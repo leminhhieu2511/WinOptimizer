@@ -18,6 +18,12 @@
                            VerticalAlignment="Center" />
             </StackPanel>
 
+            <CheckBox x:Name="TrayOnCloseCheck" DockPanel.Dock="Bottom" Style="{StaticResource ToggleSwitch}"
+                      Margin="12,8,12,8" Click="TrayOnCloseCheck_Click"
+                      ToolTip="When on, the close button hides WinOptimizer to the notification area. Right-click the tray icon and choose Exit to quit.">
+                <TextBlock Text="Minimize to tray on close" />
+            </CheckBox>
+
             <Border x:Name="AdminPanel" DockPanel.Dock="Bottom" Style="{StaticResource Card}" Padding="12" Margin="4">
                 <StackPanel>
                     <TextBlock Text="Limited mode" FontWeight="SemiBold" />

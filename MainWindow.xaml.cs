@@ -33,7 +33,14 @@ public partial class MainWindow : Window
             Title += " (Administrator)";
         }
 
+        TrayOnCloseCheck.IsChecked = SettingsStore.Current.MinimizeToTrayOnClose;
         NavList.SelectedIndex = 0;
+    }
+
+    private void TrayOnCloseCheck_Click(object sender, RoutedEventArgs e)
+    {
+        SettingsStore.Current.MinimizeToTrayOnClose = TrayOnCloseCheck.IsChecked == true;
+        SettingsStore.Save();
     }
 
     private void NavList_SelectionChanged(object sender, SelectionChangedEventArgs e)
@@ -58,13 +65,14 @@ public partial class MainWindow : Window
     }
 
     /// <summary>
-    /// While a vertical taskbar or taskbar hiding is on, closing the window only hides it so they keep working.
-    /// Otherwise closing the window exits the app.
+    /// Closing the window hides it to the notification area when "Minimize to tray on close" is on, and always
+    /// while a vertical taskbar or taskbar hiding is on (so they keep working). Otherwise it exits the app.
     /// </summary>
     protected override void OnClosing(System.ComponentModel.CancelEventArgs e)
     {
         base.OnClosing(e);
-        if (!SideTaskbarManager.AnyActive && !TaskbarHider.AnyActive)
+        bool taskbarFeaturesOn = SideTaskbarManager.AnyActive || TaskbarHider.AnyActive;
+        if (!SettingsStore.Current.MinimizeToTrayOnClose && !taskbarFeaturesOn)
         {
             App.ExitApp();
             return;
@@ -76,11 +84,10 @@ public partial class MainWindow : Window
         {
             SettingsStore.Current.SeenBackgroundNotice = true;
             SettingsStore.Save();
-            MessageBox.Show(
-                "WinOptimizer is still running so your taskbar settings keep working.\n\n" +
-                "To open it again, start WinOptimizer again or click the ⚡ button on a vertical taskbar. " +
-                "To close it completely, right-click that ⚡ button and choose Exit.",
-                "WinOptimizer", MessageBoxButton.OK, MessageBoxImage.Information);
+            TrayIcon.ShowBalloon("WinOptimizer is still running",
+                taskbarFeaturesOn
+                    ? "Your taskbar settings keep working. Click the tray icon to open it, or right-click it and choose Exit to quit."
+                    : "Click the tray icon to open it, or right-click it and choose Exit to quit.");
         }
     }
 }

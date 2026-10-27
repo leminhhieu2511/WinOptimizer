@@ -1,4 +1,4 @@
-using System.IO;
+﻿using System.IO;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Threading;
@@ -29,10 +29,22 @@ public partial class HomePage : UserControl
             {
                 UpdateGreeting();
                 _timer.Start();
+                AutoProfileService.PowerStateChanged += OnPowerStateChanged;
                 await RefreshLiveAsync();
                 await RefreshSummariesAsync();
             },
-            onInactive: () => _timer.Stop());
+            onInactive: () =>
+            {
+                _timer.Stop();
+                AutoProfileService.PowerStateChanged -= OnPowerStateChanged;
+            });
+    }
+
+    /// <summary>Plugged in/unplugged or the power mode changed (here or in Windows): update tiles and buttons now.</summary>
+    private async void OnPowerStateChanged()
+    {
+        await RefreshLiveAsync();
+        await RefreshPowerAsync();
     }
 
     private void UpdateGreeting()
@@ -147,6 +159,11 @@ public partial class HomePage : UserControl
                 MessageBoxButton.OK, MessageBoxImage.Warning);
         }
 
+        await RefreshPowerAsync();
+    }
+
+    private async Task RefreshPowerAsync()
+    {
         var (mode, plan) = await Task.Run(() =>
         {
             PowerMode? m = null;

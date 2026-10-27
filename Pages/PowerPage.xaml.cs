@@ -1,4 +1,4 @@
-using System.Windows;
+﻿using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Threading;
 using WinOptimizer.Helpers;
@@ -14,16 +14,59 @@ public partial class PowerPage : UserControl
     public PowerPage()
     {
         InitializeComponent();
+        LoadAutoSettings();
 
-        // Stay in sync if the mode is changed from Windows Settings.
+        // Stay in sync if the mode is changed from Windows Settings (or by automatic switching).
         _timer.Tick += (_, _) => RefreshState();
         PageActivity.Track(this,
             onActive: () =>
             {
                 RefreshState();
                 _timer.Start();
+                AutoProfileService.PowerStateChanged += RefreshState;
             },
-            onInactive: () => _timer.Stop());
+            onInactive: () =>
+            {
+                _timer.Stop();
+                AutoProfileService.PowerStateChanged -= RefreshState;
+            });
+    }
+
+    private void LoadAutoSettings()
+    {
+        var s = SettingsStore.Current;
+        List<ComboBoxItem> Modes() =>
+            Enum.GetValues<PowerMode>().Select(m => new ComboBoxItem { Content = PowerModeService.DisplayName(m), Tag = m }).ToList();
+        _updating = true;
+        AcModeCombo.ItemsSource = Modes();
+        BatteryModeCombo.ItemsSource = Modes();
+        AcModeCombo.SelectedIndex = (int)s.AcPowerMode;
+        BatteryModeCombo.SelectedIndex = (int)s.BatteryPowerMode;
+        AutoEnabledCheck.IsChecked = s.AutoProfilesEnabled;
+        AutoSwitchPlanCheck.IsChecked = s.AutoProfilesSwitchPlan;
+        AutoNotifyCheck.IsChecked = s.AutoProfilesNotify;
+        AutoOptions.IsEnabled = s.AutoProfilesEnabled;
+        _updating = false;
+    }
+
+    private void AutoSetting_Changed(object sender, RoutedEventArgs e)
+    {
+        if (_updating) return;
+        var s = SettingsStore.Current;
+        bool wasEnabled = s.AutoProfilesEnabled;
+        s.AutoProfilesEnabled = AutoEnabledCheck.IsChecked == true;
+        if (AcModeCombo.SelectedItem is ComboBoxItem { Tag: PowerMode ac }) s.AcPowerMode = ac;
+        if (BatteryModeCombo.SelectedItem is ComboBoxItem { Tag: PowerMode battery }) s.BatteryPowerMode = battery;
+        s.AutoProfilesSwitchPlan = AutoSwitchPlanCheck.IsChecked == true;
+        s.AutoProfilesNotify = AutoNotifyCheck.IsChecked == true;
+        SettingsStore.Save();
+        AutoOptions.IsEnabled = s.AutoProfilesEnabled;
+
+        // Turning it on, or changing the mode for the current source, takes effect right away
+        // (no notification: the user is looking at this page).
+        if (s.AutoProfilesEnabled && (!wasEnabled || sender is ComboBox))
+            AutoProfileService.ApplyNow(notify: false);
+        RefreshState();
     }
 
     private void RefreshState()
@@ -41,6 +84,10 @@ public partial class PowerPage : UserControl
             BalancedRadio.IsChecked = current == PowerMode.Balanced;
             PerformanceRadio.IsChecked = current == PowerMode.HighPerformance;
             StatusText.Text = $"Current mode: {PowerModeService.DisplayName(current)}   ·   Power plan: {planName}";
+            var battery = SystemInfoService.GetBattery();
+            AutoStatusText.Text = !battery.HasBattery
+                ? "No battery found: this PC is always plugged in, so only the \"Plugged in\" mode is used."
+                : battery.OnAcPower ? "Right now: plugged in" : "Right now: on battery";
         }
         catch (Exception ex)
         {

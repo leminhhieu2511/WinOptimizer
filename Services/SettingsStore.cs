@@ -27,8 +27,24 @@ public sealed class AppSettings
     /// <summary>True while a Windows taskbar may be hidden; if set at startup, the app was killed and restores them.</summary>
     public bool TaskbarHidingDirty { get; set; }
 
-    /// <summary>Whether we already explained that closing the window keeps the vertical taskbar running.</summary>
+    /// <summary>Whether we already explained that closing the window keeps the app running in the tray.</summary>
     public bool SeenBackgroundNotice { get; set; }
+
+    /// <summary>Closing the main window hides it to the notification area instead of exiting.</summary>
+    public bool MinimizeToTrayOnClose { get; set; } = true;
+
+    /// <summary>Switch power mode automatically when the charger is plugged in or unplugged.</summary>
+    public bool AutoProfilesEnabled { get; set; }
+
+    public PowerMode AcPowerMode { get; set; } = PowerMode.HighPerformance;
+
+    public PowerMode BatteryPowerMode { get; set; } = PowerMode.BatterySaver;
+
+    /// <summary>Activate the Balanced plan first when another plan would block the power mode change.</summary>
+    public bool AutoProfilesSwitchPlan { get; set; } = true;
+
+    /// <summary>Show a tray notification each time a profile is applied.</summary>
+    public bool AutoProfilesNotify { get; set; } = true;
 }
 
 /// <summary>Saves app settings to %LocalAppData%\WinOptimizer\settings.json.</summary>

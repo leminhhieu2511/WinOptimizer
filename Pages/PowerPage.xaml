@@ -48,6 +48,50 @@
 
             <TextBlock x:Name="StatusText" Style="{StaticResource SecondaryText}" FontSize="13" Margin="0,8,0,0" />
 
+            <TextBlock Style="{StaticResource SectionHeader}" Text="Automatic switching" Margin="0,24,0,8" />
+            <Border Style="{StaticResource Card}">
+                <StackPanel>
+                    <DockPanel>
+                        <CheckBox x:Name="AutoEnabledCheck" DockPanel.Dock="Right" Style="{StaticResource ToggleSwitch}"
+                                  VerticalAlignment="Center" Click="AutoSetting_Changed" />
+                        <StackPanel Margin="0,0,16,0">
+                            <TextBlock FontSize="16" FontWeight="SemiBold" Text="Change power mode when plugging in or unplugging" />
+                            <TextBlock x:Name="AutoStatusText" Style="{StaticResource SecondaryText}" FontSize="13" />
+                        </StackPanel>
+                    </DockPanel>
+
+                    <Grid x:Name="AutoOptions" Margin="0,16,0,0">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="Auto" />
+                            <ColumnDefinition Width="220" />
+                        </Grid.ColumnDefinitions>
+                        <Grid.RowDefinitions>
+                            <RowDefinition Height="Auto" />
+                            <RowDefinition Height="Auto" />
+                            <RowDefinition Height="Auto" />
+                            <RowDefinition Height="Auto" />
+                        </Grid.RowDefinitions>
+
+                        <StackPanel Orientation="Horizontal" VerticalAlignment="Center" Margin="0,0,16,8">
+                            <TextBlock FontFamily="{StaticResource IconFont}" Text="&#xE83E;" VerticalAlignment="Center" />
+                            <TextBlock Text="Plugged in" Margin="8,0,0,0" />
+                        </StackPanel>
+                        <ComboBox x:Name="AcModeCombo" Grid.Column="1" Margin="0,0,0,8" SelectionChanged="AutoSetting_Changed" />
+
+                        <StackPanel Grid.Row="1" Orientation="Horizontal" VerticalAlignment="Center" Margin="0,0,16,8">
+                            <TextBlock FontFamily="{StaticResource IconFont}" Text="&#xE859;" VerticalAlignment="Center" />
+                            <TextBlock Text="On battery" Margin="8,0,0,0" />
+                        </StackPanel>
+                        <ComboBox x:Name="BatteryModeCombo" Grid.Row="1" Grid.Column="1" Margin="0,0,0,8" SelectionChanged="AutoSetting_Changed" />
+
+                        <CheckBox x:Name="AutoSwitchPlanCheck" Grid.Row="2" Grid.ColumnSpan="2" Margin="0,8,0,0" Click="AutoSetting_Changed"
+                                  Content="Switch to the Balanced power plan when another plan blocks the change" />
+                        <CheckBox x:Name="AutoNotifyCheck" Grid.Row="3" Grid.ColumnSpan="2" Margin="0,8,0,0" Click="AutoSetting_Changed"
+                                  Content="Show a notification when the mode changes" />
+                    </Grid>
+                </StackPanel>
+            </Border>
+
             <TextBlock Style="{StaticResource SectionHeader}" Text="Command line" Margin="0,24,0,8" />
             <Border Style="{StaticResource Card}">
                 <StackPanel>

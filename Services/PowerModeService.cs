@@ -1,4 +1,4 @@
-using System.Runtime.InteropServices;
+﻿using System.Runtime.InteropServices;
 
 namespace WinOptimizer.Services;
 
@@ -40,6 +40,49 @@ public static class PowerModeService
 
     [DllImport("kernel32.dll")]
     private static extern IntPtr LocalFree(IntPtr hMem);
+
+    private delegate void EffectivePowerModeCallback(int mode, IntPtr context);
+
+    private const uint EffectivePowerModeV2 = 2;
+
+    [DllImport("powrprof.dll")]
+    private static extern int PowerRegisterForEffectivePowerModeNotifications(uint version,
+        EffectivePowerModeCallback callback, IntPtr context, out IntPtr registrationHandle);
+
+    [DllImport("powrprof.dll")]
+    private static extern int PowerUnregisterFromEffectivePowerModeNotifications(IntPtr registrationHandle);
+
+    // Kept in a field so the garbage collector doesn't free the delegate Windows calls back into.
+    private static EffectivePowerModeCallback? _watchCallback;
+    private static IntPtr _watchHandle;
+
+    /// <summary>
+    /// Calls <paramref name="onChanged"/> (on a thread-pool thread) whenever the effective power mode changes,
+    /// whoever changed it: this app, Windows Settings, Quick Settings or the battery flyout. Windows also calls it
+    /// once right after registering. Needs Windows 10 1809 or later; does nothing on older versions.
+    /// </summary>
+    public static void StartWatching(Action onChanged)
+    {
+        if (_watchHandle != IntPtr.Zero) return;
+        _watchCallback = (_, _) => onChanged();
+        try
+        {
+            if (PowerRegisterForEffectivePowerModeNotifications(EffectivePowerModeV2, _watchCallback, IntPtr.Zero, out _watchHandle) != 0)
+                _watchHandle = IntPtr.Zero;
+        }
+        catch (EntryPointNotFoundException)
+        {
+            _watchHandle = IntPtr.Zero;
+        }
+    }
+
+    public static void StopWatching()
+    {
+        if (_watchHandle == IntPtr.Zero) return;
+        PowerUnregisterFromEffectivePowerModeNotifications(_watchHandle);
+        _watchHandle = IntPtr.Zero;
+        _watchCallback = null;
+    }
 
     public static PowerMode GetCurrent()
     {

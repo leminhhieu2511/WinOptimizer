@@ -61,7 +61,7 @@ public partial class App : Application
             return;
         }
 
-        // The app keeps running when the window is closed while a vertical taskbar is on.
+        // The app keeps running in the tray when the window is closed (see MainWindow.OnClosing).
         ShutdownMode = ShutdownMode.OnExplicitShutdown;
 
         // Never leave Windows' taskbar invisible: restore it on a crash and when Windows signs out or shuts down.
@@ -72,6 +72,8 @@ public partial class App : Application
         var window = new MainWindow();
         MainWindow = window;
         window.Show();
+        TrayIcon.Initialize();
+        AutoProfileService.Initialize();
         SideTaskbarManager.Apply();
         TaskbarHider.Initialize();
     }
@@ -150,6 +152,8 @@ public partial class App : Application
 
     public static void ExitApp()
     {
+        AutoProfileService.Shutdown();
+        TrayIcon.Dispose();
         TaskbarHider.RestoreAll();
         SideTaskbarManager.CloseAll();
         Current.Shutdown();
@@ -157,6 +161,8 @@ public partial class App : Application
 
     protected override void OnExit(ExitEventArgs e)
     {
+        AutoProfileService.Shutdown();
+        TrayIcon.Dispose();
         TaskbarHider.RestoreAll();
         SideTaskbarManager.CloseAll();
         if (_instanceMutex is not null)

@@ -114,7 +114,7 @@ public sealed class SystemInfoService
         return GlobalMemoryStatusEx(ref status) ? (status.ullTotalPhys, status.ullAvailPhys) : (0, 0);
     }
 
-    private static BatteryInfo GetBattery()
+    public static BatteryInfo GetBattery()
     {
         if (!GetSystemPowerStatus(out var s)) return new BatteryInfo(false, 0, true, false, null);
         bool hasBattery = (s.BatteryFlag & 128) == 0 && s.BatteryFlag != 255;
