@@ -1,0 +1,84 @@
+<Window x:Class="WinOptimizer.SideTaskbar.SideTaskbarWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="WinOptimizer vertical taskbar"
+        WindowStyle="None" ResizeMode="NoResize" ShowInTaskbar="False" Topmost="True" ShowActivated="False"
+        WindowStartupLocation="Manual" Left="-10000" Top="-10000" Width="56" Height="400"
+        Background="{DynamicResource SolidBackgroundFillColorBaseBrush}">
+    <Window.Resources>
+        <Style x:Key="BarButton" TargetType="Button" BasedOn="{StaticResource {x:Type Button}}">
+            <Setter Property="Width" Value="44" />
+            <Setter Property="Height" Value="44" />
+            <Setter Property="Padding" Value="0" />
+            <Setter Property="Margin" Value="0,2" />
+            <Setter Property="Background" Value="Transparent" />
+            <Setter Property="BorderThickness" Value="0" />
+            <Setter Property="HorizontalAlignment" Value="Center" />
+            <Setter Property="Focusable" Value="False" />
+        </Style>
+    </Window.Resources>
+
+    <Border x:Name="EdgeBorder" BorderBrush="{DynamicResource CardStrokeColorDefaultBrush}" BorderThickness="0,0,1,0">
+        <DockPanel Margin="0,6">
+            <!-- Start -->
+            <Button DockPanel.Dock="Top" Style="{StaticResource BarButton}" ToolTip="Start" Click="Start_Click">
+                <Grid Width="18" Height="18">
+                    <Grid.ColumnDefinitions><ColumnDefinition /><ColumnDefinition /></Grid.ColumnDefinitions>
+                    <Grid.RowDefinitions><RowDefinition /><RowDefinition /></Grid.RowDefinitions>
+                    <Rectangle Margin="0,0,1,1" Fill="{DynamicResource AccentFillColorDefaultBrush}" />
+                    <Rectangle Grid.Column="1" Margin="1,0,0,1" Fill="{DynamicResource AccentFillColorDefaultBrush}" />
+                    <Rectangle Grid.Row="1" Margin="0,1,1,0" Fill="{DynamicResource AccentFillColorDefaultBrush}" />
+                    <Rectangle Grid.Row="1" Grid.Column="1" Margin="1,1,0,0" Fill="{DynamicResource AccentFillColorDefaultBrush}" />
+                </Grid>
+            </Button>
+
+            <!-- WinOptimizer: open / turn off / exit -->
+            <Button x:Name="AppButton" DockPanel.Dock="Bottom" Style="{StaticResource BarButton}" ToolTip="WinOptimizer" Click="App_Click">
+                <TextBlock FontFamily="{StaticResource IconFont}" Text="&#xE945;" FontSize="18"
+                           Foreground="{DynamicResource AccentTextFillColorPrimaryBrush}" />
+                <Button.ContextMenu>
+                    <ContextMenu>
+                        <MenuItem Header="Open WinOptimizer" Click="OpenApp_Click" />
+                        <MenuItem Header="Turn off this vertical taskbar" Click="TurnOff_Click" />
+                        <Separator />
+                        <MenuItem Header="Exit WinOptimizer" Click="Exit_Click" />
+                    </ContextMenu>
+                </Button.ContextMenu>
+            </Button>
+
+            <Separator DockPanel.Dock="Top" Margin="10,4" />
+
+            <!-- Open windows on this monitor -->
+            <ScrollViewer VerticalScrollBarVisibility="Hidden">
+                <ItemsControl x:Name="WindowList">
+                    <ItemsControl.ItemTemplate>
+                        <DataTemplate>
+                            <Grid>
+                                <Button Style="{StaticResource BarButton}" ToolTip="{Binding Title}" Click="Window_Click">
+                                    <Grid>
+                                        <Image Source="{Binding Icon}" Width="24" Height="24" RenderOptions.BitmapScalingMode="HighQuality" />
+                                        <!-- Shown when the window has no icon -->
+                                        <TextBlock Text="{Binding Initial}" FontWeight="SemiBold" FontSize="16"
+                                                   HorizontalAlignment="Center" VerticalAlignment="Center"
+                                                   Visibility="{Binding InitialVisibility}" />
+                                    </Grid>
+                                    <Button.ContextMenu>
+                                        <ContextMenu>
+                                            <MenuItem Header="{Binding Title}" IsEnabled="False" />
+                                            <Separator />
+                                            <MenuItem Header="Close window" Click="CloseWindow_Click" />
+                                        </ContextMenu>
+                                    </Button.ContextMenu>
+                                </Button>
+                                <!-- Active-window indicator on the inner edge -->
+                                <Rectangle Width="3" RadiusX="1.5" RadiusY="1.5" Height="{Binding IndicatorHeight}"
+                                           HorizontalAlignment="{Binding IndicatorSide}" VerticalAlignment="Center"
+                                           Fill="{DynamicResource AccentFillColorDefaultBrush}" IsHitTestVisible="False" />
+                            </Grid>
+                        </DataTemplate>
+                    </ItemsControl.ItemTemplate>
+                </ItemsControl>
+            </ScrollViewer>
+        </DockPanel>
+    </Border>
+</Window>

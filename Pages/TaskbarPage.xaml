@@ -1,0 +1,221 @@
+<UserControl x:Class="WinOptimizer.Pages.TaskbarPage"
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
+    <Grid>
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="*" />
+        </Grid.RowDefinitions>
+
+        <StackPanel Margin="16,16,24,0">
+            <TextBlock Style="{StaticResource PageTitle}" Text="Taskbar &amp; Displays" />
+            <TextBlock x:Name="SubtitleText" Style="{StaticResource PageSubtitle}"
+                       Text="Control how the taskbar works on each monitor. Changes are saved right away; Windows shows them after Explorer restarts." />
+        </StackPanel>
+
+        <StackPanel Grid.Row="1">
+        <!-- Shown on Windows builds where taskbar options can only be changed in Settings. -->
+        <Border x:Name="SettingsOnlyNotice" Style="{StaticResource Card}" Margin="16,0,24,12" Visibility="Collapsed">
+            <DockPanel>
+                <TextBlock DockPanel.Dock="Left" FontFamily="{StaticResource IconFont}" Text="&#xE946;" FontSize="20"
+                           Foreground="{DynamicResource AccentTextFillColorPrimaryBrush}" VerticalAlignment="Center" Margin="0,0,14,0" />
+                <Button DockPanel.Dock="Right" Content="Open taskbar settings" Style="{DynamicResource AccentButtonStyle}"
+                        VerticalAlignment="Center" Margin="16,0,0,0" Click="OpenTaskbarSettings_Click" />
+                <StackPanel VerticalAlignment="Center">
+                    <TextBlock x:Name="SettingsOnlyTitle" FontWeight="SemiBold" Text="Change these options in Windows Settings" />
+                    <TextBlock Style="{StaticResource SecondaryText}"
+                               Text="On this version of Windows, most taskbar options can only be changed in Settings, so they aren't shown here. Auto-hide still works from this page." />
+                </StackPanel>
+            </DockPanel>
+        </Border>
+
+        <!-- Shown after a change that Windows only picks up when Explorer restarts. Stays above the scrolling area so it's always visible. -->
+        <Border x:Name="RestartBanner" Style="{StaticResource Card}" Margin="16,0,24,12" Visibility="Collapsed"
+                BorderBrush="{DynamicResource AccentFillColorDefaultBrush}" BorderThickness="1">
+            <DockPanel>
+                <TextBlock DockPanel.Dock="Left" FontFamily="{StaticResource IconFont}" Text="&#xE946;" FontSize="20"
+                           Foreground="{DynamicResource AccentTextFillColorPrimaryBrush}" VerticalAlignment="Center" Margin="0,0,14,0" />
+                <StackPanel DockPanel.Dock="Right" Orientation="Horizontal" VerticalAlignment="Center" Margin="16,0,0,0">
+                    <Button x:Name="BannerRestartButton" Content="Restart Explorer now" Style="{DynamicResource AccentButtonStyle}"
+                            Click="RestartExplorer_Click" />
+                    <Button Content="Later" Margin="8,0,0,0" Click="DismissBanner_Click" />
+                </StackPanel>
+                <StackPanel VerticalAlignment="Center">
+                    <TextBlock x:Name="BannerTitle" FontWeight="SemiBold" Text="Restart Explorer to apply your changes" />
+                    <TextBlock Style="{StaticResource SecondaryText}"
+                               Text="Your taskbar and any open File Explorer windows will close and reopen. Other apps keep running." />
+                </StackPanel>
+            </DockPanel>
+        </Border>
+        </StackPanel>
+
+        <ScrollViewer Grid.Row="2" VerticalScrollBarVisibility="Auto">
+        <StackPanel Margin="16,0,24,24">
+            <!-- Displays -->
+            <TextBlock Style="{StaticResource SectionHeader}" Text="Connected displays" />
+            <ItemsControl x:Name="DisplayList">
+                <ItemsControl.ItemsPanel>
+                    <ItemsPanelTemplate>
+                        <WrapPanel />
+                    </ItemsPanelTemplate>
+                </ItemsControl.ItemsPanel>
+                <ItemsControl.ItemTemplate>
+                    <DataTemplate>
+                        <Border Style="{StaticResource Card}" Width="220" Margin="0,0,8,8">
+                            <StackPanel Orientation="Horizontal">
+                                <TextBlock FontFamily="{StaticResource IconFont}" Text="&#xE7F4;" FontSize="28" VerticalAlignment="Center" />
+                                <StackPanel Margin="14,0,0,0">
+                                    <TextBlock FontWeight="SemiBold" Text="{Binding Title}" />
+                                    <TextBlock Style="{StaticResource SecondaryText}" Text="{Binding Resolution}" />
+                                    <TextBlock Style="{StaticResource SecondaryText}" Text="{Binding Name}" TextTrimming="CharacterEllipsis" />
+                                </StackPanel>
+                            </StackPanel>
+                        </Border>
+                    </DataTemplate>
+                </ItemsControl.ItemTemplate>
+            </ItemsControl>
+
+            <!-- WinOptimizer's own vertical taskbar, chosen per monitor -->
+            <TextBlock Style="{StaticResource SectionHeader}" Text="Taskbars per display" Margin="0,8,0,4" />
+            <TextBlock Style="{StaticResource SecondaryText}" FontSize="13" Margin="0,0,0,8"
+                       Text="Choose for each display. Windows taskbar: Auto-hide hides Windows' own taskbar on that display only; it reappears when you move the mouse to its strip. Vertical taskbar adds WinOptimizer's own side taskbar (this Windows version can't move its taskbar to the side): it shows that display's open windows and a Start button, and maximized windows won't cover it. Both keep working in the background when you close the WinOptimizer window." />
+            <!-- One row per display, built in code so screen readers and UI Automation can reach each dropdown. -->
+            <StackPanel x:Name="SideTaskbarRows" />
+            <Border Style="{StaticResource Card}">
+                <DockPanel>
+                    <Button DockPanel.Dock="Right" Content="Open taskbar settings" VerticalAlignment="Center"
+                            Margin="16,0,0,0" Click="OpenTaskbarSettings_Click" />
+                    <StackPanel>
+                        <TextBlock FontWeight="SemiBold" Text="No Windows taskbar on a second display?" />
+                        <TextBlock Style="{StaticResource SecondaryText}"
+                                   Text="Windows only puts a taskbar on other displays when &quot;Show my taskbar on all displays&quot; is on in Windows Settings." />
+                    </StackPanel>
+                </DockPanel>
+            </Border>
+
+            <Border Style="{StaticResource Card}">
+                <DockPanel>
+                    <Button DockPanel.Dock="Right" Content="Reset taskbars" VerticalAlignment="Center" Margin="16,0,0,0"
+                            Click="ResetTaskbars_Click" />
+                    <StackPanel>
+                        <TextBlock FontWeight="SemiBold" Text="Something looks wrong?" />
+                        <TextBlock Style="{StaticResource SecondaryText}"
+                                   Text="Reset shows every Windows taskbar again and turns off the vertical taskbars. If a taskbar is still missing, restart Windows Explorer from Task Manager." />
+                    </StackPanel>
+                </DockPanel>
+            </Border>
+            <TextBlock Style="{StaticResource SecondaryText}" Margin="2,0,0,8">
+                <Run Text="Per-display auto-hide uses the technique from" />
+                <Hyperlink Click="OpenCreditLink_Click">Per-Monitor Taskbar</Hyperlink>
+                <Run Text="by Niko Leinonen (MIT License)." />
+            </TextBlock>
+
+            <!-- Multiple displays -->
+            <TextBlock x:Name="MultiDisplayHeader" Style="{StaticResource SectionHeader}" Text="Taskbar on multiple displays" />
+            <Border Style="{StaticResource Card}">
+                <DockPanel>
+                    <CheckBox x:Name="AllDisplaysToggle" DockPanel.Dock="Right" Style="{StaticResource ToggleSwitch}"
+                              VerticalAlignment="Center" Checked="AllDisplays_Changed" Unchecked="AllDisplays_Changed" />
+                    <StackPanel>
+                        <TextBlock FontWeight="SemiBold" Text="Show taskbar on all displays" />
+                        <TextBlock Style="{StaticResource SecondaryText}" Text="Turn off to keep the taskbar only on your main display." />
+                    </StackPanel>
+                </DockPanel>
+            </Border>
+            <Border Style="{StaticResource Card}">
+                <DockPanel>
+                    <ComboBox x:Name="ButtonsModeCombo" DockPanel.Dock="Right" Width="320" VerticalAlignment="Center"
+                              SelectionChanged="ButtonsMode_Changed">
+                        <ComboBoxItem Content="All taskbars" />
+                        <ComboBoxItem Content="Main taskbar and taskbar where window is open" />
+                        <ComboBoxItem Content="Taskbar where window is open" />
+                    </ComboBox>
+                    <StackPanel Margin="0,0,16,0">
+                        <TextBlock FontWeight="SemiBold" Text="Show taskbar apps on" />
+                        <TextBlock Style="{StaticResource SecondaryText}" Text="Which taskbar shows the button for a window on another monitor." />
+                    </StackPanel>
+                </DockPanel>
+            </Border>
+            <Border Style="{StaticResource Card}">
+                <DockPanel>
+                    <ComboBox x:Name="OtherCombineCombo" DockPanel.Dock="Right" Width="320" VerticalAlignment="Center"
+                              SelectionChanged="OtherCombine_Changed">
+                        <ComboBoxItem Content="Always" />
+                        <ComboBoxItem Content="When taskbar is full" />
+                        <ComboBoxItem Content="Never" />
+                    </ComboBox>
+                    <StackPanel Margin="0,0,16,0">
+                        <TextBlock FontWeight="SemiBold" Text="Combine buttons and hide labels on other taskbars" />
+                        <TextBlock Style="{StaticResource SecondaryText}" Text="For taskbars on your secondary displays." />
+                    </StackPanel>
+                </DockPanel>
+            </Border>
+
+            <!-- General -->
+            <TextBlock Style="{StaticResource SectionHeader}" Text="Taskbar behavior" Margin="0,16,0,8" />
+            <Border Style="{StaticResource Card}">
+                <DockPanel>
+                    <ComboBox x:Name="AlignmentCombo" DockPanel.Dock="Right" Width="320" VerticalAlignment="Center"
+                              SelectionChanged="Alignment_Changed">
+                        <ComboBoxItem Content="Left" />
+                        <ComboBoxItem Content="Center" />
+                    </ComboBox>
+                    <TextBlock FontWeight="SemiBold" Text="Taskbar alignment" VerticalAlignment="Center" />
+                </DockPanel>
+            </Border>
+            <Border Style="{StaticResource Card}">
+                <DockPanel>
+                    <ComboBox x:Name="MainCombineCombo" DockPanel.Dock="Right" Width="320" VerticalAlignment="Center"
+                              SelectionChanged="MainCombine_Changed">
+                        <ComboBoxItem Content="Always" />
+                        <ComboBoxItem Content="When taskbar is full" />
+                        <ComboBoxItem Content="Never" />
+                    </ComboBox>
+                    <TextBlock FontWeight="SemiBold" Text="Combine buttons and hide labels on main taskbar" VerticalAlignment="Center" />
+                </DockPanel>
+            </Border>
+            <Border Style="{StaticResource Card}">
+                <DockPanel>
+                    <ComboBox x:Name="SearchCombo" DockPanel.Dock="Right" Width="320" VerticalAlignment="Center"
+                              SelectionChanged="Search_Changed">
+                        <ComboBoxItem Content="Hide" />
+                        <ComboBoxItem Content="Search icon only" />
+                        <ComboBoxItem Content="Search box" />
+                        <ComboBoxItem Content="Search icon and label" />
+                    </ComboBox>
+                    <TextBlock FontWeight="SemiBold" Text="Search" VerticalAlignment="Center" />
+                </DockPanel>
+            </Border>
+            <Border Style="{StaticResource Card}">
+                <DockPanel>
+                    <CheckBox x:Name="TaskViewToggle" DockPanel.Dock="Right" Style="{StaticResource ToggleSwitch}"
+                              VerticalAlignment="Center" Checked="TaskView_Changed" Unchecked="TaskView_Changed" />
+                    <TextBlock FontWeight="SemiBold" Text="Show Task View button" VerticalAlignment="Center" />
+                </DockPanel>
+            </Border>
+            <Border Style="{StaticResource Card}">
+                <DockPanel>
+                    <CheckBox x:Name="AutoHideToggle" DockPanel.Dock="Right" Style="{StaticResource ToggleSwitch}"
+                              VerticalAlignment="Center" Checked="AutoHide_Changed" Unchecked="AutoHide_Changed" />
+                    <StackPanel>
+                        <TextBlock FontWeight="SemiBold" Text="Automatically hide the taskbar" />
+                        <TextBlock Style="{StaticResource SecondaryText}" Text="Gives apps more screen space; move the mouse to the bottom edge to show it. Applies right away." />
+                    </StackPanel>
+                </DockPanel>
+            </Border>
+
+            <DockPanel Margin="0,12,0,0">
+                <Button DockPanel.Dock="Left" x:Name="RestartExplorerButton" Click="RestartExplorer_Click">
+                    <StackPanel Orientation="Horizontal">
+                        <TextBlock FontFamily="{StaticResource IconFont}" Text="&#xE72C;" VerticalAlignment="Center" />
+                        <TextBlock Text="Restart Explorer" Margin="8,0,0,0" />
+                    </StackPanel>
+                </Button>
+                <TextBlock Style="{StaticResource SecondaryText}" VerticalAlignment="Center" Margin="12,0,0,0"
+                           Text="Your taskbar and open File Explorer windows will close and reopen." />
+            </DockPanel>
+        </StackPanel>
+        </ScrollViewer>
+    </Grid>
+</UserControl>
