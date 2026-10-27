@@ -1,0 +1,96 @@
+<UserControl x:Class="WinOptimizer.Pages.MonitorPage"
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
+    <ScrollViewer VerticalScrollBarVisibility="Auto">
+        <StackPanel Margin="16,16,24,24">
+            <TextBlock Style="{StaticResource PageTitle}" Text="System Monitor" />
+            <TextBlock Style="{StaticResource PageSubtitle}" Text="Live CPU, memory, disk and battery usage. Updates every 2 seconds." />
+
+            <!-- System info -->
+            <Border Style="{StaticResource Card}">
+                <Grid>
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="110" />
+                        <ColumnDefinition Width="*" />
+                    </Grid.ColumnDefinitions>
+                    <Grid.RowDefinitions>
+                        <RowDefinition /><RowDefinition /><RowDefinition /><RowDefinition />
+                    </Grid.RowDefinitions>
+                    <TextBlock Style="{StaticResource SecondaryText}" FontSize="14" Text="Computer" Margin="0,2" />
+                    <TextBlock x:Name="ComputerText" Grid.Column="1" Margin="0,2" />
+                    <TextBlock Grid.Row="1" Style="{StaticResource SecondaryText}" FontSize="14" Text="Windows" Margin="0,2" />
+                    <TextBlock x:Name="OsText" Grid.Row="1" Grid.Column="1" Margin="0,2" />
+                    <TextBlock Grid.Row="2" Style="{StaticResource SecondaryText}" FontSize="14" Text="Processor" Margin="0,2" />
+                    <TextBlock x:Name="CpuNameText" Grid.Row="2" Grid.Column="1" Margin="0,2" />
+                    <TextBlock Grid.Row="3" Style="{StaticResource SecondaryText}" FontSize="14" Text="Uptime" Margin="0,2" />
+                    <TextBlock x:Name="UptimeText" Grid.Row="3" Grid.Column="1" Margin="0,2" />
+                </Grid>
+            </Border>
+
+            <!-- Live stats -->
+            <UniformGrid Columns="3" Margin="-4,4,-4,4">
+                <Border Style="{StaticResource Card}" Margin="4">
+                    <StackPanel>
+                        <TextBlock Style="{StaticResource SecondaryText}" FontSize="14" Text="CPU" />
+                        <TextBlock x:Name="CpuText" Style="{StaticResource BigNumber}" Text="–" />
+                        <Canvas x:Name="CpuChart" Height="48" Margin="0,8,0,0" ClipToBounds="True">
+                            <Polyline x:Name="CpuLine" StrokeThickness="2" Stroke="{DynamicResource AccentFillColorDefaultBrush}" />
+                        </Canvas>
+                    </StackPanel>
+                </Border>
+                <Border Style="{StaticResource Card}" Margin="4">
+                    <StackPanel>
+                        <TextBlock Style="{StaticResource SecondaryText}" FontSize="14" Text="Memory" />
+                        <TextBlock x:Name="MemoryText" Style="{StaticResource BigNumber}" Text="–" />
+                        <TextBlock x:Name="MemoryDetailText" Style="{StaticResource SecondaryText}" />
+                        <Canvas x:Name="MemoryChart" Height="30" Margin="0,8,0,0" ClipToBounds="True">
+                            <Polyline x:Name="MemoryLine" StrokeThickness="2" Stroke="{DynamicResource AccentFillColorDefaultBrush}" />
+                        </Canvas>
+                    </StackPanel>
+                </Border>
+                <Border Style="{StaticResource Card}" Margin="4">
+                    <StackPanel>
+                        <TextBlock Style="{StaticResource SecondaryText}" FontSize="14" Text="Battery" />
+                        <TextBlock x:Name="BatteryText" Style="{StaticResource BigNumber}" Text="–" />
+                        <TextBlock x:Name="BatteryDetailText" Style="{StaticResource SecondaryText}" />
+                        <ProgressBar x:Name="BatteryBar" Height="6" Margin="0,12,0,0" Maximum="100" />
+                    </StackPanel>
+                </Border>
+            </UniformGrid>
+
+            <!-- Disks -->
+            <TextBlock Style="{StaticResource SectionHeader}" Text="Drives" />
+            <ItemsControl x:Name="DiskList">
+                <ItemsControl.ItemTemplate>
+                    <DataTemplate>
+                        <Border Style="{StaticResource Card}">
+                            <StackPanel>
+                                <DockPanel>
+                                    <TextBlock DockPanel.Dock="Right" Style="{StaticResource SecondaryText}" FontSize="14" Text="{Binding Detail}" />
+                                    <TextBlock FontWeight="SemiBold" Text="{Binding Title}" />
+                                </DockPanel>
+                                <ProgressBar Height="6" Margin="0,10,0,0" Maximum="100" Value="{Binding UsedPercent, Mode=OneWay}" />
+                            </StackPanel>
+                        </Border>
+                    </DataTemplate>
+                </ItemsControl.ItemTemplate>
+            </ItemsControl>
+
+            <!-- Processes -->
+            <TextBlock Style="{StaticResource SectionHeader}" Text="Top processes" />
+            <Border Style="{StaticResource Card}" Padding="8">
+                <ListView x:Name="ProcessList" BorderThickness="0" Background="Transparent"
+                          ScrollViewer.VerticalScrollBarVisibility="Disabled">
+                    <ListView.View>
+                        <GridView>
+                            <GridViewColumn Header="Name" Width="280" DisplayMemberBinding="{Binding Name}" />
+                            <GridViewColumn Header="PID" Width="90" DisplayMemberBinding="{Binding Id}" />
+                            <GridViewColumn Header="CPU" Width="100" DisplayMemberBinding="{Binding Cpu}" />
+                            <GridViewColumn Header="Memory" Width="120" DisplayMemberBinding="{Binding Memory}" />
+                        </GridView>
+                    </ListView.View>
+                </ListView>
+            </Border>
+        </StackPanel>
+    </ScrollViewer>
+</UserControl>

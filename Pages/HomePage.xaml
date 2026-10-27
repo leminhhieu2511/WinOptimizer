@@ -1,0 +1,137 @@
+<UserControl x:Class="WinOptimizer.Pages.HomePage"
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
+    <UserControl.Resources>
+        <!-- A button that looks like a card: used for the clickable tiles and tool shortcuts. -->
+        <Style x:Key="CardButton" TargetType="Button" BasedOn="{StaticResource {x:Type Button}}">
+            <Setter Property="HorizontalContentAlignment" Value="Stretch" />
+            <Setter Property="VerticalContentAlignment" Value="Stretch" />
+            <Setter Property="HorizontalAlignment" Value="Stretch" />
+            <Setter Property="Padding" Value="16" />
+            <Setter Property="Margin" Value="4" />
+            <Setter Property="Cursor" Value="Hand" />
+        </Style>
+        <Style x:Key="TileLabel" TargetType="TextBlock" BasedOn="{StaticResource SecondaryText}">
+            <Setter Property="FontSize" Value="14" />
+        </Style>
+        <Style x:Key="ToolIcon" TargetType="TextBlock">
+            <Setter Property="FontFamily" Value="{StaticResource IconFont}" />
+            <Setter Property="FontSize" Value="24" />
+            <Setter Property="Foreground" Value="{DynamicResource AccentTextFillColorPrimaryBrush}" />
+            <Setter Property="VerticalAlignment" Value="Top" />
+            <Setter Property="Margin" Value="0,2,14,0" />
+        </Style>
+    </UserControl.Resources>
+
+    <ScrollViewer VerticalScrollBarVisibility="Auto">
+        <StackPanel Margin="16,16,24,24">
+            <TextBlock x:Name="GreetingText" Style="{StaticResource PageTitle}" Text="Welcome" />
+            <TextBlock x:Name="SubtitleText" Style="{StaticResource PageSubtitle}" />
+
+            <!-- Live tiles -->
+            <UniformGrid Columns="4" Margin="-4,0,-4,8">
+                <Button Style="{StaticResource CardButton}" Tag="System Monitor" Click="Navigate_Click" ToolTip="Open System Monitor">
+                    <StackPanel>
+                        <TextBlock Style="{StaticResource TileLabel}" Text="CPU" />
+                        <TextBlock x:Name="CpuText" Style="{StaticResource BigNumber}" Text="–" />
+                        <TextBlock x:Name="CpuDetailText" Style="{StaticResource SecondaryText}" />
+                    </StackPanel>
+                </Button>
+                <Button Style="{StaticResource CardButton}" Tag="System Monitor" Click="Navigate_Click" ToolTip="Open System Monitor">
+                    <StackPanel>
+                        <TextBlock Style="{StaticResource TileLabel}" Text="Memory" />
+                        <TextBlock x:Name="MemoryText" Style="{StaticResource BigNumber}" Text="–" />
+                        <TextBlock x:Name="MemoryDetailText" Style="{StaticResource SecondaryText}" />
+                    </StackPanel>
+                </Button>
+                <Button Style="{StaticResource CardButton}" Tag="System Monitor" Click="Navigate_Click" ToolTip="Open System Monitor">
+                    <StackPanel>
+                        <TextBlock x:Name="StorageLabel" Style="{StaticResource TileLabel}" Text="Storage" />
+                        <TextBlock x:Name="StorageText" Style="{StaticResource BigNumber}" Text="–" />
+                        <TextBlock x:Name="StorageDetailText" Style="{StaticResource SecondaryText}" />
+                        <ProgressBar x:Name="StorageBar" Height="4" Margin="0,8,0,0" Maximum="100" />
+                    </StackPanel>
+                </Button>
+                <Button Style="{StaticResource CardButton}" Tag="System Monitor" Click="Navigate_Click" ToolTip="Open System Monitor">
+                    <StackPanel>
+                        <TextBlock Style="{StaticResource TileLabel}" Text="Battery" />
+                        <TextBlock x:Name="BatteryText" Style="{StaticResource BigNumber}" Text="–" />
+                        <TextBlock x:Name="BatteryDetailText" Style="{StaticResource SecondaryText}" />
+                    </StackPanel>
+                </Button>
+            </UniformGrid>
+
+            <!-- Power mode -->
+            <TextBlock Style="{StaticResource SectionHeader}" Text="Power mode" />
+            <Border Style="{StaticResource Card}">
+                <DockPanel>
+                    <StackPanel DockPanel.Dock="Right" Orientation="Horizontal" VerticalAlignment="Center">
+                        <Button x:Name="SaverButton" Tag="BatterySaver" Click="PowerMode_Click" MinWidth="150" Padding="12,6">
+                            <StackPanel Orientation="Horizontal">
+                                <TextBlock FontFamily="{StaticResource IconFont}" Text="&#xEBB4;" VerticalAlignment="Center" />
+                                <TextBlock Text="Battery Life Saver" Margin="8,0,0,0" />
+                            </StackPanel>
+                        </Button>
+                        <Button x:Name="BalancedButton" Tag="Balanced" Click="PowerMode_Click" MinWidth="120" Padding="12,6" Margin="8,0,0,0">
+                            <StackPanel Orientation="Horizontal">
+                                <TextBlock FontFamily="{StaticResource IconFont}" Text="&#xEC49;" VerticalAlignment="Center" />
+                                <TextBlock Text="Balanced" Margin="8,0,0,0" />
+                            </StackPanel>
+                        </Button>
+                        <Button x:Name="PerformanceButton" Tag="HighPerformance" Click="PowerMode_Click" MinWidth="170" Padding="12,6" Margin="8,0,0,0">
+                            <StackPanel Orientation="Horizontal">
+                                <TextBlock FontFamily="{StaticResource IconFont}" Text="&#xE945;" VerticalAlignment="Center" />
+                                <TextBlock Text="Highest Performance" Margin="8,0,0,0" />
+                            </StackPanel>
+                        </Button>
+                    </StackPanel>
+                    <StackPanel VerticalAlignment="Center" Margin="0,0,16,0">
+                        <TextBlock x:Name="PowerTitleText" FontWeight="SemiBold" />
+                        <TextBlock x:Name="PowerDetailText" Style="{StaticResource SecondaryText}" />
+                    </StackPanel>
+                </DockPanel>
+            </Border>
+
+            <!-- Tools -->
+            <TextBlock Style="{StaticResource SectionHeader}" Text="Tools" Margin="0,16,0,8" />
+            <UniformGrid Columns="2" Margin="-4,0,-4,0">
+                <Button Style="{StaticResource CardButton}" Tag="Junk Cleaner" Click="Navigate_Click">
+                    <DockPanel>
+                        <TextBlock Style="{StaticResource ToolIcon}" Text="&#xE74D;" />
+                        <StackPanel>
+                            <TextBlock FontSize="16" FontWeight="SemiBold" Text="Junk Cleaner" />
+                            <TextBlock x:Name="JunkStatusText" Style="{StaticResource SecondaryText}" FontSize="13" />
+                        </StackPanel>
+                    </DockPanel>
+                </Button>
+                <Button Style="{StaticResource CardButton}" Tag="Startup Apps" Click="Navigate_Click">
+                    <DockPanel>
+                        <TextBlock Style="{StaticResource ToolIcon}" Text="&#xE768;" />
+                        <StackPanel>
+                            <TextBlock FontSize="16" FontWeight="SemiBold" Text="Startup Apps" />
+                            <TextBlock x:Name="StartupStatusText" Style="{StaticResource SecondaryText}" FontSize="13" Text="Checking…" />
+                        </StackPanel>
+                    </DockPanel>
+                </Button>
+                <Button Style="{StaticResource CardButton}" Tag="Privacy &amp; Tweaks" Click="Navigate_Click">
+                    <DockPanel>
+                        <TextBlock Style="{StaticResource ToolIcon}" Text="&#xEA18;" />
+                        <StackPanel>
+                            <TextBlock FontSize="16" FontWeight="SemiBold" Text="Privacy &amp; Tweaks" />
+                            <TextBlock x:Name="TweaksStatusText" Style="{StaticResource SecondaryText}" FontSize="13" Text="Checking…" />
+                        </StackPanel>
+                    </DockPanel>
+                </Button>
+                <Button Style="{StaticResource CardButton}" Tag="Taskbar &amp; Displays" Click="Navigate_Click">
+                    <DockPanel>
+                        <TextBlock Style="{StaticResource ToolIcon}" Text="&#xE7F4;" />
+                        <StackPanel>
+                            <TextBlock FontSize="16" FontWeight="SemiBold" Text="Taskbar &amp; Displays" />
+                            <TextBlock x:Name="TaskbarStatusText" Style="{StaticResource SecondaryText}" FontSize="13" Text="Checking…" />
+                        </StackPanel>
+                    </DockPanel>
+                </Button>
+            </UniformGrid>
+        </StackPanel>
+    </ScrollViewer>
+</UserControl>
