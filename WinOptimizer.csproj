@@ -31,13 +31,6 @@
     <EmbeddedResource Remove="tests/**;native/**" />
   </ItemGroup>
 
-  <ItemGroup>
-    <!-- Produced by the native build (Task 6); only copied once it exists. -->
-    <None Include="native/build/DiskMove/$(Configuration)/DiskMove.dll" Condition="Exists('native/build/DiskMove/$(Configuration)/DiskMove.dll')">
-      <Link>DiskMove.dll</Link>
-      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
-    </None>
-  </ItemGroup>
 
   <!-- Build the native DiskMove projects with CMake (incremental: CMake skips up-to-date targets). -->
   <Target Name="BuildNative" BeforeTargets="BeforeBuild">
@@ -52,6 +45,18 @@
     <Error Condition="'$(CMakeExe)' == '' Or !Exists('$(CMakeExe)')" Text="cmake.exe not found via vswhere. Install the Visual Studio 'C++ CMake tools for Windows' component." />
     <Exec Condition="!Exists('$(NativeBuildDir)\CMakeCache.txt')" Command="&quot;$(CMakeExe)&quot; -S &quot;$(NativeDir)&quot; -B &quot;$(NativeBuildDir)&quot; -G &quot;Visual Studio 18 2026&quot; -A x64" />
     <Exec Command="&quot;$(CMakeExe)&quot; --build &quot;$(NativeBuildDir)&quot; --config $(Configuration)" />
+  </Target>
+
+  <!-- DiskMove.dll is added only after BuildNative has produced it: a static item's Exists() is evaluated
+       before any target runs, so a clean first build would miss it. (The test-only diskmove-cli is not copied.) -->
+  <Target Name="AddNativeOutputs" AfterTargets="BuildNative">
+    <PropertyGroup>
+      <DiskMoveDll>$(MSBuildProjectDirectory)\native\build\DiskMove\$(Configuration)\DiskMove.dll</DiskMoveDll>
+    </PropertyGroup>
+    <Error Condition="!Exists('$(DiskMoveDll)')" Text="Native build did not produce $(DiskMoveDll)." />
+    <ItemGroup>
+      <None Include="$(DiskMoveDll)" Link="DiskMove.dll" CopyToOutputDirectory="PreserveNewest" />
+    </ItemGroup>
   </Target>
 
 </Project>

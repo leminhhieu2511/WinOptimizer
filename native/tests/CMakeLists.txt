@@ -11,3 +11,8 @@ foreach(test_file ${DM_TEST_FILES})
   target_link_libraries(${test_base} PRIVATE DiskMoveCore)
   add_test(NAME ${suite} COMMAND ${test_base})
 endforeach()
+
+# The Win32 layer test links DiskMove.dll's objects directly (internals included; temp files only).
+target_compile_definitions(test_win32_io PRIVATE DMW_STATIC UNICODE _UNICODE)
+target_include_directories(test_win32_io PRIVATE "${CMAKE_SOURCE_DIR}/DiskMove/src")
+target_link_libraries(test_win32_io PRIVATE DiskMoveWin32)
