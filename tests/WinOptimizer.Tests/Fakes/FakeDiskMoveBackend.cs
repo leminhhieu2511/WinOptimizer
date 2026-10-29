@@ -47,6 +47,8 @@ public sealed class FakeDiskMoveBackend : IDiskMoveBackend
     public Part C, R, D;
     public bool? WinRe = true;
     public int EnableFailures;
+    /// <summary>reagentc /disable fails this many times (WinRE stays as it is).</summary>
+    public int DisableFailures;
     public int ChkdskResult;
     public bool WindowsRestoresLetter = true;
     /// <summary>Letters held by volumes outside this disk (e.g. a USB drive plugged in during the move).</summary>
@@ -277,6 +279,12 @@ public sealed class FakeDiskMoveBackend : IDiskMoveBackend
         Alive();
         if (enabled && R is not null && Parts.Contains(R) && R.IsHidden)
             throw new InvalidOperationException("fake: reagentc /enable with a hidden Recovery partition");
+        if (!enabled && DisableFailures > 0)
+        {
+            DisableFailures--;
+            Calls.Add("SetWinRe(False) failed");
+            throw new DiskMoveException("fake: reagentc /disable failed");
+        }
         if (enabled && EnableFailures > 0)
         {
             EnableFailures--;

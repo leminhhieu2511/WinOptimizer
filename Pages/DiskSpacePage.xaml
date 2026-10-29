@@ -72,6 +72,16 @@
 
                 <!-- ① Disk map -->
                 <StackPanel x:Name="MapPanel">
+                    <!-- An unfinished move the user chose to try again later (this session only) -->
+                    <Border x:Name="PendingMoveBanner" Style="{StaticResource Card}" Visibility="Collapsed"
+                            BorderBrush="#9D5D00" BorderThickness="2">
+                        <DockPanel>
+                            <Button DockPanel.Dock="Right" Content="Go to Resume" Style="{StaticResource FooterButton}"
+                                    VerticalAlignment="Center" Click="ResultResume_Click" />
+                            <TextBlock TextWrapping="Wrap" VerticalAlignment="Center"
+                                       Text="An unfinished disk space move is waiting. No new move can start until it is finished; continue it from the Resume screen when you are ready." />
+                        </DockPanel>
+                    </Border>
                     <TextBlock Style="{StaticResource SectionHeader}" Text="Disks" />
                     <StackPanel x:Name="DiskMapHost" />
                     <TextBlock x:Name="MapStatusText" Style="{StaticResource SecondaryText}" Margin="0,4,0,0" />
@@ -193,6 +203,9 @@
                                             MinWidth="120" Padding="14,6" Click="Continue_Click" />
                                     <Button x:Name="ResumeRestartButton" Content="Restart as administrator"
                                             Style="{DynamicResource AccentButtonStyle}" Padding="14,6" Click="RestartAsAdmin_Click" />
+                                    <Button x:Name="ResumeLaterButton" Content="Try again later" Style="{StaticResource FooterButton}"
+                                            ToolTip="Hide this screen until WinOptimizer is started again. Nothing is changed; no new move can start meanwhile."
+                                            Click="ResumeLater_Click" />
                                 </StackPanel>
                             </StackPanel>
                         </DockPanel>

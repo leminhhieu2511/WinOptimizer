@@ -92,13 +92,15 @@ public partial class DiskSpacePage : UserControl
         try
         {
             LimitedBanner.Visibility = AdminHelper.IsAdmin || DiskMoveSession.IsRunning ? Visibility.Collapsed : Visibility.Visible;
-            if (DiskMoveSession.HasUnfinishedMove())
+            bool unfinished = DiskMoveSession.HasUnfinishedMove();
+            if (unfinished && !DiskMoveSession.ResumeDismissed)
             {
                 await ShowResumeAsync();
                 return;
             }
 
             ShowScreen(Screen.Map);
+            PendingMoveBanner.Visibility = unfinished ? Visibility.Visible : Visibility.Collapsed;
             MapStatusText.Text = "Reading the disk layout…";
             AnalyzeButton.IsEnabled = false;
             try
@@ -873,9 +875,12 @@ public partial class DiskSpacePage : UserControl
             case DiskMoveOutcome.Completed:
                 ResultTitle.Text = $"Done: {_targetName} has {Format.Bytes(_amount)} more space";
                 ResultText.Text = letterChange ?? $"{_sourceName} kept its letter, files and identity.";
-                ResultVerifyText.Text = "Verified: the partitions have the planned sizes and positions, a read-only chkdsk found no errors on " +
-                                        $"{(result.FinalSourceLetter is char l ? $"{l}:" : _sourceName)}" +
-                                        (DiskMoveSession.ManageWinRe && _hasRecovery ? ", and Windows Recovery is in its original state." : ".");
+                ResultVerifyText.Text = result.Warnings.Count > 0
+                    // Review I2: step 7 problems are warnings; the data itself was verified block by block while copying.
+                    ? "The data was copied and verified block by block. Please read the notes below."
+                    : "Verified: the partitions have the planned sizes and positions, a read-only chkdsk found no errors on " +
+                      $"{(result.FinalSourceLetter is char l ? $"{l}:" : _sourceName)}" +
+                      (DiskMoveSession.ManageWinRe && _hasRecovery ? ", and Windows Recovery is in its original state." : ".");
                 break;
             case DiskMoveOutcome.Undone:
                 ResultTitle.Text = "The interrupted attempt was undone";
@@ -939,9 +944,12 @@ public partial class DiskSpacePage : UserControl
             ? agg.Message.Split(" (")[0] + " " + string.Join(" ", agg.InnerExceptions.Select(i => i.Message))
             : ex.Message;
         bool unfinished = DiskMoveSession.HasUnfinishedMove();
-        ShowStopped("The move stopped", message + (unfinished
-            ? "\n\nYour data is safe. WinOptimizer can continue the move from where it stopped (Go to Resume)."
-            : "\n\nNo unfinished move was left behind."), ok: false);
+        string hint;
+        if (!unfinished) hint = "No unfinished move was left behind.";
+        else if (ex is DiskMoveUnsafeFilesException) hint = "Nothing was resumed; the Resume screen refuses too until the folder's permissions are fixed.";
+        else if (ex is DiskMoveAfterCommitException) hint = "The journal is kept, so the move can be finished later (Go to Resume).";
+        else hint = ResumeHint(ReadResumeInfo());
+        ShowStopped("The move stopped", message + "\n\n" + hint, ok: false);
 
         var paths = new List<string> { "Journal: " + DiskMoveSession.JournalPath };
         try
@@ -985,60 +993,107 @@ public partial class DiskSpacePage : UserControl
 
     // ================================================================== resume
 
-    private sealed record ResumeInfo(JournalInfo? Journal, RestoreState? State, PendingMove? Pending, string? Error);
+    /// <param name="JournalExists">journal.bin exists (it may still be unreadable: <paramref name="Journal"/> null).</param>
+    /// <param name="Unsafe">The data folder guard refused (review I1): nothing was read and Continue is disabled.</param>
+    private sealed record ResumeInfo(bool JournalExists, JournalInfo? Journal, RestoreState? State, PendingMove? Pending,
+        string? Error, string? Unsafe = null)
+    {
+        public DiskMoveRunner.ResumeDirection Direction => DiskMoveRunner.PredictResume(JournalExists, Journal, Pending);
+    }
 
     private async Task ShowResumeAsync()
     {
+        DiskMoveSession.ResumeDismissed = false;   // shown on purpose (Go to Resume, or a new start)
         ShowScreen(Screen.Resume);
         bool admin = AdminHelper.IsAdmin;
         ContinueButton.Visibility = admin ? Visibility.Visible : Visibility.Collapsed;
         ResumeRestartButton.Visibility = admin || DiskMoveSession.IsRunning ? Visibility.Collapsed : Visibility.Visible;
+        ResumeLaterButton.Visibility = DiskMoveSession.IsRunning ? Visibility.Collapsed : Visibility.Visible;
         ResumeDetailText.Text = "Journal folder: " + DiskMoveSession.DataDir;
 
         _ = LoadResumeMapAsync();
         if (!admin)
         {
-            // The journal is readable only by administrators: do not try.
-            ResumeText.Text = "The last disk space move was interrupted. Your data is safe — restart WinOptimizer as administrator to finish it.";
+            // The journal is readable only by administrators: do not try (nor guess which way the resume goes).
+            ResumeText.Text = "The last disk space move was interrupted. Your data is safe — restart WinOptimizer as administrator " +
+                              "to finish it (or to undo it, if no data had been moved yet).";
             return;
         }
 
         ResumeText.Text = "Reading the journal…";
         ContinueButton.IsEnabled = false;
         var info = await Task.Run(ReadResumeInfo);
-        ContinueButton.IsEnabled = true;
         _resumeInfo = info;
-        if (info.Journal is { } j)
+        if (info.Unsafe is not null)
+        {
+            ResumeText.Text = info.Unsafe;
+            return;   // Continue stays disabled
+        }
+        ContinueButton.IsEnabled = true;
+        string src = (info.State?.SourceLetter ?? info.Pending?.SourceLetter ?? '\0') is var c && c != '\0' ? $"{c}:" : "the source";
+        if (info.Journal is { } j && info.Direction == DiskMoveRunner.ResumeDirection.Finish)
         {
             int step = Math.Max((int)MoveStep.LockSource, (int)j.Step);
             int index = Math.Clamp(j.MoveIndex, 0, j.ChunkCount.Length - 1);
-            ResumeText.Text = $"The last disk space move was interrupted at step {Math.Min(step, (int)MoveStep.Verify)} " +
-                              $"(block {j.ChunksDone} of {j.ChunkCount[index]}). Your data is safe — click Continue to finish.";
-        }
-        else if (info.Pending is { } p)
-        {
-            ResumeText.Text = "The last disk space move was interrupted before any data was moved. Your data is safe — click Continue to give " +
-                              $"{(p.SourceLetter == '\0' ? "the source" : $"{p.SourceLetter}:")} its space back.";
+            ResumeText.Text = (j.Step >= MoveStep.MoveRecovery && j.Step <= MoveStep.Verify
+                                  ? $"The last disk space move stopped at step {step}. {src}'s data is already moved and safe — "
+                                  : $"The last disk space move was interrupted at step {Math.Min(step, (int)MoveStep.Verify)} " +
+                                    $"(block {j.ChunksDone} of {j.ChunkCount[index]}). Your data is safe — ") +
+                              "click Continue to finish the move, or Try again later.";
         }
         else
         {
-            ResumeText.Text = "The last disk space move was interrupted. Your data is safe — click Continue to finish.";
+            ResumeText.Text = ResumeHint(info);
         }
         if (info.Error is not null) ResumeDetailText.Text += "\nNote: " + info.Error;
     }
 
+    /// <summary>What Continue will do, in words (review minor 2: never "finish" when the resume undoes).</summary>
+    private static string ResumeHint(ResumeInfo info)
+    {
+        if (info.Unsafe is not null) return info.Unsafe;
+        char letter = info.State?.SourceLetter ?? info.Pending?.SourceLetter ?? '\0';
+        string src = letter == '\0' ? "the source" : $"{letter}:";
+        return info.Direction switch
+        {
+            DiskMoveRunner.ResumeDirection.Finish =>
+                "Your data is safe. Continue on the Resume screen finishes the move from where it stopped (Go to Resume).",
+            DiskMoveRunner.ResumeDirection.Undo =>
+                $"No data had been moved yet, so your data is safe. Continue on the Resume screen undoes the attempt and gives {src} its space back (Go to Resume).",
+            DiskMoveRunner.ResumeDirection.Unknown =>
+                "The journal could not be read. Continue on the Resume screen checks the disk and stops without changing anything " +
+                "unless the state is clear (Go to Resume).",
+            _ => "No unfinished move was left behind.",
+        };
+    }
+
     private ResumeInfo? _resumeInfo;
 
+    /// <summary>Reads the journal and marker for the Resume screen, after the data folder guard (review I1) when the
+    /// folder is the real one: nothing is read from an unsafe folder.</summary>
     private static ResumeInfo ReadResumeInfo()
     {
+        string pendingPath = Path.Combine(DiskMoveSession.DataDir, DiskMoveRunner.PendingFileName);
+        bool journalExists = File.Exists(DiskMoveSession.JournalPath);
+        if (DiskMoveSession.SecureDataFolder && (journalExists || File.Exists(pendingPath)))
+        {
+            try
+            {
+                DataFolderSecurity.PrepareTrusted(DiskMoveSession.DataDir, [DiskMoveSession.JournalPath, pendingPath]);
+            }
+            catch (DiskMoveUnsafeFilesException ex)
+            {
+                return new ResumeInfo(journalExists, null, null, null, null, ex.Message);
+            }
+        }
+
         JournalInfo? journal = null;
         RestoreState? state = null;
         PendingMove? pending = null;
         string? error = null;
         try
         {
-            if (File.Exists(DiskMoveSession.JournalPath))
-                journal = new WindowsDiskMoveBackend().ReadJournal(DiskMoveSession.JournalPath, out state);
+            if (journalExists) journal = new WindowsDiskMoveBackend().ReadJournal(DiskMoveSession.JournalPath, out state);
         }
         catch (Exception ex) when (ex is DiskMoveException or IOException or UnauthorizedAccessException or DllNotFoundException)
         {
@@ -1046,14 +1101,22 @@ public partial class DiskSpacePage : UserControl
         }
         try
         {
-            string path = Path.Combine(DiskMoveSession.DataDir, DiskMoveRunner.PendingFileName);
-            if (File.Exists(path)) pending = PendingMove.FromJsonBytes(File.ReadAllBytes(path));
+            if (File.Exists(pendingPath)) pending = PendingMove.FromJsonBytes(File.ReadAllBytes(pendingPath));
         }
         catch (Exception ex) when (ex is DiskMoveException or IOException or UnauthorizedAccessException)
         {
             error ??= "the pending marker could not be read (" + ex.Message + ").";
         }
-        return new ResumeInfo(journal, state, pending, error);
+        return new ResumeInfo(journalExists, journal, state, pending, error);
+    }
+
+    /// <summary>Review I2: leave the Resume screen for this session. Nothing changes on disk; new moves stay blocked.</summary>
+    private async void ResumeLater_Click(object sender, RoutedEventArgs e)
+    {
+        if (DiskMoveSession.IsRunning) return;
+        DiskMoveSession.ResumeDismissed = true;
+        _resumeInfo = null;
+        await RefreshAsync();
     }
 
     private async Task LoadResumeMapAsync()
@@ -1076,6 +1139,12 @@ public partial class DiskSpacePage : UserControl
     {
         if (DiskMoveSession.IsRunning || !AdminHelper.IsAdmin) return;
         var info = _resumeInfo ?? await Task.Run(ReadResumeInfo);
+        if (info.Unsafe is not null)
+        {
+            _resumeInfo = null;
+            ResumeText.Text = info.Unsafe;
+            return;
+        }
 #if DEBUG
         Guid? diskGuid = info.State?.DiskGuid ?? info.Pending?.DiskGuid;
         if (DiskMoveSession.TestTargetDisk is not null &&

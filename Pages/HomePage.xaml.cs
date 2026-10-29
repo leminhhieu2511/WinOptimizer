@@ -124,7 +124,7 @@ public partial class HomePage : UserControl
             ? $"Last scan found {Format.Bytes(junk)} you can free up"
             : "Find temporary and cache files you can safely remove";
         DiskSpaceStatusText.Text = DiskMoveSession.IsRunning ? "A disk space move is running"
-            : DiskMoveSession.HasUnfinishedMove() ? "An interrupted move needs to be finished"
+            : DiskMoveSession.HasUnfinishedMove() ? "An interrupted move is waiting on the Disk Space page"
             : "Move free space from a data partition to C:";
         StartupStatusText.Text = $"{s.StartupEnabled} of {s.StartupTotal} apps start with Windows";
         TweaksStatusText.Text = $"{s.TweaksOn} of {s.TweaksTotal} tweaks on";

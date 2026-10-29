@@ -90,7 +90,7 @@ public static class DiskMovePrechecks
 
         if (facts.JournalExists)
             Add(CheckSeverity.FixFirst, CheckCode.JournalExists,
-                "An unfinished move was found. Go to the Resume screen to finish it before starting a new one.");
+                "An unfinished move was found. Go to the Resume screen to finish it (or undo it, if no data had been moved yet) before starting a new one.");
 
         if (!r.Any(x => x.Severity == CheckSeverity.Blocker))
         {

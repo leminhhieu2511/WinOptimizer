@@ -33,30 +33,39 @@ public static class DiskMoveSession
 
     public static string DataDir => Path.GetDirectoryName(JournalPath)!;
 
-    /// <summary>A journal or pending marker exists: the Disk Space page must show the Resume screen.
-    /// File.Exists only, so it also works without admin rights.</summary>
+    /// <summary>A journal or pending marker exists: the Disk Space page must show the Resume screen. Lists the folder
+    /// (BUILTIN\Users may list it), so it also works without admin rights.</summary>
     public static bool HasUnfinishedMove()
     {
         try { return DiskMoveRunner.HasUnfinishedMove(DataDir); }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { return false; }
     }
 
-    /// <summary>Administrator only: re-applies <see cref="DiskMoveRunner.CreateDataFolderSecurity"/> to the default data
-    /// folder if it exists (an older build made it Administrators-only, hiding an unfinished move from non-admin
-    /// starts). Best effort; the test folder is left alone.</summary>
+    /// <summary>The data folder is guarded (<see cref="DataFolderSecurity"/>); false only for the Debug test folder.</summary>
+    public static bool SecureDataFolder => TestTargetDisk is null;
+
+    /// <summary>Administrator only, at app start: if the default data folder exists, checks the journal and marker and
+    /// gives both folders the owner Administrators and their protected ACLs (<see cref="DataFolderSecurity.PrepareTrusted"/>),
+    /// so a later non-admin start can detect an unfinished move. Best effort: a failure is reported again (and stops
+    /// everything) when the runner or the Resume screen prepares the folder.</summary>
     public static void RepairDataFolderSecurity()
     {
-        if (TestTargetDisk is not null) return;
+        if (!SecureDataFolder) return;
         try
         {
-            if (Directory.Exists(DataDir)) DiskMoveRunner.ApplyDataFolderSecurity(DataDir);
+            if (Directory.Exists(DataDir))
+                DataFolderSecurity.PrepareTrusted(DataDir, [JournalPath, Path.Combine(DataDir, DiskMoveRunner.PendingFileName)]);
         }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or InvalidOperationException
-                                       or System.Security.Principal.IdentityNotMappedException)
+        catch (DiskMoveException)
         {
-            // Not fatal: the runner re-applies it the next time it writes there.
+            // Not fatal here; the Resume screen and the runner refuse with the reason.
         }
     }
+
+    /// <summary>"Try again later" on the Resume screen: the Disk Space page shows the map instead of the Resume screen
+    /// for the rest of this session (review I2). New moves stay blocked (JournalExists) while a journal or marker
+    /// exists; the next start shows the Resume screen again.</summary>
+    public static bool ResumeDismissed { get; set; }
 
     /// <summary>Windows RE is disabled/re-enabled around the Recovery move, except on a test target.</summary>
     public static bool ManageWinRe => TestTargetDisk is null;

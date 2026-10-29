@@ -50,16 +50,28 @@ public sealed class DiskMoveRunner
         SecureDataFolder = string.Equals(DataDir, Path.GetDirectoryName(DefaultJournalPath), StringComparison.OrdinalIgnoreCase);
     }
 
-    /// <summary>Create the data folder (if missing) with an Administrators + SYSTEM only ACL. Defaults to true for
-    /// the default ProgramData folder, false elsewhere (tests).</summary>
+    /// <summary>Guard the data folder (<see cref="DataFolderSecurity"/>): owner and protected ACLs on it and its parent,
+    /// and an admin-only check of the folders, journal and marker before they are trusted. Defaults to true for the
+    /// default ProgramData folder, false elsewhere (tests).</summary>
     public bool SecureDataFolder { get; init; }
+
+    /// <summary>Overrides the data folder guard (tests). Null: <see cref="DataFolderSecurity.Guard"/> when
+    /// <see cref="SecureDataFolder"/>, else none.</summary>
+    public IDataFolderGuard? FolderGuard { get; init; }
+
+    private IDataFolderGuard? Guard => FolderGuard ?? (SecureDataFolder ? DataFolderSecurity.Guard : null);
+
+    /// <summary>Review I1: before any trust of journal.bin / pending.json and before a run writes there. Throws
+    /// <see cref="DiskMoveUnsafeFilesException"/>; nothing on the disk has changed at that point.</summary>
+    private void PrepareDataFolder() => Guard?.PrepareTrusted(DataDir, [_journal, PendingPath]);
 
     /// <summary>How often a paused move polls shouldPause (spec: 1 s).</summary>
     public TimeSpan PausePollInterval { get; init; } = TimeSpan.FromSeconds(1);
     /// <summary>Clock for the backup file names and their 30-day retention.</summary>
     public Func<DateTime> Now { get; init; } = () => DateTime.Now;
 
-    /// <summary>File.Exists only: the journal's ACL makes it unreadable to a non-admin process.</summary>
+    /// <summary>File.Exists only (a non-admin process cannot see an admin-only file this way; use
+    /// <see cref="HasUnfinishedMove"/> for that).</summary>
     public static bool HasUnfinishedJournal(string journalPath) => File.Exists(journalPath);
 
     /// <summary>A journal ("journal.bin") or a pending marker ("pending.json") exists in the data folder: the app must
@@ -84,6 +96,29 @@ public sealed class DiskMoveRunner
 
     private string DataDir => Path.GetDirectoryName(Path.GetFullPath(_journal))!;
 
+    /// <summary>Which way a resume will go, from what is in the data folder (mirrors <see cref="Resume"/>).</summary>
+    public enum ResumeDirection
+    {
+        /// <summary>Neither a journal nor a marker.</summary>
+        None,
+        /// <summary>The move continues forward (journal without an undo marker, or at step 3 or later).</summary>
+        Finish,
+        /// <summary>Nothing was moved yet: the attempt is undone and the source gets its space back.</summary>
+        Undo,
+        /// <summary>The journal could not be read and there is no marker: the resume stops without changes.</summary>
+        Unknown,
+    }
+
+    /// <summary>Predicts what <see cref="ResumeAsync"/> will do. <paramref name="journal"/> null with
+    /// <paramref name="journalExists"/> means the journal is unreadable.</summary>
+    public static ResumeDirection PredictResume(bool journalExists, JournalInfo? journal, PendingMove? pending)
+    {
+        if (!journalExists) return pending is null ? ResumeDirection.None : ResumeDirection.Undo;
+        if (journal is null) return pending is null ? ResumeDirection.Unknown : ResumeDirection.Undo;   // torn create
+        if (pending is { Undoing: true } && journal.Step < MoveStep.MoveSource) return ResumeDirection.Undo;
+        return ResumeDirection.Finish;
+    }
+
     /// <summary>Mutable state of one run/resume.</summary>
     private sealed class Ctx
     {
@@ -95,7 +130,7 @@ public sealed class DiskMoveRunner
         public IDisposable? SourceLock;
         public IDisposable? RecoveryLock;
         // Undo bookkeeping (only before step 3 of a fresh run).
-        public bool Shrunk, JournalCreated, SourceHidden;
+        public bool Shrunk, JournalCreated, SourceHidden, UndoMarkerWritten;
         public readonly List<string> Warnings = [];
         public char? FinalLetter;
 
@@ -140,6 +175,7 @@ public sealed class DiskMoveRunner
         if (HasUnfinishedJournal(_journal) || File.Exists(PendingPath))
             throw new DiskMoveException($"An unfinished move exists in {DataDir}; resume it instead of starting a new move.");
         cancel.ThrowIfCancellationRequested();
+        PrepareDataFolder();   // refuse up front, before anything is written (review I1 / T12 N1)
 
         // ---------------------------------------------------------------- step 0: checks + layout backup
         if (plan.PartitionsToShift.Count == 0 || plan.PartitionsToShift[0].Guid != source.Guid)
@@ -242,8 +278,8 @@ public sealed class DiskMoveRunner
                 catch (Exception undo)
                 {
                     throw new AggregateException(
-                        "The move failed before any data was moved, and undoing it failed too. " +
-                        (HasUnfinishedJournal(_journal) ? $"Resume will finish the move from {_journal}." : ""), ex, undo);
+                        "The move failed before any data was moved, and undoing it failed too. Your data is safe. " +
+                        UndoFailedHint(ctx), ex, undo);
                 }
                 ExceptionDispatchInfo.Capture(ex).Throw();
                 throw;
@@ -257,6 +293,17 @@ public sealed class DiskMoveRunner
         {
             ctx.ReleaseLocks();
         }
+    }
+
+    /// <summary>What the next resume does after a failed undo (review minor 2): it undoes once the Undoing marker is
+    /// written (or with a marker and no journal), it continues forward from a journal without that marker.</summary>
+    private string UndoFailedHint(Ctx ctx)
+    {
+        bool journal = HasUnfinishedJournal(_journal), pending = File.Exists(PendingPath);
+        if (ctx.UndoMarkerWritten || (pending && !journal))
+            return "The Resume screen (Continue) will finish undoing it and give the source its original size back.";
+        if (journal) return $"The Resume screen (Continue) will continue the move from the journal {_journal}.";
+        return "";
     }
 
     private void ShrinkSource(Ctx ctx)
@@ -332,7 +379,11 @@ public sealed class DiskMoveRunner
         ctx.Progress.Report(new RunProgress(MoveStep.LockSource, 0, 0, "Undoing the changes"));
         // Read-only first: the source must still be on this disk (also keeps a crashed process from touching the marker).
         long size = _b.PartitionSize(ctx.Disk, s.SourceGuid);
+        if (size > s.SourceOriginalSize)
+            throw new DiskMoveStateMismatchException(
+                $"The source is {size} bytes, larger than its original {s.SourceOriginalSize}; the undo changed nothing.");
         WritePending(PendingFor(s, undoing: true));
+        ctx.UndoMarkerWritten = true;
         if (ctx.SourceHidden)
             _b.SetPartitionAttributes(ctx.Disk, s.SourceGuid, s.SourceGptAttributes);   // still locked: nothing mounts before
         ctx.ReleaseLocks();
@@ -340,7 +391,7 @@ public sealed class DiskMoveRunner
         ctx.SourceHidden = false;
         if (ctx.JournalCreated) _b.DeleteJournal(_journal);
         ctx.JournalCreated = false;
-        if (ctx.Shrunk || size != s.SourceOriginalSize) _b.ResizePartition(ctx.Disk, s.SourceGuid, s.SourceOriginalSize);
+        if (size < s.SourceOriginalSize) _b.ResizePartition(ctx.Disk, s.SourceGuid, s.SourceOriginalSize);   // never shrink
         ctx.Shrunk = false;
         DeletePending();
     }
@@ -356,11 +407,10 @@ public sealed class DiskMoveRunner
 
     private DiskMoveResult Resume(IProgress<RunProgress> progress, Func<bool> shouldPause)
     {
-        if (!HasUnfinishedJournal(_journal))
-        {
-            if (File.Exists(PendingPath)) return UndoPending(progress);
+        if (!HasUnfinishedJournal(_journal) && !File.Exists(PendingPath))
             return new DiskMoveResult(DiskMoveOutcome.NothingToDo, null, []);
-        }
+        PrepareDataFolder();   // review I1: nothing is read or trusted before this
+        if (!HasUnfinishedJournal(_journal)) return UndoPending(progress);
         var pending = ReadPending();
         JournalInfo? info;
         RestoreState? state;
@@ -555,17 +605,40 @@ public sealed class DiskMoveRunner
         for (var step = first; step <= MoveStep.Verify; step++)
         {
             if (step != first || recordFirst) _b.SetJournalStep(_journal, step);
-            switch (step)
+            try
             {
-                case MoveStep.MoveSource: MoveSource(ctx); break;
-                case MoveStep.CommitSource: CommitSource(ctx); break;
-                case MoveStep.MoveRecovery: MoveRecovery(ctx); break;
-                case MoveStep.ExtendTarget: ExtendTarget(ctx); break;
-                case MoveStep.Verify: Verify(ctx); break;
+                switch (step)
+                {
+                    case MoveStep.MoveSource: MoveSource(ctx); break;
+                    case MoveStep.CommitSource: CommitSource(ctx); break;
+                    case MoveStep.MoveRecovery: MoveRecovery(ctx); break;
+                    case MoveStep.ExtendTarget: ExtendTarget(ctx); break;
+                    case MoveStep.Verify: Verify(ctx); break;
+                }
+            }
+            catch (DiskMoveException ex) when (step is MoveStep.MoveRecovery or MoveStep.ExtendTarget &&
+                                               ex is not DiskMoveStateMismatchException)
+            {
+                // Review I2: after step 4 the source's data is moved and committed. A failure here (Recovery volume
+                // busy, reagentc /disable failed, extend failed) is usually transient: keep the journal (resumable) and
+                // say clearly that the data is safe.
+                throw new DiskMoveAfterCommitException(AfterCommitText(ctx, step, ex), ex);
             }
         }
         _b.SetJournalStep(_journal, MoveStep.Done);
         Finish(ctx);
+    }
+
+    private static string AfterCommitText(Ctx ctx, MoveStep step, Exception ex)
+    {
+        var s = ctx.State;
+        string src = ctx.FinalLetter is char l ? $"{l}:" : s.SourceLetter != '\0' ? $"{s.SourceLetter}:" : "The data partition";
+        string what = step == MoveStep.MoveRecovery ? "Moving the Recovery partition" : "Extending the Windows partition";
+        string winRe = step == MoveStep.MoveRecovery && s.ManageWinRe && s.WinReWasEnabled
+            ? " Windows Recovery may stay turned off until the move is finished." : "";
+        return $"{src}'s data is already moved and safe. {what} did not finish: {ex.Message} This is usually temporary " +
+               "(for example the Recovery volume was in use). Choose \"Try again later\" on the Resume screen and continue " +
+               "later, for example after a restart; until then the Windows partition is not extended and no new move can start." + winRe;
     }
 
     private void MoveSource(Ctx ctx)
@@ -686,37 +759,43 @@ public sealed class DiskMoveRunner
         else if (size != want) throw new DiskMoveStateMismatchException($"The target is {size} bytes, neither {s.TargetOriginalSize} nor {want}.");
     }
 
-    /// <summary>Step 7: read-only chkdsk of the source, WinRE as before, sizes and start as planned.</summary>
+    /// <summary>
+    /// Step 7: read-only chkdsk of the source, WinRE as before, sizes and start as planned. Review I2: nothing found here
+    /// can mean that data was not moved correctly (every chunk was read back and compared before it was recorded, and
+    /// steps 4-6 already checked the starts and sizes they set), so each problem becomes a result warning, the journal
+    /// is deleted and the move completes. The layout backups stay for 30 days.
+    /// </summary>
     private void Verify(Ctx ctx)
     {
         var s = ctx.State;
         ctx.Progress.Report(new RunProgress(MoveStep.Verify, 0, 0, "Verifying the result"));
-        var problems = new List<string>();
-        long tSize = _b.PartitionSize(ctx.Disk, s.TargetGuid);
-        if (tSize != s.TargetOriginalSize + s.Amount) problems.Add($"target is {tSize} bytes");
+        long tSize = _b.PartitionSize(ctx.Disk, s.TargetGuid), tWant = s.TargetOriginalSize + s.Amount;
+        if (tSize != tWant)
+            ctx.Warn(MoveStep.Verify, $"The Windows partition is {tSize} bytes, not the planned {tWant}. Check it in Disk Management.");
         long srcSize = _b.PartitionSize(ctx.Disk, s.SourceGuid), srcStart = _b.PartitionStart(ctx.Disk, s.SourceGuid);
-        if (srcSize != s.SourceShrunkSize || srcStart != s.SourceNewStart) problems.Add($"source is at {srcStart} (+{srcSize})");
+        string src = s.SourceLetter != '\0' ? $"{s.SourceLetter}:" : "The data partition";
+        if (srcSize != s.SourceShrunkSize || srcStart != s.SourceNewStart)
+            ctx.Warn(MoveStep.Verify, $"{src} is at {srcStart} (+{srcSize} bytes), not at the planned {s.SourceNewStart} " +
+                                      $"(+{s.SourceShrunkSize}). Check it in Disk Management.");
         if (ctx.ManageWinRe && _b.WinReEnabled() != s.WinReWasEnabled)
-        {
-            if (s.WinReWasEnabled) ctx.Warn(MoveStep.Verify, WinReWarning);   // not a failure of the move itself
-            else problems.Add("Windows RE is enabled but was disabled before");
-        }
+            ctx.Warn(MoveStep.Verify, s.WinReWasEnabled
+                ? WinReWarning
+                : "Windows Recovery is turned on now but was off before the move. Run `reagentc /disable` as administrator if you want it off.");
         if (s.SourceLetter != '\0')
         {
             if (_b.GetLetter(s.SourceVolumePath!) is not char letter)
             {
-                problems.Add($"the source has no drive letter (it was {s.SourceLetter}:)");
+                ctx.Warn(MoveStep.Verify, $"{s.SourceLetter}: has no drive letter after the move. Its data is intact; give it a " +
+                                          "letter in Disk Management, then run a disk check on it.");
             }
             else
             {
                 NoteLetter(ctx, MoveStep.Verify, letter);
                 int rc = _b.Chkdsk(letter);
-                if (rc != 0) problems.Add($"chkdsk {letter}: returned {rc}");
+                if (rc != 0)
+                    ctx.Warn(MoveStep.Verify, $"chkdsk reported problems on {letter}: (exit code {rc}). Run `chkdsk {letter}: /f` as administrator.");
             }
         }
-        if (problems.Count > 0)
-            throw new DiskMoveVerificationException("Verification failed: " + string.Join("; ", problems) +
-                                                    $". The journal is kept: {_journal}.");
     }
 
     private void Finish(Ctx ctx)
@@ -728,48 +807,23 @@ public sealed class DiskMoveRunner
 
     // ================================================================== layout backups
 
-    /// <summary>Creates the data folder. With <see cref="SecureDataFolder"/> a new folder gets
-    /// <see cref="CreateDataFolderSecurity"/>, and an existing one (for example made by an older build with an
-    /// Administrators-only ACL) gets it re-applied, so a non-admin start can always see an unfinished move.</summary>
+    /// <summary>Creates the data folder if missing. With a guard it was already secured (and checked) at the start of
+    /// the run or resume, so nothing is re-applied here and an undo cannot fail half way on an ACL write (T12 N1); a
+    /// folder that has vanished since is created and secured again through the guard (throws before any write).</summary>
     private void EnsureDataDir()
     {
-        if (!SecureDataFolder)
+        if (Guard is not { } guard)
         {
             Directory.CreateDirectory(DataDir);
             return;
         }
-        if (Directory.Exists(DataDir))
-        {
-            ApplyDataFolderSecurity(DataDir);
-            return;
-        }
-        Directory.CreateDirectory(Path.GetDirectoryName(DataDir)!);
-        new DirectoryInfo(DataDir).Create(CreateDataFolderSecurity());
+        if (!Directory.Exists(DataDir)) guard.PrepareTrusted(DataDir, [_journal, PendingPath]);
     }
 
-    /// <summary>
-    /// The data folder's ACL (protected: nothing inherited from ProgramData).
-    /// Administrators and SYSTEM: full control, inherited by the files (journal, pending marker, backups), which
-    /// therefore stay readable by administrators only.
-    /// BUILTIN\Users: list the folder and read its attributes and permissions, on this folder only (not inherited),
-    /// so a non-admin process can see THAT a journal or pending marker exists (<see cref="HasUnfinishedMove"/>)
-    /// without being able to read either.
-    /// </summary>
-    public static DirectorySecurity CreateDataFolderSecurity()
-    {
-        var sec = new DirectorySecurity();
-        sec.SetAccessRuleProtection(isProtected: true, preserveInheritance: false);
-        foreach (var sid in new[] { WellKnownSidType.BuiltinAdministratorsSid, WellKnownSidType.LocalSystemSid })
-            sec.AddAccessRule(new FileSystemAccessRule(new SecurityIdentifier(sid, null), FileSystemRights.FullControl,
-                InheritanceFlags.ContainerInherit | InheritanceFlags.ObjectInherit, PropagationFlags.None, AccessControlType.Allow));
-        sec.AddAccessRule(new FileSystemAccessRule(new SecurityIdentifier(WellKnownSidType.BuiltinUsersSid, null),
-            FileSystemRights.ListDirectory | FileSystemRights.ReadAttributes | FileSystemRights.ReadExtendedAttributes |
-            FileSystemRights.ReadPermissions,
-            InheritanceFlags.None, PropagationFlags.None, AccessControlType.Allow));
-        return sec;
-    }
+    /// <summary>The data folder's ACL: see <see cref="DataFolderSecurity.CreateDataFolderSecurity"/>.</summary>
+    public static DirectorySecurity CreateDataFolderSecurity() => DataFolderSecurity.CreateDataFolderSecurity();
 
-    /// <summary>Sets <see cref="CreateDataFolderSecurity"/> on an existing folder (needs admin rights or ownership).</summary>
+    /// <summary>Sets <see cref="CreateDataFolderSecurity"/> (DACL only) on an existing folder.</summary>
     public static void ApplyDataFolderSecurity(string dataDir) =>
         new DirectoryInfo(dataDir).SetAccessControl(CreateDataFolderSecurity());
 

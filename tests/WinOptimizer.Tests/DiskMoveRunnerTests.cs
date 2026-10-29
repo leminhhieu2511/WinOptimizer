@@ -754,12 +754,277 @@ public sealed class DiskMoveRunnerTests : IDisposable
         Assert.True(File.Exists(Path.Combine(_dir, "layout-20261029-120000.json")));
     }
 
+    // ------------------------------------------------------------------ review I2: no loop after the commit
+
     [Fact]
-    public async Task Verify_ChkdskFails_KeepsJournal()
+    public async Task Verify_ChkdskFails_WarnsDeletesJournalAndCompletes()
     {
         var f = new FakeDiskMoveBackend { ChkdskResult = 3 };
-        await Assert.ThrowsAsync<DiskMoveVerificationException>(() => Run(f));
+        var b = Capture(f);
+        var r = await Run(f);
+        Assert.Equal(DiskMoveOutcome.Completed, r.Outcome);
+        Assert.Equal(["chkdsk reported problems on D: (exit code 3). Run `chkdsk D: /f` as administrator."], r.Warnings);
+        AssertMoved(f, b);   // includes: no journal, no marker
+    }
+
+    [Fact]
+    public async Task Verify_MissingLetter_WarnsAndCompletes()
+    {
+        var f = new FakeDiskMoveBackend();
+        var b = Capture(f);
+        f.OnCall = c => { if (c == "Step(Verify)") { f.D.Letter = '\0'; f.D.RememberedLetter = '\0'; } };
+        var r = await Run(f);
+        Assert.Equal(DiskMoveOutcome.Completed, r.Outcome);
+        Assert.Contains(r.Warnings, w => w.StartsWith("D: has no drive letter after the move. Its data is intact"));
+        Assert.DoesNotContain(f.Calls, c => c.StartsWith("Chkdsk"));
+        AssertMoved(f, b with { DLetter = '\0' });
+    }
+
+    [Fact]
+    public async Task Verify_WinReOnButWasOff_WarnsAndCompletes()
+    {
+        var f = new FakeDiskMoveBackend { WinRe = false };
+        var b = Capture(f);
+        f.OnCall = c => { if (c == "Step(Verify)") f.WinRe = true; };
+        var r = await Run(f);
+        Assert.Equal(DiskMoveOutcome.Completed, r.Outcome);
+        Assert.Contains(r.Warnings, w => w.Contains("reagentc /disable"));
+        AssertMoved(f, b with { WinRe = true });
+    }
+
+    [Fact]
+    public async Task Verify_SizeMismatch_WarnsAndCompletes()
+    {
+        var f = new FakeDiskMoveBackend();
+        var b = Capture(f);
+        f.OnCall = c => { if (c == "Step(Verify)") f.C.Size -= FakeDiskMoveBackend.MiB; };   // something resized C meanwhile
+        var r = await Run(f);
+        Assert.Equal(DiskMoveOutcome.Completed, r.Outcome);
+        Assert.Contains(r.Warnings, w => w.StartsWith("The Windows partition is") && w.Contains("Disk Management"));
+        Assert.False(DiskMoveRunner.HasUnfinishedMove(_dir));
+    }
+
+    /// <summary>Step 7 problems found on a resume (the reviewer's loop): the resume completes with warnings once.</summary>
+    [Fact]
+    public async Task Verify_FailsAfterCrash_ResumeWarnsOnceAndCompletes()
+    {
+        var f = new FakeDiskMoveBackend { ChkdskResult = 2 };
+        f.OnCall = c => { if (c == "Step(Verify)") f.CrashAtCall = f.CallCount; };
+        await Assert.ThrowsAnyAsync<Exception>(() => Run(f));
+        f.Revive();
+        var r = await Runner(f).ResumeAsync(new SyncProgress(), () => false);
+        Assert.Equal(DiskMoveOutcome.Completed, r.Outcome);
+        Assert.Single(r.Warnings);
+        Assert.False(DiskMoveRunner.HasUnfinishedMove(_dir));
+        Assert.Equal(DiskMoveOutcome.NothingToDo, (await Runner(f).ResumeAsync(new SyncProgress(), () => false)).Outcome);
+    }
+
+    [Fact]
+    public async Task Step5_RecoveryBusy_KeepsJournalSaysDataSafe_ThenResumeCompletes()
+    {
+        var f = new FakeDiskMoveBackend();
+        var b = Capture(f);
+        f.R.InUse = true;   // something holds the Recovery volume
+        var ex = await Assert.ThrowsAsync<DiskMoveAfterCommitException>(() => Run(f));
+        Assert.StartsWith("D:'s data is already moved and safe. Moving the Recovery partition did not finish", ex.Message);
+        Assert.Contains("Try again later", ex.Message);
+        Assert.IsType<DiskMoveNativeException>(ex.InnerException);
         Assert.True(DiskMoveRunner.HasUnfinishedJournal(Journal));
+        Assert.Equal(b.DStart + X, f.D.Start);          // the source is committed and visible again
+        Assert.Equal(b.DAttrs, f.D.Attrs);
+        Assert.Equal('D', f.D.Letter);
+        Assert.Equal(b.RStart, f.R.Start);               // Recovery untouched
+        Assert.False(f.R.IsHidden);
+
+        f.R.InUse = false;                               // later
+        var r = await Runner(f).ResumeAsync(new SyncProgress(), () => false);
+        Assert.Equal(DiskMoveOutcome.Completed, r.Outcome);
+        AssertMoved(f, b);
+    }
+
+    [Fact]
+    public async Task Step5_ReagentcDisableFails_KeepsJournalSaysDataSafe_ThenResumeCompletes()
+    {
+        var f = new FakeDiskMoveBackend { DisableFailures = 1 };
+        var b = Capture(f);
+        var ex = await Assert.ThrowsAsync<DiskMoveAfterCommitException>(() => Run(f));
+        Assert.Contains("data is already moved and safe", ex.Message);
+        Assert.Contains("reagentc /disable failed", ex.Message);
+        Assert.True(DiskMoveRunner.HasUnfinishedJournal(Journal));
+        Assert.Equal(b.RStart, f.R.Start);
+        var r = await Runner(f).ResumeAsync(new SyncProgress(), () => false);
+        Assert.Equal(DiskMoveOutcome.Completed, r.Outcome);
+        AssertMoved(f, b);
+    }
+
+    // ------------------------------------------------------------------ review minors 2 and 3: undo
+
+    /// <summary>Minor 3: the undo never shrinks. A source found larger than recorded stops the undo before any change.</summary>
+    [Fact]
+    public async Task Undo_SourceLargerThanOriginal_StopsWithoutChanges()
+    {
+        var f = new FakeDiskMoveBackend();
+        var b = Capture(f);
+        using var cts = new CancellationTokenSource();
+        int countAtCancel = -1;
+        f.OnCall = c =>
+        {
+            if (c != "Dismount(D)") return;
+            f.D.Size = b.DSize + FakeDiskMoveBackend.MiB;   // something grew it (the fake's model allows it: D is hidden)
+            countAtCancel = f.Calls.Count;
+            cts.Cancel();
+        };
+        await Assert.ThrowsAsync<DiskMoveStateMismatchException>(() => Run(f, ct: cts.Token));
+        Assert.Equal(countAtCancel, f.Calls.Count(c => !c.StartsWith("Unlock")));   // nothing after the cancel point
+        Assert.Equal(b.DSize + FakeDiskMoveBackend.MiB, f.D.Size);
+        Assert.DoesNotContain(f.Calls, c => c.StartsWith($"Resize(D,{b.DSize})"));
+    }
+
+    [Fact]
+    public async Task Undo_ResizesBackOnlyWhenSmaller()
+    {
+        var f = new FakeDiskMoveBackend();
+        var b = Capture(f);
+        using var cts = new CancellationTokenSource();
+        f.OnCall = c => { if (c == "Dismount(D)") cts.Cancel(); };
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => Run(f, ct: cts.Token));
+        Assert.Single(f.Calls, c => c == $"Resize(D,{b.DSize})");
+        Assert.Equal(b.DSize, f.D.Size);
+    }
+
+    /// <summary>Minor 2: the undo marker is written, the undo then fails: the text says the resume will UNDO.</summary>
+    [Fact]
+    public async Task UndoFails_AfterUndoMarker_SaysResumeWillUndo()
+    {
+        var f = new FakeDiskMoveBackend();
+        var b = Capture(f);
+        f.D.InUse = true;                      // step 2 lock fails ...
+        f.CrashBeforeResizeTo = b.DSize;       // ... and the undo dies giving D its size back
+        var ex = await Assert.ThrowsAsync<AggregateException>(() => Run(f));
+        Assert.Contains("will finish undoing it", ex.Message);
+        Assert.DoesNotContain("continue the move", ex.Message);
+        f.Revive();
+        f.D.InUse = false;
+        var r = await Runner(f).ResumeAsync(new SyncProgress(), () => false);
+        Assert.Equal(DiskMoveOutcome.Undone, r.Outcome);   // what the text promised
+    }
+
+    /// <summary>Minor 2: the undo fails before its marker, with the journal present: the resume continues forward.</summary>
+    [Fact]
+    public async Task UndoFails_BeforeUndoMarker_WithJournal_SaysResumeWillContinue()
+    {
+        var f = new FakeDiskMoveBackend();
+        var b = Capture(f);
+        f.OnCall = c => { if (c == "CreateJournal") f.CrashAtCall = f.CallCount; };   // undo's first read fails too
+        var ex = await Assert.ThrowsAsync<AggregateException>(() => Run(f));
+        Assert.Contains("will continue the move", ex.Message);
+        f.Revive();
+        var r = await Runner(f).ResumeAsync(new SyncProgress(), () => false);
+        Assert.Equal(DiskMoveOutcome.Completed, r.Outcome);   // what the text promised
+        AssertMoved(f, b);
+    }
+
+    [Theory]
+    [InlineData(false, false, false, null, DiskMoveRunner.ResumeDirection.None)]
+    [InlineData(false, false, true, null, DiskMoveRunner.ResumeDirection.Undo)]
+    [InlineData(true, false, false, null, DiskMoveRunner.ResumeDirection.Unknown)]      // unreadable journal, no marker
+    [InlineData(true, false, true, null, DiskMoveRunner.ResumeDirection.Undo)]          // torn create
+    [InlineData(true, true, false, MoveStep.LockSource, DiskMoveRunner.ResumeDirection.Finish)]
+    [InlineData(true, true, true, MoveStep.LockSource, DiskMoveRunner.ResumeDirection.Finish)]   // marker not Undoing
+    [InlineData(true, true, true, MoveStep.MoveSource, DiskMoveRunner.ResumeDirection.Finish)]
+    public void PredictResume_MatchesResume(bool journalExists, bool readable, bool pending, MoveStep? step,
+        DiskMoveRunner.ResumeDirection expected)
+    {
+        var j = readable ? new JournalInfo(2, step!.Value, 0, 0, [4, 4]) : null;
+        var p = pending ? new PendingMove(Guid.NewGuid(), Guid.NewGuid(), 'D', 1, Guid.NewGuid(), 1, DateTime.Now) : null;
+        Assert.Equal(expected, DiskMoveRunner.PredictResume(journalExists, j, p));
+    }
+
+    [Theory]
+    [InlineData(MoveStep.LockSource, DiskMoveRunner.ResumeDirection.Undo)]
+    [InlineData(MoveStep.MoveSource, DiskMoveRunner.ResumeDirection.Finish)]
+    public void PredictResume_UndoingMarker(MoveStep step, DiskMoveRunner.ResumeDirection expected)
+    {
+        var p = new PendingMove(Guid.NewGuid(), Guid.NewGuid(), 'D', 1, Guid.NewGuid(), 1, DateTime.Now, true);
+        Assert.Equal(expected, DiskMoveRunner.PredictResume(true, new JournalInfo(2, step, 0, 0, [4, 4]), p));
+    }
+
+    // ------------------------------------------------------------------ review I1: the data folder guard
+
+    sealed class FakeGuard(FakeDiskMoveBackend f, bool refuse) : IDataFolderGuard
+    {
+        public readonly List<IReadOnlyList<string>> Seen = [];
+
+        public void PrepareTrusted(string dataDir, IReadOnlyList<string> files)
+        {
+            Seen.Add(files);
+            if (refuse) throw new DiskMoveUnsafeFilesException(dataDir, "journal.bin is not safe: BUILTIN\\Users may change it.");
+            Directory.CreateDirectory(dataDir);   // like the real guard
+            f.Calls.Add("Guard");
+        }
+    }
+
+    [Fact]
+    public async Task Resume_UnsafeDataFolder_RefusesBeforeReadingAnything()
+    {
+        var f = new FakeDiskMoveBackend();
+        f.OnCall = c => { if (c == "Chunk(0,1)") f.CrashAtCall = f.CallCount; };   // half moved
+        await Assert.ThrowsAnyAsync<Exception>(() => Run(f));
+        f.Revive();
+        var before = f.Calls.Count;
+        var guard = new FakeGuard(f, refuse: true);
+        var runner = new DiskMoveRunner(f, Journal) { FolderGuard = guard };
+        var ex = await Assert.ThrowsAsync<DiskMoveUnsafeFilesException>(() => runner.ResumeAsync(new SyncProgress(), () => false));
+        Assert.StartsWith("The disk move files have unsafe permissions and were not used.", ex.Message);
+        Assert.Equal(before, f.Calls.Count);   // nothing on the disk changed
+        Assert.Equal(new[] { Journal, Pending }, Assert.Single(guard.Seen).ToArray());
+        Assert.True(DiskMoveRunner.HasUnfinishedJournal(Journal));
+    }
+
+    [Fact]
+    public async Task Resume_PendingOnly_UnsafeDataFolder_Refuses()
+    {
+        var f = new FakeDiskMoveBackend();
+        f.OnCall = c => { if (c.StartsWith("Resize(D,")) f.CrashAtCall = f.CallCount; };
+        await Assert.ThrowsAnyAsync<Exception>(() => Run(f));
+        f.Revive();
+        var before = f.Calls.Count;
+        var runner = new DiskMoveRunner(f, Journal) { FolderGuard = new FakeGuard(f, refuse: true) };
+        await Assert.ThrowsAsync<DiskMoveUnsafeFilesException>(() => runner.ResumeAsync(new SyncProgress(), () => false));
+        Assert.Equal(before, f.Calls.Count);
+        Assert.True(File.Exists(Pending));
+    }
+
+    [Fact]
+    public async Task Run_UnsafeDataFolder_RefusesBeforeAnyWrite()
+    {
+        var f = new FakeDiskMoveBackend();
+        var runner = new DiskMoveRunner(f, Journal) { FolderGuard = new FakeGuard(f, refuse: true) };
+        await Assert.ThrowsAsync<DiskMoveUnsafeFilesException>(() => Run(f, runner));
+        Assert.Empty(f.Calls);
+        Assert.False(Directory.Exists(_dir) && Directory.EnumerateFiles(_dir).Any());
+    }
+
+    [Fact]
+    public async Task Guard_RunsFirst_ThenTheMoveCompletes()
+    {
+        var f = new FakeDiskMoveBackend();
+        var b = Capture(f);
+        var runner = new DiskMoveRunner(f, Journal) { FolderGuard = new FakeGuard(f, refuse: false) };
+        await Run(f, runner);
+        Assert.Equal("Guard", f.Calls[0]);
+        Assert.Single(f.Calls, c => c == "Guard");   // not re-applied later in the run (T12 N1)
+        AssertMoved(f, b);
+    }
+
+    [Fact]
+    public async Task Resume_NothingThere_DoesNotTouchTheFolder()
+    {
+        var f = new FakeDiskMoveBackend();
+        var guard = new FakeGuard(f, refuse: true);
+        var r = await new DiskMoveRunner(f, Journal) { FolderGuard = guard }.ResumeAsync(new SyncProgress(), () => false);
+        Assert.Equal(DiskMoveOutcome.NothingToDo, r.Outcome);
+        Assert.Empty(guard.Seen);
     }
 
     [Fact]

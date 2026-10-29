@@ -62,7 +62,7 @@ public sealed record RestoreState(Guid DiskGuid, Guid SourceGuid, char SourceLet
 /// <summary>How a run or resume ended.</summary>
 public enum DiskMoveOutcome
 {
-    /// <summary>All steps done; the journal is deleted.</summary>
+    /// <summary>All steps done; the journal is deleted. Problems found by step 7 are in the result's warnings.</summary>
     Completed,
     /// <summary>An attempt interrupted before any data moved was undone (the source got its size back).</summary>
     Undone,
@@ -146,5 +146,7 @@ public sealed class DiskMoveNativeException(int status, string operation)
     };
 }
 
-/// <summary>Step 7 found the result not as planned; the journal is kept.</summary>
-public sealed class DiskMoveVerificationException(string message) : DiskMoveException(message);
+/// <summary>A step after the source was committed (5 or 6) failed, usually transiently (Recovery volume busy, reagentc).
+/// The source's data is moved and safe; the journal is kept so the move can be continued later (review I2). Step 7
+/// problems never throw: they are result warnings.</summary>
+public sealed class DiskMoveAfterCommitException(string message, Exception inner) : DiskMoveException(message, inner);
