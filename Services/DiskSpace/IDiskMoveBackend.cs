@@ -1,0 +1,65 @@
+namespace WinOptimizer.Services.DiskSpace;
+
+/// <summary>
+/// Every disk operation the <see cref="DiskMoveRunner"/> performs. <see cref="WindowsDiskMoveBackend"/> is the
+/// real one; unit tests use a fake that models the disk. Partitions are always named by their GPT partition GUID
+/// and disks by their current number (the runner finds it from the disk GUID); failures throw
+/// <see cref="DiskMoveException"/> (or a subclass).
+/// </summary>
+public interface IDiskMoveBackend
+{
+    /// <summary>Current number of the disk with this GPT disk GUID; throws <see cref="DiskMoveException"/> if none.</summary>
+    int FindDiskNumber(Guid diskGuid);
+
+    /// <summary>Actual start (bytes) of the partition read from the partition table; throws if it is not on the disk.</summary>
+    long PartitionStart(int disk, Guid part);
+    /// <summary>Actual length (bytes) of the partition read from the partition table.</summary>
+    long PartitionSize(int disk, Guid part);
+    /// <summary>MSFT_Partition.Resize (shrinks or extends the end). No-op if the size already is newSize.</summary>
+    void ResizePartition(int disk, Guid part, long newSize);
+
+    /// <summary>Exact GPT attribute bits (DiskMove.dll).</summary>
+    ulong GetPartitionAttributes(int disk, Guid part);
+    /// <summary>Sets the exact GPT attribute bits in one layout write (DiskMove.dll; no-op if unchanged).</summary>
+    void SetPartitionAttributes(int disk, Guid part, ulong attributes);
+
+    /// <summary>Removes the drive letter of the volume; succeeds if Windows already removed it.</summary>
+    void RemoveLetter(string volumePath, char letter);
+    /// <summary>Gives the volume its letter back; succeeds if Windows already did, drops letters Windows auto-assigned.</summary>
+    void AssignLetter(string volumePath, char letter);
+
+    /// <summary>Opens the volume and takes FSCTL_LOCK_VOLUME; dispose to release. Throws if in use or absent.</summary>
+    IDisposable LockVolume(string volumePath);
+    /// <summary>True only if the locked volume is exactly [start, start + length) on the disk.</summary>
+    bool VerifyVolume(IDisposable volume, int disk, long start, long length);
+    void Dismount(IDisposable volume);
+
+    /// <summary>"Windows RE status" from reagentc /info; null if it cannot be determined.</summary>
+    bool? WinReEnabled();
+    /// <summary>reagentc /enable or /disable (no-op if already so); throws if WinRE does not end in that state.</summary>
+    void SetWinRe(bool enabled);
+    /// <summary>KB5028997 fallback: deletes the (moved) Recovery partition and creates a new one at the same place
+    /// (Recovery type, attributes 0x8000000000000001, NTFS) for reagentc /enable to fill.</summary>
+    void RecreateRecoveryPartition(int disk, Guid part, long offset, long size);
+
+    /// <summary>First 34 and last 33 sectors of the disk (primary and backup GPT).</summary>
+    byte[] ReadRawGpt(int disk, int sectorSize);
+
+    /// <summary>Creates the journal (CREATE_ALWAYS) with the moves and the restore state as its app blob.</summary>
+    void CreateJournal(string path, IReadOnlyList<NativeMovePlan> moves, RestoreState state);
+    /// <summary>Null if there is no journal file; throws if it exists but cannot be read.</summary>
+    JournalInfo? ReadJournal(string path, out RestoreState? state);
+    void SetJournalStep(string path, MoveStep step);
+    void DeleteJournal(string path);
+
+    /// <summary>Runs or resumes move <paramref name="moveIndex"/> of the journal (DiskMove.dll checks the disk's
+    /// identity first). <paramref name="progress"/>(done, total) returning true stops between two chunks.
+    /// Returns true when the move is complete, false when it stopped on request.</summary>
+    bool RunMove(int disk, string journal, int moveIndex, Func<long, long, bool> progress);
+    /// <summary>Moves the GPT entry to newStart (idempotent).</summary>
+    void SetPartitionStart(int disk, Guid part, long newStart);
+    void PatchNtfsHiddenSectors(int disk, long start, long length, int sectorSize);
+
+    /// <summary>Read-only "chkdsk X:"; returns its exit code (0 = clean).</summary>
+    int Chkdsk(char letter);
+}
