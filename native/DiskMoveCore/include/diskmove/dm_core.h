@@ -38,6 +38,33 @@ dm_status dm_plan_validate(const dm_move_plan *p);
 dm_status dm_chunks_build(const dm_move_plan *p, dm_extent **out, uint32_t *out_count);
 void      dm_free(void *p);
 
+/* ---- Crash-safe journal ---- */
+typedef struct dm_io {
+    void *ctx;
+    dm_status (*read)(void *ctx, uint64_t off, void *buf, uint32_t len);
+    dm_status (*write)(void *ctx, uint64_t off, const void *buf, uint32_t len);
+    dm_status (*flush)(void *ctx);
+} dm_io;
+typedef struct dm_journal_info {
+    uint32_t move_count;
+    uint32_t step;              /* step 0-7, defined by the C# side */
+    uint32_t move_index;        /* move currently running */
+    uint64_t chunks_done;       /* of move_index */
+    uint64_t chunk_count[2];    /* total chunks of each move (0 for unused) */
+    uint64_t seq;
+} dm_journal_info;
+#define DM_MAX_MOVES 2
+dm_status dm_journal_create(const dm_io *j, const dm_move_plan *moves, uint32_t move_count,
+                            const void *app_blob, uint32_t app_len);
+/* If app_cap < app_len: *app_len is still set and DM_E_INVALID_ARG returned (retry with bigger buffer). */
+dm_status dm_journal_read(const dm_io *j, dm_journal_info *info,
+                          void *app_blob, uint32_t app_cap, uint32_t *app_len);
+dm_status dm_journal_set_step(const dm_io *j, uint32_t step);
+/* Internal (dm_move.c): stored plan (extents = NULL) + stored chunks (free with dm_free); progress write. */
+dm_status dm_journal_load_move(const dm_io *j, uint32_t move_index, dm_move_plan *plan_out,
+                               dm_extent **chunks, uint32_t *chunk_count);
+dm_status dm_journal_progress(const dm_io *j, uint32_t move_index, uint64_t chunks_done, uint64_t last_hash);
+
 #ifdef __cplusplus
 }
 #endif

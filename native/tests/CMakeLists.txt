@@ -5,7 +5,7 @@ list(REMOVE_ITEM DM_TEST_FILES "${CMAKE_CURRENT_SOURCE_DIR}/test_main.c")
 foreach(test_file ${DM_TEST_FILES})
   get_filename_component(test_base "${test_file}" NAME_WE)   # test_hash
   string(REGEX REPLACE "^test_" "" suite "${test_base}")     # hash
-  add_executable(${test_base} "${test_file}" test_main.c)
+  add_executable(${test_base} "${test_file}" test_main.c mem_io.c)
   target_compile_definitions(${test_base} PRIVATE DM_SUITE=${suite})
   target_include_directories(${test_base} PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
   target_link_libraries(${test_base} PRIVATE DiskMoveCore)
