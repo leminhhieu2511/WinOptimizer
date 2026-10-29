@@ -117,7 +117,8 @@ public sealed class DiskLayoutService : IDiskLayoutSource
             (long)Get<ulong>(part, "Offset"),
             (long)Get<ulong>(part, "Size"),
             driveLetter,
-            volume?.Path,
+            // MSFT_Volume can miss a volume without a letter (e.g. Recovery); its access path still names it.
+            volume?.Path ?? accessPaths.FirstOrDefault(a => a.StartsWith(@"\\?\Volume{", StringComparison.OrdinalIgnoreCase)),
             volume?.FileSystem,
             volume is { Size: { } size, SizeRemaining: { } rem } ? size - rem : null,
             attrs,

@@ -44,7 +44,8 @@ public sealed record VhdxPartition(uint Number, long Offset, long Size, Guid Gui
 /// Creates, attaches and lays out a throw-away VHDX (diskpart /s) and hands out its disk number only after
 /// checking (MSFT_Disk) that it is that VHDX and neither the boot nor the system disk. Detached and deleted on
 /// Dispose. Layout (GPT, no ESP, no Windows volume): [MSR added by diskpart] CLIKE 1024 MB NTFS (letter),
-/// RLIKE 300 MB recovery type + attributes 0x8000000000000001 (no letter), DLIKE 2048 MB NTFS (letter).
+/// RLIKE 300 MB recovery type + attributes 0x8000000000000001 (no letter), DLIKE 2048 MB NTFS (letter; its size and the
+/// VHDX maximum can be raised for flows that need more than 1 GiB to move).
 /// </summary>
 public sealed class VhdxFixture : IDisposable
 {
@@ -103,9 +104,10 @@ public sealed class VhdxFixture : IDisposable
         DLikeGuid = d;
     }
 
-    /// <summary>Creates "&lt;ScratchDir&gt;\&lt;name&gt;.vhdx" (4096 MB expandable), attaches it and lays it out.</summary>
-    public static VhdxFixture Create(string name, Action<string>? log = null)
+    /// <summary>Creates "&lt;ScratchDir&gt;\&lt;name&gt;.vhdx" (4096 MB expandable by default), attaches it and lays it out.</summary>
+    public static VhdxFixture Create(string name, Action<string>? log = null, int dLikeMb = 2048, int maximumMb = 4096)
     {
+        if (dLikeMb + 1024 + 300 + 64 > maximumMb) throw new ArgumentOutOfRangeException(nameof(dLikeMb));
         log ??= _ => { };
         if (!Elevation.IsAdmin) throw new InvalidOperationException("VhdxFixture needs an elevated process.");
         Encoding.RegisterProvider(CodePagesEncodingProvider.Instance);
@@ -116,7 +118,7 @@ public sealed class VhdxFixture : IDisposable
 
         var before = Query("SELECT Number FROM MSFT_Disk").Select(o => Convert.ToInt32(o["Number"])).ToHashSet();
         int rc = Diskpart(Path.Combine(ScratchDir, name + ".attach.txt"),
-            $"create vdisk file=\"{path}\" maximum=4096 type=expandable\r\n" +
+            $"create vdisk file=\"{path}\" maximum={maximumMb} type=expandable\r\n" +
             $"select vdisk file=\"{path}\"\r\nattach vdisk\r\n", log);
         if (rc != 0) throw new InvalidOperationException($"diskpart create/attach failed ({rc})");
 
@@ -142,7 +144,7 @@ public sealed class VhdxFixture : IDisposable
                 "create partition primary size=1024\r\nformat quick fs=ntfs label=CLIKE\r\nassign\r\n" +
                 "create partition primary size=300\r\nformat quick fs=ntfs label=RLIKE\r\n" +
                 $"set id={RecoveryType}\r\ngpt attributes=0x8000000000000001\r\n" +
-                "create partition primary size=2048\r\nformat quick fs=ntfs label=DLIKE\r\nassign\r\n", log);
+                $"create partition primary size={dLikeMb}\r\nformat quick fs=ntfs label=DLIKE\r\nassign\r\n", log);
             if (rc != 0) throw new InvalidOperationException($"diskpart layout failed ({rc})");
 
             var d = Query($"SELECT * FROM MSFT_Disk WHERE Number={disk}").Single();
@@ -160,7 +162,7 @@ public sealed class VhdxFixture : IDisposable
             foreach (var p in parts) log($"partition {p}");
             var c = parts.Single(p => p.GptType != MsrType && p.GptType != RecoveryType && p.Size == 1024 * MiB);
             var r = parts.Single(p => p.GptType == RecoveryType);
-            var dl = parts.Single(p => p.GptType != MsrType && p.GptType != RecoveryType && p.Size == 2048 * MiB);
+            var dl = parts.Single(p => p.GptType != MsrType && p.GptType != RecoveryType && p.Size == dLikeMb * MiB);
             foreach (var x in new[] { c, dl })
                 if (x.Letter == '\0' || x.Letter is 'C' or 'D')
                     throw new InvalidOperationException($"SAFETY: unexpected drive letter '{x.Letter}' on the VHDX");

@@ -10,6 +10,7 @@ A Windows 11 optimization tool built with C# / .NET 10 and WPF. It brings power 
 | **System Monitor** | Live CPU and memory with 2-minute history graphs, battery, drive usage and the busiest processes. |
 | **Power Mode** | Switches between **Battery Life Saver**, **Balanced** and **Highest Performance**, the same setting as *Settings › System › Power & battery › Power mode*. If the active power plan blocks power modes, it offers a one-click switch to the Balanced plan. |
 | **Junk Cleaner** | Scans and cleans temp files, the Windows Update download cache, browser caches (Chrome, Edge, Brave, Firefox), shader and thumbnail caches, crash dumps and the Recycle Bin. Asks before deleting, skips files that are in use, and keeps temp files changed in the last 24 hours. |
+| **Disk Space** | Moves free space from a data partition (such as D:) to the Windows drive C:, even when D: or a Recovery partition sits between them. D: keeps its letter, files and identity. See [Disk Space](#disk-space) below. |
 | **Startup Apps** | Turns startup apps on or off the same way Task Manager does, so you can turn them back on any time. Can open each program's folder. |
 | **Taskbar & Displays** | Per display: auto-hide Windows' own taskbar, and/or add WinOptimizer's **vertical taskbar** on the left or right. Also lists connected displays and controls auto-hide. |
 | **Privacy & Tweaks** | 22 switches in four groups: Privacy, Ads & suggestions, Performance & gaming, and File Explorer. Each shows its current state; turning one off puts the Windows default back. |
@@ -27,10 +28,32 @@ On Windows builds that can't move their own taskbar to the side, WinOptimizer ad
 
 Windows can only auto-hide its taskbar on every display at once. WinOptimizer can hide it on chosen displays only; the taskbar reappears when the mouse reaches its strip. Combined with the vertical taskbar, a display can show *only* the vertical taskbar.
 
+### Disk Space
+
+Windows' Disk Management can only extend C: into free space directly to its right. When D: (and often the Recovery partition) follows C:, shrinking D: leaves the free space on the wrong side. The **Disk Space** page fixes that the way partition tools do: it shrinks D:, shifts D: and the Recovery partition to the right on the disk, then extends C:.
+
+1. **Disk map** – every disk drawn to scale; choose the partition to take space from.
+2. **Analysis** – red items block the move, yellow items must be fixed first (for example *Close for me* for programs that use the drive), green items are notes.
+3. **Amount** – a slider and a GB box (1 GB minimum; the maximum keeps a reserve on D:), a before/after preview, the data to copy and an estimated time.
+4. **Confirm** – tick *I have backed up important data on D:* and click **Start moving**.
+5. **Progress / result** – eight steps, speed and time left; **Open Disk Management** at the end.
+
+It needs administrator rights (Limited mode shows the map read-only). While it runs, WinOptimizer keeps the PC awake, holds a shutdown with a reason, cannot be closed or exited, and locks the sidebar. On battery it shows a warning and pauses safely below 20% until the charger is plugged in again.
+
+**Risks — read before using it:**
+
+- **Back up first.** The move rewrites partitions on your system disk. A hardware fault during the move can cause data loss.
+- **Whole partitions are copied.** D: and the Recovery partition are copied block by block (each block is read back to check it), not just their used space, so a large D: takes time: about 400 MB/s on an SSD and 80 MB/s on an HDD, twice over. The estimate is shown before you confirm.
+- **No cancel after the copy starts.** You can cancel until step 3 and everything is put back. From step 3 on, the move can only be finished.
+- **Interruptions resume.** Every step is recorded in a journal (`C:\ProgramData\WinOptimizer\DiskMove\`, readable by administrators only, together with a backup of the partition table). After a crash or power loss, the next start of WinOptimizer opens the Resume screen; click **Continue** (as administrator) to finish. There is no "skip".
+- **Windows Recovery (WinRE)** is turned off while the Recovery partition moves and on again afterwards. If Windows cannot turn it back on, the result screen says so; turn it on yourself from an administrator command prompt with `reagentc /enable` (see Microsoft KB5028997 if that fails).
+- Only basic GPT disks with an NTFS data partition after C: on the same disk are supported, with nothing or one Recovery partition in between. BitLocker on the source, MBR/dynamic disks, Storage Spaces and multi-boot systems are refused.
+
 ## Requirements
 
 - Windows 11 (developed and tested on 26H1, build 28000)
 - [.NET 10 SDK](https://dotnet.microsoft.com/download) to build; the .NET 10 Desktop Runtime to run
+- To build: Visual Studio 2026 (or its Build Tools) with the **Desktop development with C++** workload, including *C++ CMake tools for Windows*. `dotnet build` builds the native `DiskMove.dll` (used by Disk Space) with CMake.
 
 ## Build and run
 
@@ -62,6 +85,7 @@ The app runs without admin rights by default ("Limited mode"). Use **Restart as 
 - cleaning Windows temporary files and the Windows Update download cache
 - turning startup apps for all users on or off
 - the telemetry and activity history tweaks
+- moving disk space (Disk Space page)
 
 Everything else works without admin rights. A copy running as administrator can't be reached from a normal copy, so `--exit` from a normal prompt won't close it; close it from its window or the ⚡ menu.
 
@@ -106,9 +130,11 @@ Saved in `%LocalAppData%\WinOptimizer\settings.json` (vertical taskbars, hidden 
 ```
 App.xaml(.cs)          Startup, single instance, --exit, crash/sign-out restore, shared styles
 MainWindow.xaml(.cs)   Sidebar navigation, admin restart, background mode
-Pages/                 One page per feature (Home, Monitor, Power, Cleaner, Startup, Taskbar, Tweaks)
+Pages/                 One page per feature (Home, Monitor, Power, Cleaner, Disk Space, Startup, Taskbar, Tweaks)
 Services/              Windows logic: power, system info, junk cleaner, startup apps, tweaks,
                        taskbar settings, taskbar hider, window list, settings store, registry/Explorer helpers
+Services/DiskSpace/    Disk layout, prechecks, planner, the journaled move runner, power guard (Disk Space page)
+native/                DiskMove.dll and its C core (block copy with journal), built with CMake
 SideTaskbar/           The vertical taskbar window and the manager that creates one per display
 Helpers/               PageActivity (pause when hidden), LowPriority (background-priority work), formatting
 ```

@@ -2,6 +2,7 @@
 using System.Windows.Controls;
 using WinOptimizer.Pages;
 using WinOptimizer.Services;
+using WinOptimizer.Services.DiskSpace;
 using WinOptimizer.SideTaskbar;
 
 namespace WinOptimizer;
@@ -22,6 +23,7 @@ public partial class MainWindow : Window
             new NavItem("", "System Monitor", () => new MonitorPage()),
             new NavItem("", "Power Mode", () => new PowerPage()),
             new NavItem("", "Junk Cleaner", () => new CleanerPage()),
+            new NavItem("", "Disk Space", () => new DiskSpacePage()),
             new NavItem("", "Startup Apps", () => new StartupPage()),
             new NavItem("", "Taskbar & Displays", () => new TaskbarPage()),
             new NavItem("", "Privacy & Tweaks", () => new TweaksPage()),
@@ -35,6 +37,20 @@ public partial class MainWindow : Window
 
         TrayOnCloseCheck.IsChecked = SettingsStore.Current.MinimizeToTrayOnClose;
         NavList.SelectedIndex = 0;
+
+        DiskMoveSession.RunningChanged += UpdateAdminPanel;
+        Closed += (_, _) => DiskMoveSession.RunningChanged -= UpdateAdminPanel;
+    }
+
+    /// <summary>"Restart as administrator" is not offered while a disk space move runs.</summary>
+    private void UpdateAdminPanel() =>
+        AdminPanel.Visibility = AdminHelper.IsAdmin || DiskMoveSession.IsRunning ? Visibility.Collapsed : Visibility.Visible;
+
+    /// <summary>Locks the sidebar (no page changes) while a disk space move runs on the current page.</summary>
+    public void SetNavigationLocked(bool locked)
+    {
+        NavList.IsEnabled = !locked;
+        UpdateAdminPanel();
     }
 
     private void TrayOnCloseCheck_Click(object sender, RoutedEventArgs e)
@@ -60,6 +76,7 @@ public partial class MainWindow : Window
 
     private void RestartAsAdmin_Click(object sender, RoutedEventArgs e)
     {
+        if (DiskMoveSession.IsRunning) return;
         if (AdminHelper.RestartAsAdmin())
             App.ExitApp();
     }
@@ -67,10 +84,19 @@ public partial class MainWindow : Window
     /// <summary>
     /// Closing the window hides it to the notification area when "Minimize to tray on close" is on, and always
     /// while a vertical taskbar or taskbar hiding is on (so they keep working). Otherwise it exits the app.
+    /// While a disk space move runs the window cannot be closed at all (checked first).
     /// </summary>
     protected override void OnClosing(System.ComponentModel.CancelEventArgs e)
     {
         base.OnClosing(e);
+        if (DiskMoveSession.IsRunning)
+        {
+            e.Cancel = true;
+            MessageBox.Show(this, DiskMoveSession.BusyMessage, DiskMoveSession.BusyTitle,
+                MessageBoxButton.OK, MessageBoxImage.Warning);
+            return;
+        }
+
         bool taskbarFeaturesOn = SideTaskbarManager.AnyActive || TaskbarHider.AnyActive;
         if (!SettingsStore.Current.MinimizeToTrayOnClose && !taskbarFeaturesOn)
         {

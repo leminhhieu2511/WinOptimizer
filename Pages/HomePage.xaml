@@ -104,6 +104,16 @@
                         </StackPanel>
                     </DockPanel>
                 </Button>
+                <Button Style="{StaticResource CardButton}" Tag="Disk Space" Click="Navigate_Click">
+                    <DockPanel>
+                        <TextBlock Style="{StaticResource ToolIcon}" Text="&#xEDA2;" />
+                        <StackPanel>
+                            <TextBlock FontSize="16" FontWeight="SemiBold" Text="Disk Space" />
+                            <TextBlock x:Name="DiskSpaceStatusText" Style="{StaticResource SecondaryText}" FontSize="13"
+                                       Text="Move free space from a data partition to C:" />
+                        </StackPanel>
+                    </DockPanel>
+                </Button>
                 <Button Style="{StaticResource CardButton}" Tag="Startup Apps" Click="Navigate_Click">
                     <DockPanel>
                         <TextBlock Style="{StaticResource ToolIcon}" Text="&#xE768;" />

@@ -8,7 +8,8 @@ using Microsoft.Win32;
 namespace WinOptimizer.Services.DiskSpace;
 
 /// <param name="RunChkdsk">False skips the (slow) read-only chkdsk; SourceChkdskExitCode then stays null.</param>
-/// <param name="JournalPath">Path of the move journal; null means no journal can exist.</param>
+/// <param name="JournalPath">Path of the move journal; null means no journal can exist. JournalExists is true when its
+/// folder holds a journal or a pending marker (<see cref="DiskMoveRunner.HasUnfinishedMove"/>).</param>
 public sealed record SystemFactsOptions(bool RunChkdsk = true, string? JournalPath = null);
 
 /// <summary>
@@ -40,7 +41,8 @@ public static class SystemFactsProbe
             options.RunChkdsk && admin && source.DriveLetter is char l ? Safe(() => RunChkdsk(l), (int?)null) : null,
             Safe(() => GetMinSize(disk, source), (long?)null),
             admin ? Safe(() => GetLockHolders(source), (IReadOnlyList<LockHolder>)[]) : [],
-            options.JournalPath is { Length: > 0 } jp && Safe(() => File.Exists(jp), false));
+            options.JournalPath is { Length: > 0 } jp &&
+                Safe(() => DiskMoveRunner.HasUnfinishedMove(Path.GetDirectoryName(Path.GetFullPath(jp))!), false));
     }
 
     private static T Safe<T>(Func<T> f, T fallback)
@@ -158,7 +160,7 @@ public static class SystemFactsProbe
         }
     }
 
-    /// <summary>Counts the blocks of <c>bcdedit /enum osloader</c>. Each block starts with a title over a line of dashes.</summary>
+    /// <summary>Operating systems in the boot menu, from <c>bcdedit /enum osloader</c> (see <see cref="CountOsLoaders"/>).</summary>
     private static int CountBcdOsLoaders()
     {
         var psi = new ProcessStartInfo("bcdedit.exe", "/enum osloader")
@@ -171,7 +173,34 @@ public static class SystemFactsProbe
         if (!p.WaitForExit(30_000)) { try { p.Kill(true); } catch (InvalidOperationException) { } return 0; }
         _ = errTask.Result;
         if (p.ExitCode != 0) return 0;
-        return output.Split('\n').Count(line => line.Trim() is { Length: >= 5 } t && t.All(ch => ch == '-'));
+        return CountOsLoaders(output);
+    }
+
+    /// <summary>
+    /// Counts the OS loader blocks of <c>bcdedit /enum osloader</c> output. Each block starts with a title over a line
+    /// of dashes. Blocks with a <c>winpe</c> element are Windows RE / WinPE loaders (every normal Windows install has
+    /// one for its recovery environment), not another operating system, so they are not counted. Element names are
+    /// not localized, so this works with any display language.
+    /// </summary>
+    public static int CountOsLoaders(string bcdOutput)
+    {
+        int count = 0;
+        bool inBlock = false, winpe = false;
+        foreach (var raw in bcdOutput.Replace("\r", "").Split('\n'))
+        {
+            string t = raw.Trim();
+            if (t.Length >= 5 && t.All(ch => ch == '-'))
+            {
+                if (inBlock && !winpe) count++;
+                inBlock = true;
+                winpe = false;
+                continue;
+            }
+            if (inBlock && t.StartsWith("winpe", StringComparison.OrdinalIgnoreCase) && (t.Length == 5 || char.IsWhiteSpace(t[5])))
+                winpe = true;
+        }
+        if (inBlock && !winpe) count++;
+        return count;
     }
 
     /// <summary><c>chkdsk X:</c> without switches is an online read-only scan. Timeout kills it and counts as non-zero.</summary>

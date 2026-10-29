@@ -1,6 +1,7 @@
 ﻿using System.Threading;
 using System.Windows;
 using WinOptimizer.Services;
+using WinOptimizer.Services.DiskSpace;
 using WinOptimizer.SideTaskbar;
 
 namespace WinOptimizer;
@@ -55,6 +56,14 @@ public partial class App : Application
             return;
         }
 
+#if DEBUG
+        if (!ApplyDiskMoveTestTarget(e.Args))
+        {
+            Shutdown(1);
+            return;
+        }
+#endif
+
         if (!AcquireSingleInstance(waitForOldCopy: e.Args.Contains(AfterRestartArg)))
         {
             Shutdown(0);
@@ -67,11 +76,19 @@ public partial class App : Application
         // Never leave Windows' taskbar invisible: restore it on a crash and when Windows signs out or shuts down.
         AppDomain.CurrentDomain.UnhandledException += (_, _) => TaskbarHider.RestoreAll();
         DispatcherUnhandledException += (_, _) => TaskbarHider.RestoreAll();
-        SessionEnding += (_, _) => TaskbarHider.RestoreAll();
+        SessionEnding += (_, args) =>
+        {
+            // A running disk space move must not be cut off: hold the sign-out/shutdown (with PowerGuard's reason).
+            if (DiskMoveSession.IsRunning) args.Cancel = true;
+            else TaskbarHider.RestoreAll();
+        };
 
         var window = new MainWindow();
         MainWindow = window;
         window.Show();
+        // An interrupted disk space move: open its page right away (it shows the Resume screen).
+        if (DiskMoveSession.HasUnfinishedMove() || DiskMoveSession.TestTargetDisk is not null)
+            window.NavigateTo("Disk Space");
         TrayIcon.Initialize();
         AutoProfileService.Initialize();
         SideTaskbarManager.Apply();
@@ -128,8 +145,9 @@ public partial class App : Application
             {
                 if (WaitHandle.WaitAny(events) == 1)
                 {
+                    // Keep listening: ExitApp refuses while a disk space move runs, and a later --exit must still work.
                     Dispatcher.BeginInvoke(ExitApp);
-                    return;
+                    continue;
                 }
                 Dispatcher.BeginInvoke(ShowMainWindow);
             }
@@ -150,14 +168,51 @@ public partial class App : Application
         window.Activate();
     }
 
+    /// <summary>Exits the app (window, tray menu, ⚡ menu, --exit). Refused while a disk space move runs.</summary>
     public static void ExitApp()
     {
+        if (DiskMoveSession.IsRunning)
+        {
+            ShowMainWindow();
+            MessageBox.Show(Current.MainWindow!, DiskMoveSession.BusyMessage, DiskMoveSession.BusyTitle,
+                MessageBoxButton.OK, MessageBoxImage.Warning);
+            return;
+        }
         AutoProfileService.Shutdown();
         TrayIcon.Dispose();
         TaskbarHider.RestoreAll();
         SideTaskbarManager.CloseAll();
         Current.Shutdown();
     }
+
+#if DEBUG
+    /// <summary>
+    /// Debug builds only: "--disk-move-test-target N" makes the Disk Space page use disk N (an attached VHDX) as its
+    /// target disk. Boot and system disks, unknown disks and anything that is not a virtual disk are refused.
+    /// </summary>
+    private static bool ApplyDiskMoveTestTarget(string[] args)
+    {
+        int i = Array.IndexOf(args, DiskMoveSession.TestTargetArg);
+        if (i < 0) return true;
+        string? error = null;
+        if (i + 1 >= args.Length || !int.TryParse(args[i + 1], out int disk))
+        {
+            error = $"{DiskMoveSession.TestTargetArg} needs a disk number.";
+        }
+        else
+        {
+            var d = new DiskLayoutService().GetDisks().FirstOrDefault(x => x.Number == disk);
+            if (d is null) error = $"Disk {disk} was not found.";
+            else if (d.IsBoot || d.IsSystem) error = $"Disk {disk} is a boot or system disk and can never be a test target.";
+            else if (!d.FriendlyName.Contains("Virtual", StringComparison.OrdinalIgnoreCase))
+                error = $"Disk {disk} ('{d.FriendlyName}') is not a virtual disk.";
+            else DiskMoveSession.UseTestTarget(disk);
+        }
+        if (error is null) return true;
+        MessageBox.Show(error, "WinOptimizer (Debug test target refused)", MessageBoxButton.OK, MessageBoxImage.Error);
+        return false;
+    }
+#endif
 
     protected override void OnExit(ExitEventArgs e)
     {

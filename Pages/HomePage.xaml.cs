@@ -4,6 +4,7 @@ using System.Windows.Controls;
 using System.Windows.Threading;
 using WinOptimizer.Helpers;
 using WinOptimizer.Services;
+using WinOptimizer.Services.DiskSpace;
 
 namespace WinOptimizer.Pages;
 
@@ -122,6 +123,9 @@ public partial class HomePage : UserControl
         JunkStatusText.Text = JunkCleanerService.LastScanBytes is { } junk
             ? $"Last scan found {Format.Bytes(junk)} you can free up"
             : "Find temporary and cache files you can safely remove";
+        DiskSpaceStatusText.Text = DiskMoveSession.IsRunning ? "A disk space move is running"
+            : DiskMoveSession.HasUnfinishedMove() ? "An interrupted move needs to be finished"
+            : "Move free space from a data partition to C:";
         StartupStatusText.Text = $"{s.StartupEnabled} of {s.StartupTotal} apps start with Windows";
         TweaksStatusText.Text = $"{s.TweaksOn} of {s.TweaksTotal} tweaks on";
         TaskbarStatusText.Text = s.Displays == 1 ? "1 display connected" : $"{s.Displays} displays connected";
