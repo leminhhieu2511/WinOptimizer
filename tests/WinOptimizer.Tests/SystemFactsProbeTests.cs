@@ -1,3 +1,4 @@
+using System.Management;
 using System.Diagnostics;
 using Xunit;
 using WinOptimizer.Services;
@@ -103,6 +104,67 @@ public class BitLockerMappingTests
     {
         var map = SystemFactsProbe.MapBitLocker(Letters, new SystemFactsProbe.BitLockerOutcome.Failed());
         Assert.All(Letters, c => Assert.Equal("Unknown", map[c]));
+    }
+
+    private static ManagementException Wmi(ManagementStatus status)
+    {
+        // ManagementException has no public constructor; set the status the way WMI does.
+        var ex = (ManagementException)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(ManagementException));
+        typeof(ManagementException).GetField("errorCode", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!
+            .SetValue(ex, status);
+        return ex;
+    }
+
+    private static SystemFactsProbe.BitLockerVolume Vol(string letter, uint? status) => new(letter, () => status);
+    private static SystemFactsProbe.BitLockerVolume Throwing(string letter, Exception ex) => new(letter, () => throw ex);
+
+    /// <summary>Review minor 1: a per-volume GetConversionStatus failure (NotFound or any other) must make THAT letter
+    /// Unknown (a Blocker), never FullyDecrypted for every letter.</summary>
+    [Theory]
+    [InlineData(ManagementStatus.NotFound)]
+    [InlineData(ManagementStatus.InvalidClass)]
+    [InlineData(ManagementStatus.InvalidNamespace)]
+    [InlineData(ManagementStatus.AccessDenied)]
+    public void PerVolumeWmiError_MapsThatLetterToUnknown(ManagementStatus status)
+    {
+        var outcome = SystemFactsProbe.ReadBitLocker(() => [Vol("C:", 0), Throwing("D:", Wmi(status)), Vol("E:", 1)]);
+        var map = SystemFactsProbe.MapBitLocker(Letters, outcome);
+        Assert.Equal("FullyDecrypted", map['C']);
+        Assert.Equal("Unknown", map['D']);
+        Assert.Equal("FullyEncrypted", map['E']);
+    }
+
+    [Fact]
+    public void PerVolumeOtherError_MapsThatLetterToUnknown()
+    {
+        var outcome = SystemFactsProbe.ReadBitLocker(() => [Throwing("D:", new UnauthorizedAccessException()), Vol("C:", 0)]);
+        var map = SystemFactsProbe.MapBitLocker(Letters, outcome);
+        Assert.Equal("Unknown", map['D']);
+        Assert.Equal("FullyDecrypted", map['C']);
+    }
+
+    [Fact]
+    public void PerVolumeNonZeroReturn_MapsThatLetterToUnknown()
+    {
+        var map = SystemFactsProbe.MapBitLocker(Letters, SystemFactsProbe.ReadBitLocker(() => [Vol("D:", null)]));
+        Assert.Equal("Unknown", map['D']);
+    }
+
+    [Theory]
+    [InlineData(ManagementStatus.InvalidNamespace)]
+    [InlineData(ManagementStatus.InvalidClass)]
+    [InlineData(ManagementStatus.NotFound)]
+    public void NamespaceOrClassMissing_IsNotPresent(ManagementStatus status)
+    {
+        var outcome = SystemFactsProbe.ReadBitLocker(() => throw Wmi(status));
+        Assert.IsType<SystemFactsProbe.BitLockerOutcome.NotPresent>(outcome);
+    }
+
+    [Fact]
+    public void ConnectAccessDenied_IsFailed()
+    {
+        Assert.IsType<SystemFactsProbe.BitLockerOutcome.Failed>(SystemFactsProbe.ReadBitLocker(() => throw Wmi(ManagementStatus.AccessDenied)));
+        Assert.IsType<SystemFactsProbe.BitLockerOutcome.Failed>(SystemFactsProbe.ReadBitLocker(() => throw new UnauthorizedAccessException()));
     }
 }
 

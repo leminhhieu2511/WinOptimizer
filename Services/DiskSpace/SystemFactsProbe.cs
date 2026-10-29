@@ -125,38 +125,85 @@ public static class SystemFactsProbe
         return map; // Failed, or letters the namespace did not list: Unknown (blocks, the safe choice)
     }
 
-    private static IReadOnlyDictionary<char, string> GetBitLocker(IEnumerable<char> letters, bool admin)
+    /// <summary>One Win32_EncryptableVolume: its drive letter and its GetConversionStatus call (null = the method
+    /// returned non-zero). The call may throw.</summary>
+    public sealed record BitLockerVolume(string? DriveLetter, Func<uint?> ConversionStatus);
+
+    /// <summary>
+    /// Turns the BitLocker WMI reads into an outcome. Only a failure of <paramref name="listVolumes"/> (connecting to
+    /// the namespace and querying the class) with InvalidNamespace / InvalidClass / NotFound means "no BitLocker on
+    /// this Windows" (<see cref="BitLockerOutcome.NotPresent"/>); any other failure there is
+    /// <see cref="BitLockerOutcome.Failed"/>. A failure (any exception, NotFound included) or a non-zero return of
+    /// one volume's GetConversionStatus leaves only that letter out of the list, so it maps to Unknown (a Blocker),
+    /// never to FullyDecrypted (review minor 1).
+    /// </summary>
+    public static BitLockerOutcome ReadBitLocker(Func<IReadOnlyList<BitLockerVolume>> listVolumes)
     {
-        var all = letters.ToList();
-        if (!admin) return MapBitLocker(all, new BitLockerOutcome.Failed()); // WMI BitLocker access needs admin
+        IReadOnlyList<BitLockerVolume> list;
         try
         {
-            var scope = new ManagementScope(@"root\cimv2\Security\MicrosoftVolumeEncryption");
-            scope.Connect();
-            var volumes = new List<(char, uint)>();
-            using var searcher = new ManagementObjectSearcher(scope, new ObjectQuery("SELECT * FROM Win32_EncryptableVolume"));
-            using var results = searcher.Get();
-            foreach (var o in results)
-            {
-                using (o)
-                {
-                    if (o["DriveLetter"] is not string { Length: > 0 } dl) continue;
-                    var inv = ((ManagementObject)o).InvokeMethod("GetConversionStatus", null, null);
-                    if (inv is null || Convert.ToUInt32(inv["ReturnValue"]) != 0) continue;
-                    volumes.Add((dl[0], Convert.ToUInt32(inv["ConversionStatus"])));
-                }
-            }
-            return MapBitLocker(all, new BitLockerOutcome.Listed(volumes));
+            list = listVolumes();
         }
         catch (ManagementException ex) when (ex.ErrorCode is ManagementStatus.InvalidNamespace
                                                  or ManagementStatus.InvalidClass or ManagementStatus.NotFound)
         {
-            return MapBitLocker(all, new BitLockerOutcome.NotPresent());
+            return new BitLockerOutcome.NotPresent();
         }
         catch (Exception ex) when (ex is ManagementException or UnauthorizedAccessException or COMException
                                        or InvalidCastException or FormatException)
         {
-            return MapBitLocker(all, new BitLockerOutcome.Failed());
+            return new BitLockerOutcome.Failed();
+        }
+
+        var volumes = new List<(char, uint)>();
+        foreach (var v in list)
+        {
+            if (v.DriveLetter is not { Length: > 0 } dl) continue;
+            try
+            {
+                if (v.ConversionStatus() is uint status) volumes.Add((dl[0], status));
+            }
+            catch (Exception ex) when (ex is ManagementException or UnauthorizedAccessException or COMException
+                                           or InvalidCastException or FormatException or OverflowException)
+            {
+                // Unknown for this letter: it is simply not listed.
+            }
+        }
+        return new BitLockerOutcome.Listed(volumes);
+    }
+
+    private static IReadOnlyDictionary<char, string> GetBitLocker(IEnumerable<char> letters, bool admin)
+    {
+        var all = letters.ToList();
+        if (!admin) return MapBitLocker(all, new BitLockerOutcome.Failed()); // WMI BitLocker access needs admin
+        var objects = new List<ManagementObject>();
+        try
+        {
+            var outcome = ReadBitLocker(() =>
+            {
+                var scope = new ManagementScope(@"root\cimv2\Security\MicrosoftVolumeEncryption");
+                scope.Connect();
+                using var searcher = new ManagementObjectSearcher(scope, new ObjectQuery("SELECT * FROM Win32_EncryptableVolume"));
+                using var results = searcher.Get();
+                var list = new List<BitLockerVolume>();
+                foreach (var o in results)
+                {
+                    var mo = (ManagementObject)o;
+                    objects.Add(mo);
+                    list.Add(new BitLockerVolume(mo["DriveLetter"] as string, () =>
+                    {
+                        using var inv = mo.InvokeMethod("GetConversionStatus", null, null);
+                        if (inv is null || Convert.ToUInt32(inv["ReturnValue"]) != 0) return null;
+                        return Convert.ToUInt32(inv["ConversionStatus"]);
+                    }));
+                }
+                return list;
+            });
+            return MapBitLocker(all, outcome);
+        }
+        finally
+        {
+            foreach (var o in objects) o.Dispose();
         }
     }
 
