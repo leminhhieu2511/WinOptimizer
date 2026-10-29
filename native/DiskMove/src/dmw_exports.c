@@ -97,13 +97,45 @@ DMW_API dm_status DMW_CALL dmw_journal_set_step(const wchar_t *path, uint32_t st
     return s;
 }
 
+/* Before the first write: the disk must be the one the journal was made for (GPT disk GUID) and still hold
+   the partition at its old or committed start. The disk number alone (\\.\PhysicalDriveN) can change
+   between a crash and the resume. */
+static dm_status check_disk_identity(const wchar_t *disk_path, const dm_io *jio, uint32_t move_index)
+{
+    dm_move_plan plan;
+    dm_extent *chunks = NULL;
+    uint32_t n = 0;
+    dm_status s = dm_journal_load_move(jio, move_index, &plan, &chunks, &n);
+    if (s != DM_OK) return s;
+    dm_free(chunks);
+    DRIVE_LAYOUT_INFORMATION_EX *lay = NULL;
+    s = dmw_query_layout(disk_path, &lay);
+    if (s == DM_OK) s = dmw_layout_check_move(lay, &plan);
+    free(lay);
+    return s;
+}
+
 DMW_API dm_status DMW_CALL dmw_run_move(const wchar_t *disk_path, const wchar_t *journal_path, uint32_t move_index,
                                         dm_progress_cb progress, void *user)
+{
+    return dmw_run_move_ex(disk_path, journal_path, move_index, progress, user, 1);
+}
+
+dm_status dmw_run_move_ex(const wchar_t *disk_path, const wchar_t *journal_path, uint32_t move_index,
+                          dm_progress_cb progress, void *user, int check_identity)
 {
     if (!disk_path || !disk_path[0] || !journal_path || !journal_path[0]) return DM_E_INVALID_ARG;
     dmw_file jf, df;
     dm_status s = dmw_journal_open(journal_path, 1, &jf);
     if (s != DM_OK) return s;
+    if (check_identity) {
+        dm_io cio = dmw_file_as_dm_io(&jf);
+        s = check_disk_identity(disk_path, &cio, move_index);
+        if (s != DM_OK) {
+            dmw_file_close(&jf);
+            return s;
+        }
+    }
     s = dmw_disk_open(disk_path, &df);
     if (s != DM_OK) {
         dmw_file_close(&jf);

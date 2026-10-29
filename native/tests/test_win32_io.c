@@ -243,11 +243,11 @@ static void run_move_on_image_file(uint32_t sector, uint64_t seed)
     ASSERT_EQ_INT(dmw_journal_create_ex(jr, &plan, 1, NULL, 0, 0), DM_OK);
 
     prog pg = { 0, 0, 0 };
-    ASSERT_EQ_INT(dmw_run_move(disk, jr, 0, on_progress, &pg), DM_OK);
+    ASSERT_EQ_INT(dmw_run_move_ex(disk, jr, 0, on_progress, &pg, 0), DM_OK);
     ASSERT_TRUE(pg.calls > 0);
     ASSERT_EQ_U64(pg.last_done, pg.last_total);
     /* A finished move returns DM_OK again without I/O. */
-    ASSERT_EQ_INT(dmw_run_move(disk, jr, 0, NULL, NULL), DM_OK);
+    ASSERT_EQ_INT(dmw_run_move_ex(disk, jr, 0, NULL, NULL, 0), DM_OK);
 
     uint64_t got_size = 0;
     uint8_t *img = read_file(disk, &got_size);
@@ -298,11 +298,11 @@ static void move_stop_and_missing_paths(void)
     free(zero);
     ASSERT_EQ_INT(dmw_journal_create_ex(jr, &p, 1, NULL, 0, 0), DM_OK);
 
-    ASSERT_EQ_INT(dmw_run_move(disk, jr, 0, stop_now, NULL), DM_E_STOPPED);
+    ASSERT_EQ_INT(dmw_run_move_ex(disk, jr, 0, stop_now, NULL, 0), DM_E_STOPPED);
     ASSERT_EQ_INT(dmw_run_move(none, jr, 0, NULL, NULL), DM_E_NOT_FOUND);
     ASSERT_EQ_INT(dmw_run_move(disk, none, 0, NULL, NULL), DM_E_NOT_FOUND);
     ASSERT_EQ_INT(dmw_run_move(NULL, jr, 0, NULL, NULL), DM_E_INVALID_ARG);
-    ASSERT_EQ_INT(dmw_run_move(disk, jr, 0, NULL, NULL), DM_OK);   /* resumes after the stop */
+    ASSERT_EQ_INT(dmw_run_move_ex(disk, jr, 0, NULL, NULL, 0), DM_OK);   /* resumes after the stop */
     DeleteFileW(disk);
     DeleteFileW(jr);
 }
@@ -605,6 +605,84 @@ static void disk_only_calls_refuse_plain_file(void)
     DeleteFileW(path);
 }
 
+/* ---- disk identity before the first write (pure part of dmw_run_move's check) ---- */
+
+static void identity_plan(dm_move_plan *p)
+{
+    memset(p, 0, sizeof *p);
+    memset(p->disk_guid, 0x55, 16);
+    memset(p->partition_guid, 0x41, 16);   /* middle partition of make_layout */
+    p->sector_size = 512;
+    p->old_start = 1025 * MIB;
+    p->length = 512 * MIB;
+    p->shift = 512 * MIB;
+}
+
+static void layout_checks_move_identity(void)
+{
+    layout_buf b;
+    dm_move_plan p;
+    identity_plan(&p);
+    make_layout(&b);
+    memset(&b.hdr.Gpt.DiskId, 0x55, sizeof(GUID));
+    ASSERT_EQ_INT(dmw_layout_check_move(&b.hdr, &p), DM_OK);                    /* not committed yet */
+    b.hdr.PartitionEntry[1].StartingOffset.QuadPart = (LONGLONG)(1537 * MIB);
+    ASSERT_EQ_INT(dmw_layout_check_move(&b.hdr, &p), DM_OK);                    /* already committed */
+    b.hdr.PartitionEntry[1].StartingOffset.QuadPart = (LONGLONG)(1026 * MIB);
+    ASSERT_EQ_INT(dmw_layout_check_move(&b.hdr, &p), DM_E_JOURNAL_MISMATCH);    /* elsewhere */
+
+    make_layout(&b);
+    memset(&b.hdr.Gpt.DiskId, 0x56, sizeof(GUID));
+    ASSERT_EQ_INT(dmw_layout_check_move(&b.hdr, &p), DM_E_JOURNAL_MISMATCH);    /* another disk */
+    memset(&b.hdr.Gpt.DiskId, 0x55, sizeof(GUID));
+    b.hdr.PartitionEntry[1].PartitionLength.QuadPart = (LONGLONG)(511 * MIB);
+    ASSERT_EQ_INT(dmw_layout_check_move(&b.hdr, &p), DM_E_JOURNAL_MISMATCH);    /* other length */
+    make_layout(&b);
+    memset(&b.hdr.Gpt.DiskId, 0x55, sizeof(GUID));
+    memset(p.partition_guid, 0x77, 16);
+    ASSERT_EQ_INT(dmw_layout_check_move(&b.hdr, &p), DM_E_JOURNAL_MISMATCH);    /* no such partition */
+    identity_plan(&p);
+    p.shift = UINT64_MAX;                                                       /* old_start + shift overflows */
+    b.hdr.PartitionEntry[1].StartingOffset.QuadPart = (LONGLONG)(1024 * MIB);
+    ASSERT_EQ_INT(dmw_layout_check_move(&b.hdr, &p), DM_E_JOURNAL_MISMATCH);
+    identity_plan(&p);
+    make_layout(&b);
+    memset(&b.hdr.Gpt.DiskId, 0x55, sizeof(GUID));
+    b.hdr.PartitionStyle = PARTITION_STYLE_MBR;
+    ASSERT_EQ_INT(dmw_layout_check_move(&b.hdr, &p), DM_E_JOURNAL_MISMATCH);    /* not GPT */
+    ASSERT_EQ_INT(dmw_layout_check_move(NULL, &p), DM_E_INVALID_ARG);
+    ASSERT_EQ_INT(dmw_layout_check_move(&b.hdr, NULL), DM_E_INVALID_ARG);
+}
+
+/* The exported dmw_run_move checks the disk before its first write: a plain file has no GPT, so it is
+   refused and stays byte-identical, and the journal shows no progress. */
+static void run_move_refuses_unverified_disk(void)
+{
+    dm_move_plan p; dm_extent e;
+    small_plan(&p, &e);
+    uint64_t size = p.old_start + p.length + p.shift + MIB;
+    uint8_t *data = (uint8_t *)malloc((size_t)size);
+    ASSERT_TRUE(data != NULL);
+    if (!data) return;
+    for (uint64_t i = 0; i < size; i++) data[i] = (uint8_t)(i * 31 + 7);
+    wchar_t disk[MAX_PATH], jr[MAX_PATH];
+    temp_path(disk, L"ident");
+    temp_path(jr, L"identjr");
+    ASSERT_TRUE(write_file(disk, data, size));
+    ASSERT_EQ_INT(dmw_journal_create_ex(jr, &p, 1, NULL, 0, 0), DM_OK);
+    ASSERT_TRUE(dmw_run_move(disk, jr, 0, NULL, NULL) != DM_OK);
+    uint64_t got = 0;
+    uint8_t *after = read_file(disk, &got);
+    ASSERT_TRUE(after && got == size && memcmp(after, data, (size_t)size) == 0);
+    dm_journal_info info; uint32_t alen = 0;
+    ASSERT_EQ_INT(dmw_journal_read(jr, &info, NULL, 0, &alen), DM_OK);
+    ASSERT_EQ_U64(info.chunks_done, 0);
+    free(after);
+    free(data);
+    DeleteFileW(disk);
+    DeleteFileW(jr);
+}
+
 static void misc_args(void)
 {
     dmw_volume *v = (dmw_volume *)1;
@@ -651,5 +729,7 @@ void dm_run_win32_io(void)
     DM_RUN(disk_is_system_smoke);
     DM_RUN(volume_extent_match);
     DM_RUN(disk_only_calls_refuse_plain_file);
+    DM_RUN(layout_checks_move_identity);
+    DM_RUN(run_move_refuses_unverified_disk);
     DM_RUN(misc_args);
 }

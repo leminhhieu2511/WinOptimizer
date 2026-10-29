@@ -26,7 +26,8 @@
  * Every command first refuses a --disk that holds the Windows volume or an EFI system / active partition
  * (dmw_disk_is_system; read-only, fails closed).
  *
- * Progress lines: "progress <done>/<total>". Ctrl+C stops between two chunks (exit code 7 = DM_E_STOPPED).
+ * Step lines: "phase <lock|hide|copy|patch|commit-gpt|restore|done>"; progress lines: "progress <done>/<total>"
+ * (stdout is unbuffered). Ctrl+C stops between two chunks (exit code 7 = DM_E_STOPPED).
  * Exit code = dm_status of the failing step (0 = success, 1 = bad command line).
  */
 #define WIN32_LEAN_AND_MEAN
@@ -72,6 +73,19 @@ static int report(dm_status s, const char *step)
 {
     if (s != DM_OK) fprintf(stderr, "error %s (%d) during %s\n", status_name(s), (int)s, step);
     return (int)s;
+}
+
+/* Machine-readable step markers (stdout is unbuffered): lock, hide, copy, patch, commit-gpt, restore, done.
+   The VHDX kill tests use them (and the "progress" lines) to pick their kill points. */
+static void phase(const char *name)
+{
+    printf("phase %s\n", name);
+}
+
+static void done_ok(void)
+{
+    phase("done");
+    printf("ok\n");
 }
 
 static int usage(void)
@@ -265,6 +279,7 @@ static int remount(const restore_info *ri)
 static int restore_volume(const wchar_t *disk, const uint8_t part_guid[16], const restore_info *ri,
                           const wchar_t *sidecar, dmw_volume **v)
 {
+    phase("restore");
     dm_status s = dmw_set_partition_attributes(disk, part_guid, ri->attributes, NULL);
     dmw_volume_close(*v);
     *v = NULL;
@@ -337,10 +352,12 @@ static int commit(const wchar_t *disk, const uint8_t part_guid[16], uint64_t new
                   uint32_t sector)
 {
     if (length && sector) {
+        phase("patch");
         dm_status s = dmw_patch_ntfs_hidden_sectors(disk, new_start, length, sector);
         if (s != DM_OK) return report(s, "patch NTFS hidden sectors");
         printf("hidden sectors patched\n");
     }
+    phase("commit-gpt");
     dm_status s = dmw_set_partition_start(disk, part_guid, new_start);
     if (s != DM_OK) return report(s, "set partition start");
     printf("partition start set to %llu\n", (unsigned long long)new_start);
@@ -384,12 +401,14 @@ static int cmd_move(void)
 
     /* 1. Lock + verify: nothing is written unless --volume really is [start, start+length) on --disk. */
     dmw_volume *v = NULL;
+    phase("lock");
     rc = lock_and_verify(volume, disk_number, plan.old_start, plan.length, plan.old_start, &v);
     if (rc) return rc;
 
     /* 2. Hide it before the first write, so Windows cannot remount it at the old offset if the lock is lost.
           Read the original attributes, persist them (sidecar, flushed), then ONE layout write sets
           original | HIDDEN | NO_DRIVE_LETTER, so a crash at any point never loses an original bit. */
+    phase("hide");
     dm_status s = dmw_get_partition_attributes(disk, plan.partition_guid, &ri.attributes);
     if (s != DM_OK) {
         dmw_volume_close(v);
@@ -444,6 +463,7 @@ static int cmd_move(void)
     }
 
     /* 3. Copy, then commit; the volume stays hidden until the move is fully committed. */
+    phase("copy");
     s = dmw_run_move(disk, journal, 0, on_progress, NULL);
     if (s != DM_OK) {
         rc = report(s, "move");
@@ -453,7 +473,7 @@ static int cmd_move(void)
             printf("not committed (--no-commit)\n");
             dmw_volume_close(v);
             print_restore_hint(&ri, sidecar);
-            printf("ok\n");
+            done_ok();
             return 0;
         }
         rc = commit(disk, plan.partition_guid, new_start, plan.length, plan.sector_size);
@@ -466,7 +486,7 @@ static int cmd_move(void)
 
     /* 4. Committed: original attributes back, mount points re-created at the new location. */
     rc = restore_volume(disk, plan.partition_guid, &ri, sidecar, &v);
-    if (!rc) printf("ok\n");
+    if (!rc) done_ok();
     return rc;
 }
 
@@ -501,6 +521,7 @@ static int cmd_resume(void)
     dmw_volume *v = NULL;
     rc = optional_lock(disk_number, old_start, old_start, length, &v);
     if (rc) return rc;
+    phase("copy");
     dm_status s = dmw_run_move(disk, journal, (uint32_t)index, on_progress, NULL);
     rc = report(s, "move");
     dmw_volume_close(v);
@@ -510,7 +531,8 @@ static int cmd_resume(void)
     restore_info ri;
     cli_sidecar_path(journal, sidecar, MAX_PATH * 2);
     if (cli_sidecar_read(sidecar, &ri)) print_restore_hint(&ri, sidecar);
-    printf("move done\nok\n");
+    printf("move done\n");
+    done_ok();
     return 0;
 }
 
@@ -554,7 +576,7 @@ static int cmd_commit(void)
     }
     if (have_restore) rc = restore_volume(disk, guid, &ri, sidecar, &v);
     dmw_volume_close(v);
-    if (!rc) printf("ok\n");
+    if (!rc) done_ok();
     return rc;
 }
 

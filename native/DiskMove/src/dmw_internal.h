@@ -48,4 +48,16 @@ int dmw_layout_has_system_partition(const DRIVE_LAYOUT_INFORMATION_EX *layout);
 /* Pure part of dmw_volume_verify. */
 dm_status dmw_extents_match(const VOLUME_DISK_EXTENTS *ext, uint32_t disk_number, uint64_t start, uint64_t length);
 
+/* Read-only IOCTL_DISK_GET_DRIVE_LAYOUT_EX of disk_path into a malloc'd buffer (caller frees). */
+dm_status dmw_query_layout(const wchar_t *disk_path, DRIVE_LAYOUT_INFORMATION_EX **out);
+
+/* Pure part of dmw_run_move's identity check: the layout must be GPT with DiskId == plan->disk_guid and
+   hold plan->partition_guid with length plan->length at old_start (not committed yet) or old_start + shift
+   (committed). DM_E_JOURNAL_MISMATCH otherwise; DM_E_INVALID_ARG for NULL. */
+dm_status dmw_layout_check_move(const DRIVE_LAYOUT_INFORMATION_EX *layout, const dm_move_plan *plan);
+
+/* dmw_run_move with the disk identity check optional (check = 0 lets tests move inside a plain image file). */
+dm_status dmw_run_move_ex(const wchar_t *disk_path, const wchar_t *journal_path, uint32_t move_index,
+                          dm_progress_cb progress, void *user, int check_identity);
+
 #endif /* DISKMOVE_DMW_INTERNAL_H */

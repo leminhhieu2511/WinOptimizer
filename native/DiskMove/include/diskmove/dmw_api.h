@@ -52,7 +52,9 @@ DMW_API dm_status DMW_CALL dmw_journal_read(const wchar_t *path, dm_journal_info
 DMW_API dm_status DMW_CALL dmw_journal_set_step(const wchar_t *path, uint32_t step);
 
 /* Runs (or resumes) move move_index on the disk (unbuffered, write-through I/O). progress is the core's
-   dm_progress_cb (may be NULL); return non-zero from it to stop between two chunks (DM_E_STOPPED). */
+   dm_progress_cb (may be NULL); return non-zero from it to stop between two chunks (DM_E_STOPPED).
+   Before any write it reads the disk's layout: it must be GPT with the journal's disk GUID and hold the
+   journal's partition (same length) at old_start or old_start + shift; otherwise DM_E_JOURNAL_MISMATCH. */
 DMW_API dm_status DMW_CALL dmw_run_move(const wchar_t *disk_path, const wchar_t *journal_path, uint32_t move_index,
                                         dm_progress_cb progress, void *user);
 

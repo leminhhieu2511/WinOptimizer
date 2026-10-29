@@ -70,6 +70,26 @@ dm_status dmw_layout_get_attributes(const DRIVE_LAYOUT_INFORMATION_EX *layout, c
     return DM_E_NOT_FOUND;
 }
 
+dm_status dmw_layout_check_move(const DRIVE_LAYOUT_INFORMATION_EX *layout, const dm_move_plan *plan)
+{
+    if (!layout || !plan) return DM_E_INVALID_ARG;
+    if (layout->PartitionStyle != PARTITION_STYLE_GPT ||
+        memcmp(&layout->Gpt.DiskId, plan->disk_guid, sizeof(GUID)) != 0)
+        return DM_E_JOURNAL_MISMATCH;
+    int committed_ok = plan->old_start <= UINT64_MAX - plan->shift;
+    for (DWORD i = 0; i < layout->PartitionCount; i++) {
+        const PARTITION_INFORMATION_EX *e = &layout->PartitionEntry[i];
+        if (e->PartitionStyle != PARTITION_STYLE_GPT ||
+            memcmp(&e->Gpt.PartitionId, plan->partition_guid, sizeof(GUID)) != 0)
+            continue;
+        uint64_t start = (uint64_t)e->StartingOffset.QuadPart;
+        if ((uint64_t)e->PartitionLength.QuadPart != plan->length) return DM_E_JOURNAL_MISMATCH;
+        if (start == plan->old_start || (committed_ok && start == plan->old_start + plan->shift)) return DM_OK;
+        return DM_E_JOURNAL_MISMATCH;
+    }
+    return DM_E_JOURNAL_MISMATCH;
+}
+
 /* EFI system partition type c12a7328-f81f-11d2-ba4b-00a0c93ec93b. */
 static const GUID k_esp_type = { 0xC12A7328, 0xF81F, 0x11D2, { 0xBA, 0x4B, 0x00, 0xA0, 0xC9, 0x3E, 0xC9, 0x3B } };
 
@@ -144,7 +164,7 @@ static dm_status edit_layout(const wchar_t *disk_path, layout_edit_fn edit, void
 }
 
 /* Read-only layout query (GENERIC_READ only). */
-static dm_status query_layout(const wchar_t *disk_path, DRIVE_LAYOUT_INFORMATION_EX **out)
+dm_status dmw_query_layout(const wchar_t *disk_path, DRIVE_LAYOUT_INFORMATION_EX **out)
 {
     HANDLE h = CreateFileW(disk_path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
     if (h == INVALID_HANDLE_VALUE) return dmw_status_from_win32(GetLastError());
@@ -244,7 +264,7 @@ DMW_API dm_status DMW_CALL dmw_get_partition_attributes(const wchar_t *disk_path
 {
     if (!disk_path || !disk_path[0] || !partition_guid || !attributes) return DM_E_INVALID_ARG;
     DRIVE_LAYOUT_INFORMATION_EX *lay = NULL;
-    dm_status s = query_layout(disk_path, &lay);
+    dm_status s = dmw_query_layout(disk_path, &lay);
     if (s == DM_OK) s = dmw_layout_get_attributes(lay, partition_guid, attributes);
     free(lay);
     return s;
@@ -289,7 +309,7 @@ DMW_API dm_status DMW_CALL dmw_disk_is_system(uint32_t disk_number, int *is_syst
     wchar_t path[64];
     swprintf(path, 64, L"\\\\.\\PhysicalDrive%u", disk_number);
     DRIVE_LAYOUT_INFORMATION_EX *lay = NULL;
-    s = query_layout(path, &lay);
+    s = dmw_query_layout(path, &lay);
     if (s == DM_OK) *is_system = dmw_layout_has_system_partition(lay);
     free(lay);
     return s;
