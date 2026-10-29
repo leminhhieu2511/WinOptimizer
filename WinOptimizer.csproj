@@ -24,6 +24,10 @@
   </ItemGroup>
 
   <ItemGroup>
+    <PackageReference Include="System.Management" Version="10.0.0" />
+  </ItemGroup>
+
+  <ItemGroup>
     <!-- Native C sources/tests are built by CMake, not by the C# compiler. -->
     <Compile Remove="tests/**;native/**" />
     <Page Remove="tests/**;native/**" />
