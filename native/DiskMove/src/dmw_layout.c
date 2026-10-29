@@ -76,18 +76,42 @@ dm_status dmw_layout_check_move(const DRIVE_LAYOUT_INFORMATION_EX *layout, const
     if (layout->PartitionStyle != PARTITION_STYLE_GPT ||
         memcmp(&layout->Gpt.DiskId, plan->disk_guid, sizeof(GUID)) != 0)
         return DM_E_JOURNAL_MISMATCH;
-    int committed_ok = plan->old_start <= UINT64_MAX - plan->shift;
+    if (plan->length == 0 || plan->old_start > UINT64_MAX - plan->shift ||
+        plan->old_start + plan->shift > UINT64_MAX - plan->length)
+        return DM_E_JOURNAL_MISMATCH;
+    uint64_t dst = plan->old_start + plan->shift, dst_end = dst + plan->length;
+
+    /* The destination must lie inside the GPT usable range. */
+    uint64_t lo = (uint64_t)layout->Gpt.StartingUsableOffset.QuadPart;
+    uint64_t ul = (uint64_t)layout->Gpt.UsableLength.QuadPart;
+    uint64_t hi = lo > UINT64_MAX - ul ? UINT64_MAX : lo + ul;
+    if (dst < lo || dst_end > hi) return DM_E_JOURNAL_MISMATCH;
+
+    const PARTITION_INFORMATION_EX *self = NULL;
     for (DWORD i = 0; i < layout->PartitionCount; i++) {
         const PARTITION_INFORMATION_EX *e = &layout->PartitionEntry[i];
-        if (e->PartitionStyle != PARTITION_STYLE_GPT ||
-            memcmp(&e->Gpt.PartitionId, plan->partition_guid, sizeof(GUID)) != 0)
-            continue;
-        uint64_t start = (uint64_t)e->StartingOffset.QuadPart;
-        if ((uint64_t)e->PartitionLength.QuadPart != plan->length) return DM_E_JOURNAL_MISMATCH;
-        if (start == plan->old_start || (committed_ok && start == plan->old_start + plan->shift)) return DM_OK;
-        return DM_E_JOURNAL_MISMATCH;
+        if (e->PartitionStyle == PARTITION_STYLE_GPT &&
+            memcmp(&e->Gpt.PartitionId, plan->partition_guid, sizeof(GUID)) == 0) {
+            self = e;
+            break;
+        }
     }
-    return DM_E_JOURNAL_MISMATCH;
+    if (!self) return DM_E_JOURNAL_MISMATCH;
+    uint64_t start = (uint64_t)self->StartingOffset.QuadPart;
+    if ((uint64_t)self->PartitionLength.QuadPart != plan->length) return DM_E_JOURNAL_MISMATCH;
+    if (start != plan->old_start && start != dst) return DM_E_JOURNAL_MISMATCH;
+
+    /* Defence in depth: the raw writes go to [dst, dst_end); no OTHER partition may own any of it (the moved
+       partition may overlap its own old range). A legitimate source move lands inside the source's original
+       extent and a Recovery move inside the space the source freed. */
+    for (DWORD i = 0; i < layout->PartitionCount; i++) {
+        const PARTITION_INFORMATION_EX *e = &layout->PartitionEntry[i];
+        if (e == self || e->PartitionLength.QuadPart <= 0) continue;
+        uint64_t os = (uint64_t)e->StartingOffset.QuadPart, ol = (uint64_t)e->PartitionLength.QuadPart;
+        uint64_t oe = os > UINT64_MAX - ol ? UINT64_MAX : os + ol;
+        if (dst < oe && os < dst_end) return DM_E_JOURNAL_MISMATCH;
+    }
+    return DM_OK;
 }
 
 /* EFI system partition type c12a7328-f81f-11d2-ba4b-00a0c93ec93b. */

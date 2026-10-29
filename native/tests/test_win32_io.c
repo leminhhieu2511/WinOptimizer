@@ -654,6 +654,46 @@ static void layout_checks_move_identity(void)
     ASSERT_EQ_INT(dmw_layout_check_move(&b.hdr, NULL), DM_E_INVALID_ARG);
 }
 
+/* Review I1: the destination [old_start + shift, +length) must be inside the GPT usable range and must not
+   overlap any other partition; the moved partition may overlap its own old range. */
+static void layout_check_move_rejects_unsafe_destination(void)
+{
+    layout_buf b;
+    dm_move_plan p;
+    make_layout(&b);   /* #1 [1, 1025) MiB, #2 [1025, 1537), #3 [2049, 3073); usable end just under 4096 MiB */
+    memset(&b.hdr.Gpt.DiskId, 0x55, sizeof(GUID));
+
+    identity_plan(&p);                                                          /* clean: [1537, 2049) is free */
+    ASSERT_EQ_INT(dmw_layout_check_move(&b.hdr, &p), DM_OK);
+    p.shift = 256 * MIB;                                                        /* [1281, 1793): overlaps itself only */
+    ASSERT_EQ_INT(dmw_layout_check_move(&b.hdr, &p), DM_OK);
+    p.shift = 600 * MIB;                                                        /* [1625, 2137): overlaps #3 */
+    ASSERT_EQ_INT(dmw_layout_check_move(&b.hdr, &p), DM_E_JOURNAL_MISMATCH);
+    p.shift = 513 * MIB;                                                        /* [1538, 2050): 1 MiB into #3 */
+    ASSERT_EQ_INT(dmw_layout_check_move(&b.hdr, &p), DM_E_JOURNAL_MISMATCH);
+
+    /* Last partition: a destination past the usable end is refused, one inside it is fine. */
+    memset(p.partition_guid, 0x42, 16);
+    p.old_start = 2049 * MIB;
+    p.length = 1024 * MIB;
+    p.shift = 1024 * MIB;                                                       /* ends at 4097 MiB */
+    ASSERT_EQ_INT(dmw_layout_check_move(&b.hdr, &p), DM_E_JOURNAL_MISMATCH);
+    p.shift = 1000 * MIB;                                                       /* ends at 4073 MiB */
+    ASSERT_EQ_INT(dmw_layout_check_move(&b.hdr, &p), DM_OK);
+
+    /* First partition: its destination would land on #2. */
+    memset(p.partition_guid, 0x40, 16);
+    p.old_start = 1 * MIB;
+    p.length = 1024 * MIB;
+    p.shift = 1 * MIB;
+    ASSERT_EQ_INT(dmw_layout_check_move(&b.hdr, &p), DM_E_JOURNAL_MISMATCH);
+
+    /* Overflow of old_start + shift + length. */
+    identity_plan(&p);
+    p.shift = UINT64_MAX - p.old_start - 1;
+    ASSERT_EQ_INT(dmw_layout_check_move(&b.hdr, &p), DM_E_JOURNAL_MISMATCH);
+}
+
 /* The exported dmw_run_move checks the disk before its first write: a plain file has no GPT, so it is
    refused and stays byte-identical, and the journal shows no progress. */
 static void run_move_refuses_unverified_disk(void)
@@ -730,6 +770,7 @@ void dm_run_win32_io(void)
     DM_RUN(volume_extent_match);
     DM_RUN(disk_only_calls_refuse_plain_file);
     DM_RUN(layout_checks_move_identity);
+    DM_RUN(layout_check_move_rejects_unsafe_destination);
     DM_RUN(run_move_refuses_unverified_disk);
     DM_RUN(misc_args);
 }

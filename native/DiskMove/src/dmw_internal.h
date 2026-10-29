@@ -53,7 +53,8 @@ dm_status dmw_query_layout(const wchar_t *disk_path, DRIVE_LAYOUT_INFORMATION_EX
 
 /* Pure part of dmw_run_move's identity check: the layout must be GPT with DiskId == plan->disk_guid and
    hold plan->partition_guid with length plan->length at old_start (not committed yet) or old_start + shift
-   (committed). DM_E_JOURNAL_MISMATCH otherwise; DM_E_INVALID_ARG for NULL. */
+   (committed), and the destination [old_start + shift, old_start + shift + length) must lie inside the GPT
+   usable range and overlap no other partition. DM_E_JOURNAL_MISMATCH otherwise; DM_E_INVALID_ARG for NULL. */
 dm_status dmw_layout_check_move(const DRIVE_LAYOUT_INFORMATION_EX *layout, const dm_move_plan *plan);
 
 /* dmw_run_move with the disk identity check optional (check = 0 lets tests move inside a plain image file). */
