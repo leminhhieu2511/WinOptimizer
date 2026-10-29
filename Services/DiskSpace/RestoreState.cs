@@ -59,6 +59,44 @@ public sealed record RestoreState(Guid DiskGuid, Guid SourceGuid, char SourceLet
     }
 }
 
+/// <summary>How a run or resume ended.</summary>
+public enum DiskMoveOutcome
+{
+    /// <summary>All steps done; the journal is deleted.</summary>
+    Completed,
+    /// <summary>An attempt interrupted before any data moved was undone (the source got its size back).</summary>
+    Undone,
+    /// <summary>Resume found neither a journal nor a pending marker.</summary>
+    NothingToDo,
+}
+
+/// <summary>Result of <see cref="DiskMoveRunner.RunAsync"/> / <see cref="DiskMoveRunner.ResumeAsync"/>.</summary>
+/// <param name="FinalSourceLetter">The source's drive letter at the end (null if none / not known).</param>
+/// <param name="Warnings">Things the user must know or do (letter changed, WinRE not re-enabled, ...).</param>
+public sealed record DiskMoveResult(DiskMoveOutcome Outcome, char? FinalSourceLetter, IReadOnlyList<string> Warnings);
+
+/// <summary>
+/// Written (atomically) before step 1 and deleted once the journal exists (step 2) or after an undo, so an
+/// interruption before the journal can still give the source its space back on the next start.
+/// </summary>
+public sealed record PendingMove(Guid DiskGuid, Guid SourceGuid, char SourceLetter, long SourceOriginalSize,
+    Guid TargetGuid, long Amount, DateTime Timestamp)
+{
+    public byte[] ToJsonBytes() => JsonSerializer.SerializeToUtf8Bytes(this);
+
+    public static PendingMove FromJsonBytes(ReadOnlySpan<byte> json)
+    {
+        try
+        {
+            return JsonSerializer.Deserialize<PendingMove>(json) ?? throw new DiskMoveException("The pending move marker is empty.");
+        }
+        catch (JsonException ex)
+        {
+            throw new DiskMoveException("The pending move marker is not readable.", ex);
+        }
+    }
+}
+
 /// <summary>Progress of a run: the current step and, for the copy steps, bytes copied.</summary>
 public sealed record RunProgress(MoveStep Step, long BytesDone, long BytesTotal, string Message);
 

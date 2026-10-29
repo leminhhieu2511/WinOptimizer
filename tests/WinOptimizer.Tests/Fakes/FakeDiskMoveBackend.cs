@@ -49,6 +49,8 @@ public sealed class FakeDiskMoveBackend : IDiskMoveBackend
     public int EnableFailures;
     public int ChkdskResult;
     public bool WindowsRestoresLetter = true;
+    /// <summary>Letters held by volumes outside this disk (e.g. a USB drive plugged in during the move).</summary>
+    public readonly HashSet<char> ForeignLetters = [];
     public int ChunksPerMove = 4;
     public readonly Dictionary<int, int> ChunkCopies = new() { [0] = 0, [1] = 0 };
     public readonly List<string> Calls = [];
@@ -172,7 +174,8 @@ public sealed class FakeDiskMoveBackend : IDiskMoveBackend
         bool wasHidden = p.IsHidden;
         p.Attrs = attributes;
         if (!wasHidden && p.IsHidden) p.Letter = '\0';                         // Windows drops the letter itself
-        if (wasHidden && !p.IsHidden && WindowsRestoresLetter) p.Letter = p.RememberedLetter;   // ...and often gives it back
+        if (wasHidden && !p.IsHidden && WindowsRestoresLetter && p.RememberedLetter != '\0')
+            p.Letter = Taken(p.RememberedLetter, p) ? FirstFree() : p.RememberedLetter;   // ...and often gives one back
         Did($"SetAttributes({p.Name},{(p.IsHidden ? "hidden" : "visible")},0x{attributes:X16})");
     }
 
@@ -185,13 +188,34 @@ public sealed class FakeDiskMoveBackend : IDiskMoveBackend
         Did($"RemoveLetter({p.Name},{letter})");
     }
 
-    public void AssignLetter(string volumePath, char letter)
+    bool Taken(char letter, Part self) => ForeignLetters.Contains(letter) || Parts.Any(o => o != self && o.Letter == letter);
+
+    char FirstFree()
+    {
+        for (char c = 'D'; c <= 'Z'; c++)
+            if (!ForeignLetters.Contains(c) && Parts.All(o => o.Letter != c)) return c;
+        throw new DiskMoveException("fake: no free letter");
+    }
+
+    /// <summary>Like the real backend: the wanted letter if free; if taken by another volume, the letter the volume
+    /// already has (auto-assigned), else the first free one from D.</summary>
+    public char AssignLetter(string volumePath, char letter)
     {
         Alive();
         var p = ByVolume(volumePath);
         if (p.IsHidden) throw new DiskMoveException($"fake: {p.Name} has no volume while hidden");
-        p.Letter = p.RememberedLetter = letter;
-        Did($"AssignLetter({p.Name},{letter})");
+        if (!Taken(letter, p)) p.Letter = letter;
+        else if (p.Letter == '\0') p.Letter = FirstFree();
+        p.RememberedLetter = p.Letter;
+        Did($"AssignLetter({p.Name},{p.Letter})");
+        return p.Letter;
+    }
+
+    public char? GetLetter(string volumePath)
+    {
+        Alive();
+        var p = ByVolume(volumePath);
+        return p.Letter == '\0' || p.IsHidden ? null : p.Letter;
     }
 
     sealed class Vol(FakeDiskMoveBackend owner, Part p) : IDisposable
@@ -251,19 +275,6 @@ public sealed class FakeDiskMoveBackend : IDiskMoveBackend
         }
         WinRe = enabled;
         Did($"SetWinRe({enabled})");
-    }
-
-    public void RecreateRecoveryPartition(int disk, Guid part, long offset, long size)
-    {
-        Disk(disk);
-        var p = P(part);
-        if (p.Start != offset || p.Size != size) throw new InvalidOperationException("fake: recreate at another place");
-        p.Guid = Guid.NewGuid();
-        p.VolumePath = $@"\\?\Volume{{{p.Guid}}}\";
-        p.Attrs = 0x8000000000000001UL;
-        p.DataStart = p.Start;
-        p.HiddenSectors = p.Start / Sector;
-        Did($"RecreateRecovery({p.Name})");
     }
 
     public byte[] ReadRawGpt(int disk, int sectorSize)

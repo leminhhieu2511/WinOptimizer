@@ -66,8 +66,11 @@ public sealed class RunnerVhdxTests(ITestOutputHelper output)
             var c = Prepare(vhdx, name);
             var runner = new DiskMoveRunner(new GuardedBackend(new WindowsDiskMoveBackend(), c, Log), c.Journal, manageWinRe: false);
             var sw = Stopwatch.StartNew();
-            await runner.RunAsync(c.Disk, c.Target, c.Source, c.Plan, () => [], new LogProgress(Log), () => false, CancellationToken.None);
-            Log($"RunAsync took {sw.Elapsed.TotalSeconds:F1} s");
+            var result = await runner.RunAsync(c.Disk, c.Target, c.Source, c.Plan, () => [], new LogProgress(Log), () => false, CancellationToken.None);
+            Log($"RunAsync took {sw.Elapsed.TotalSeconds:F1} s: {result.Outcome}, letter {result.FinalSourceLetter}, warnings [{string.Join(" | ", result.Warnings)}]");
+            Assert.Equal(DiskMoveOutcome.Completed, result.Outcome);
+            Assert.Equal(c.Letter, result.FinalSourceLetter);
+            Assert.Empty(result.Warnings);
             AssertMoved(c);
         }
         finally
@@ -104,8 +107,11 @@ public sealed class RunnerVhdxTests(ITestOutputHelper output)
 
             var resumed = new GuardedBackend(new WindowsDiskMoveBackend(), c, Log);
             var sw = Stopwatch.StartNew();
-            await new DiskMoveRunner(resumed, c.Journal, manageWinRe: false).ResumeAsync(new LogProgress(Log), () => false);
-            Log($"ResumeAsync took {sw.Elapsed.TotalSeconds:F1} s");
+            var result = await new DiskMoveRunner(resumed, c.Journal, manageWinRe: false).ResumeAsync(new LogProgress(Log), () => false);
+            Log($"ResumeAsync took {sw.Elapsed.TotalSeconds:F1} s: {result.Outcome}, letter {result.FinalSourceLetter}, warnings [{string.Join(" | ", result.Warnings)}]");
+            Assert.Equal(DiskMoveOutcome.Completed, result.Outcome);
+            Assert.Equal(c.Letter, result.FinalSourceLetter);
+            Assert.Empty(result.Warnings);
             Assert.DoesNotContain(resumed.Calls, x => x.StartsWith($"LockVolume({(moveIndex == 0 ? c.Source : c.Recovery).VolumePath}"));
             AssertMoved(c);
         }
@@ -191,6 +197,7 @@ public sealed class RunnerVhdxTests(ITestOutputHelper output)
         // Journal gone; the layout backups of step 0 are kept.
         Assert.False(DiskMoveRunner.HasUnfinishedJournal(c.Journal));
         string dir = Path.GetDirectoryName(c.Journal)!;
+        Assert.False(DiskMoveRunner.HasUnfinishedMove(dir), "journal or pending marker left");
         Assert.Single(Directory.GetFiles(dir, "layout-*.json"));
         var gpt = File.ReadAllBytes(Assert.Single(Directory.GetFiles(dir, "gpt-*.bin")));
         int sector = (int)vhdx.LogicalSectorSize;
@@ -267,7 +274,14 @@ public sealed class RunnerVhdxTests(ITestOutputHelper output)
         }
 
         public void RemoveLetter(string volumePath, char letter) { log($"RemoveLetter({volumePath}, {letter})"); inner.RemoveLetter(Volume(volumePath, "RemoveLetter"), letter); }
-        public void AssignLetter(string volumePath, char letter) { log($"AssignLetter({volumePath}, {letter})"); inner.AssignLetter(Volume(volumePath, "AssignLetter"), letter); }
+        public char AssignLetter(string volumePath, char letter)
+        {
+            char got = inner.AssignLetter(Volume(volumePath, "AssignLetter"), letter);
+            log($"AssignLetter({volumePath}, {letter}) = {got}");
+            return got;
+        }
+
+        public char? GetLetter(string volumePath) => inner.GetLetter(Volume(volumePath, "GetLetter"));
 
         public IDisposable LockVolume(string volumePath)
         {
@@ -287,7 +301,6 @@ public sealed class RunnerVhdxTests(ITestOutputHelper output)
         public void Dismount(IDisposable volume) { log("Dismount"); Calls.Add("Dismount"); inner.Dismount(volume); }
         public bool? WinReEnabled() => Never<bool?>("reagentc /info");
         public void SetWinRe(bool enabled) => Never<bool>("reagentc");
-        public void RecreateRecoveryPartition(int disk, Guid part, long offset, long size) => Never<bool>("RecreateRecoveryPartition");
         public byte[] ReadRawGpt(int disk, int sectorSize) => inner.ReadRawGpt(Disk(disk, "ReadRawGpt"), sectorSize);
 
         public void CreateJournal(string path, IReadOnlyList<NativeMovePlan> moves, RestoreState state)

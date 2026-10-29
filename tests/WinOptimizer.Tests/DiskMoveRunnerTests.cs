@@ -10,6 +10,7 @@ public sealed class DiskMoveRunnerTests : IDisposable
 
     readonly string _dir = Path.Combine(Path.GetTempPath(), "wo-dmr-" + Guid.NewGuid().ToString("N"));
     string Journal => Path.Combine(_dir, "journal.bin");
+    string Pending => Path.Combine(_dir, DiskMoveRunner.PendingFileName);
 
     public void Dispose()
     {
@@ -36,7 +37,7 @@ public sealed class DiskMoveRunnerTests : IDisposable
         ? new MovePlan(X, [f.Snap(f.D)], false)
         : new MovePlan(X, [f.Snap(f.D), f.Snap(f.R)], true);
 
-    Task Run(FakeDiskMoveBackend f, DiskMoveRunner? r = null, Func<IReadOnlyList<CheckResult>>? recheck = null,
+    Task<DiskMoveResult> Run(FakeDiskMoveBackend f, DiskMoveRunner? r = null, Func<IReadOnlyList<CheckResult>>? recheck = null,
         Func<bool>? pause = null, CancellationToken ct = default, IProgress<RunProgress>? progress = null)
     {
         var snap = f.Snapshot();
@@ -67,7 +68,24 @@ public sealed class DiskMoveRunnerTests : IDisposable
         }
         Assert.Equal(b.WinRe, f.WinRe);
         Assert.False(DiskMoveRunner.HasUnfinishedJournal(Journal));
+        Assert.False(File.Exists(Pending), "pending marker left");
+        Assert.False(DiskMoveRunner.HasUnfinishedMove(_dir));
         Assert.All(f.Parts, p => Assert.False(p.Locked, $"{p.Name} still locked"));
+    }
+
+    /// <summary>An interrupted attempt that never got a journal was undone: D back to its original size.</summary>
+    void AssertUndone(FakeDiskMoveBackend f, Before b, DiskMoveResult r)
+    {
+        Assert.Equal(DiskMoveOutcome.Undone, r.Outcome);
+        Assert.Equal(b.DStart, f.D.Start);
+        Assert.Equal(b.DSize, f.D.Size);
+        Assert.Equal(f.D.Start, f.D.DataStart);
+        Assert.Equal(b.DAttrs, f.D.Attrs);
+        Assert.Equal(b.DLetter, f.D.Letter);
+        Assert.Equal(b.CSize, f.C.Size);
+        Assert.Equal(b.RStart, f.R.Start);
+        Assert.False(DiskMoveRunner.HasUnfinishedMove(_dir));
+        Assert.Contains("D: was restored to its original size", Assert.Single(r.Warnings));
     }
 
     /// <summary>Nothing but (maybe) the shrink of D happened: D visible with its letter at its start.</summary>
@@ -181,11 +199,16 @@ public sealed class DiskMoveRunnerTests : IDisposable
             return (f, b);
         }
 
-        int resumed = 0, untouched = 0, finished = 0;
+        int resumed = 0, untouched = 0, finished = 0, undone = 0;
         for (int n = 1; n <= total; n++)
         {
             var (f, b) = await CrashedAt(n);
-            if (DiskMoveRunner.HasUnfinishedJournal(Journal))
+            if (!DiskMoveRunner.HasUnfinishedJournal(Journal) && File.Exists(Pending))
+            {
+                undone++;   // crashed in step 1 or in step 2 before the journal existed
+                AssertUndone(f, b, await Runner(f).ResumeAsync(new SyncProgress(), () => false));
+            }
+            else if (DiskMoveRunner.HasUnfinishedJournal(Journal))
             {
                 resumed++;
                 await Runner(f).ResumeAsync(new SyncProgress(), () => false);
@@ -227,7 +250,8 @@ public sealed class DiskMoveRunnerTests : IDisposable
                 AssertNotMoved(f, b);
             }
         }
-        Assert.True(resumed > 20 && untouched >= 2 && finished == 1, $"resumed {resumed}, untouched {untouched}, finished {finished}");
+        Assert.True(resumed > 20 && undone == 2 && untouched == 0 && finished == 1,
+            $"resumed {resumed}, undone {undone}, untouched {untouched}, finished {finished}");
     }
 
     [Fact]
@@ -260,6 +284,7 @@ public sealed class DiskMoveRunnerTests : IDisposable
         Assert.False(DiskMoveRunner.HasUnfinishedJournal(Journal));
         Assert.DoesNotContain(f.Calls, c => c.StartsWith("RunMove") || c.StartsWith("Step("));
         AssertInOrder(f.Calls, "SetAttributes(D,visible", "Unlock(D)", "AssignLetter(D,D)", "DeleteJournal", $"Resize(D,{b.DSize})");
+        Assert.False(DiskMoveRunner.HasUnfinishedMove(_dir));
     }
 
     [Fact]
@@ -299,15 +324,121 @@ public sealed class DiskMoveRunnerTests : IDisposable
     }
 
     [Fact]
-    public async Task WinReFallback_WhenEnableFails()
+    public async Task WinRe_EnableFails_WarnsAndCompletes()
     {
         var f = new FakeDiskMoveBackend { EnableFailures = 1 };
         var b = Capture(f);
-        await Run(f);
-        AssertInOrder(f.Calls, "SetWinRe(False)", "RunMove(1)", "SetWinRe(True) failed", "RecreateRecovery(R)", "SetWinRe(True)");
-        Assert.True(f.WinRe);
-        Assert.Equal(b.CSize + X, f.C.Size);
+        var progress = new SyncProgress();
+        var r = await Run(f, progress: progress);
+        AssertInOrder(f.Calls, "SetWinRe(False)", "RunMove(1)", "SetWinRe(True) failed", "Step(ExtendTarget)", "Resize(C,",
+            "Step(Verify)", "Step(Done)", "DeleteJournal");
+        Assert.False(f.WinRe);   // left for the user: winre.wim is on C:
+        Assert.Equal(DiskMoveOutcome.Completed, r.Outcome);
+        Assert.Equal([DiskMoveRunner.WinReWarning], r.Warnings);   // reported once, also by step 7
+        Assert.Contains(progress.Items, p => p.Message.Contains("reagentc /enable"));
+        AssertMoved(f, b with { WinRe = false });
+    }
+
+    [Fact]
+    public async Task WinRe_EnableFailsAfterCrash_ResumeWarnsAndCompletes()
+    {
+        var f = new FakeDiskMoveBackend { EnableFailures = 5 };
+        var b = Capture(f);
+        f.OnCall = c => { if (c == "Step(ExtendTarget)") f.CrashAtCall = f.CallCount; };
+        await Assert.ThrowsAnyAsync<Exception>(() => Run(f));
+        f.Revive();
+        var r = await Runner(f).ResumeAsync(new SyncProgress(), () => false);
+        Assert.Equal([DiskMoveRunner.WinReWarning], r.Warnings);   // found again by step 7 alone
+        AssertMoved(f, b with { WinRe = false });
+    }
+
+    [Theory]
+    [InlineData(true)]    // Windows auto-assigns another letter after the unhide: it is kept
+    [InlineData(false)]   // no letter at all: the first free one from D is assigned
+    public async Task Letter_TakenByAnotherVolume_UsesAnotherLetterAndWarns(bool windowsRestoresLetter)
+    {
+        var f = new FakeDiskMoveBackend { WindowsRestoresLetter = windowsRestoresLetter };
+        var b = Capture(f);
+        f.OnCall = c => { if (c == "Dismount(D)") f.ForeignLetters.Add('D'); };   // a USB drive takes D: during the move
+        f.ForeignLetters.Add('E');
+        var r = await Run(f);
+        Assert.Equal('F', f.D.Letter);
+        Assert.Equal('F', r.FinalSourceLetter);
+        Assert.Equal(["D: was taken by another drive, so your data drive is now F:."], r.Warnings);
+        Assert.Contains("Chkdsk(D)", f.Calls);   // step 7 checked the volume under its new letter
+        AssertMoved(f, b with { DLetter = 'F' });
+    }
+
+    [Fact]
+    public async Task Letter_Kept_ReportedInResult()
+    {
+        var f = new FakeDiskMoveBackend();
+        var r = await Run(f);
+        Assert.Equal('D', r.FinalSourceLetter);
+        Assert.Empty(r.Warnings);
+        Assert.Equal(DiskMoveOutcome.Completed, r.Outcome);
+    }
+
+    [Theory]
+    [InlineData("Resize(D,")]   // crash right after step 1
+    [InlineData("Lock(D)")]     // crash in step 2, before CreateJournal
+    public async Task CrashBeforeJournal_ResumeUndoesShrink(string crashAfter)
+    {
+        var f = new FakeDiskMoveBackend();
+        var b = Capture(f);
+        f.OnCall = c => { if (c.StartsWith(crashAfter)) f.CrashAtCall = f.CallCount; };
+        await Assert.ThrowsAnyAsync<Exception>(() => Run(f));
+        f.Revive();
+        f.OnCall = null;
         Assert.False(DiskMoveRunner.HasUnfinishedJournal(Journal));
+        Assert.True(File.Exists(Pending));
+        Assert.True(DiskMoveRunner.HasUnfinishedMove(_dir));
+        Assert.Equal(b.DSize - X, f.D.Size);
+
+        var progress = new SyncProgress();
+        var r = await Runner(f).ResumeAsync(progress, () => false);
+        AssertUndone(f, b, r);
+        Assert.Contains(progress.Items, p => p.Message.Contains("restored to its original size"));
+        Assert.DoesNotContain(f.Calls, c => c.StartsWith("CreateJournal") || c.StartsWith("SetAttributes"));
+    }
+
+    [Fact]
+    public async Task CrashAtCreateJournal_ResumeContinuesAndDropsPending()
+    {
+        var f = new FakeDiskMoveBackend();
+        var b = Capture(f);
+        f.OnCall = c => { if (c == "CreateJournal") f.CrashAtCall = f.CallCount; };
+        await Assert.ThrowsAnyAsync<Exception>(() => Run(f));
+        f.Revive();
+        Assert.True(DiskMoveRunner.HasUnfinishedJournal(Journal));
+        var r = await Runner(f).ResumeAsync(new SyncProgress(), () => false);
+        Assert.Equal(DiskMoveOutcome.Completed, r.Outcome);
+        AssertMoved(f, b);
+    }
+
+    [Fact]
+    public async Task Pending_GoneOnceJournalExists()
+    {
+        var f = new FakeDiskMoveBackend();
+        bool pendingBeforeShrink = false, pendingAfterJournal = true;
+        f.OnCall = c =>
+        {
+            if (c.StartsWith("Resize(D,")) pendingBeforeShrink = File.Exists(Pending);
+            if (c == "SetAttributes(D,hidden,0xC000000000000000)") pendingAfterJournal = File.Exists(Pending);
+        };
+        await Run(f);
+        Assert.True(pendingBeforeShrink, "the marker must exist before step 1");
+        Assert.False(pendingAfterJournal, "the journal supersedes the marker");
+    }
+
+    [Fact]
+    public async Task Run_RefusesWhenPendingExists()
+    {
+        var f = new FakeDiskMoveBackend();
+        Directory.CreateDirectory(_dir);
+        File.WriteAllText(Pending, "{}");
+        await Assert.ThrowsAsync<DiskMoveException>(() => Run(f));
+        Assert.Equal(0, f.CallCount);
     }
 
     [Fact]
@@ -356,6 +487,7 @@ public sealed class DiskMoveRunnerTests : IDisposable
             return [new CheckResult(CheckSeverity.Warning, CheckCode.Backup, "backup"), fix];
         }));
         Assert.True(shrunkWhenRechecked, "recheck must run after step 1");
+        Assert.False(DiskMoveRunner.HasUnfinishedMove(_dir));
         Assert.Contains(fix, ex.Results);
         Assert.Equal(b.DSize, f.D.Size);
         Assert.False(DiskMoveRunner.HasUnfinishedJournal(Journal));
@@ -430,7 +562,8 @@ public sealed class DiskMoveRunnerTests : IDisposable
     public async Task Resume_WithoutJournal_DoesNothing()
     {
         var f = new FakeDiskMoveBackend();
-        await Runner(f).ResumeAsync(new SyncProgress(), () => false);
+        var r = await Runner(f).ResumeAsync(new SyncProgress(), () => false);
+        Assert.Equal(DiskMoveOutcome.NothingToDo, r.Outcome);
         Assert.Equal(0, f.CallCount);
     }
 
@@ -537,4 +670,15 @@ public sealed class WindowsDiskMoveBackendTests
     [InlineData("    Windows RE-Status:         Aktiviert\r\n", null)]   // localized output: unknown, never guessed
     public void ParseWinReStatus_ReadsReagentcInfo(string output, bool? expected) =>
         Assert.Equal(expected, WindowsDiskMoveBackend.ParseWinReStatus(output));
+
+    [Theory]
+    [InlineData("<?xml version='1.0' encoding='utf-8'?>\r\n<WindowsRE version=\"2.0\">\r\n  <WinreBCD id=\"{a4d113f5-47d9-11f1-89b2-e91252689b75}\"/>\r\n  <InstallState state=\"1\"/>\r\n  <OsInstallAvailable state=\"0\"/>\r\n</WindowsRE>", true)]
+    [InlineData("<WindowsRE version=\"2.0\"><InstallState state=\"0\"/><IsAutoRepairOn state=\"1\"/></WindowsRE>", false)]
+    [InlineData("<WindowsRE version=\"2.0\"><IsAutoRepairOn state=\"1\"/></WindowsRE>", null)]   // missing element
+    [InlineData("<WindowsRE version=\"2.0\"><InstallState/></WindowsRE>", null)]                  // missing attribute
+    [InlineData("<WindowsRE version=\"2.0\"><InstallState state=\"2\"/></WindowsRE>", null)]     // unknown value
+    [InlineData("<WindowsRE><InstallState state=\"1\"></WindowsRE", null)]                         // malformed
+    [InlineData("", null)]
+    public void ParseReAgentXml_ReadsInstallState(string xml, bool? expected) =>
+        Assert.Equal(expected, WindowsDiskMoveBackend.ParseReAgentXml(xml));
 }

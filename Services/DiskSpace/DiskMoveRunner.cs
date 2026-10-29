@@ -1,6 +1,8 @@
 using System.Globalization;
 using System.IO;
 using System.Runtime.ExceptionServices;
+using System.Security.AccessControl;
+using System.Security.Principal;
 using System.Text.Json;
 
 namespace WinOptimizer.Services.DiskSpace;
@@ -25,6 +27,11 @@ public sealed class DiskMoveRunner
     public const ulong HideBits = GptHidden | GptNoDriveLetter;
     private const long MiB = 1L << 20;
     private const string StampFormat = "yyyyMMdd-HHmmss";
+    /// <summary>Marker written before step 1 and removed once the journal exists (or after an undo).</summary>
+    public const string PendingFileName = "pending.json";
+    public const string JournalFileName = "journal.bin";
+    public const string WinReWarning =
+        "Windows Recovery could not be re-enabled automatically. Run `reagentc /enable` as administrator; see Microsoft KB5028997.";
     private static readonly TimeSpan BackupRetention = TimeSpan.FromDays(30);
 
     /// <summary>C:\ProgramData\WinOptimizer\DiskMove\journal.bin</summary>
@@ -40,7 +47,12 @@ public sealed class DiskMoveRunner
         _b = backend ?? throw new ArgumentNullException(nameof(backend));
         _journal = journalPath ?? throw new ArgumentNullException(nameof(journalPath));
         _manageWinRe = manageWinRe;
+        SecureDataFolder = string.Equals(DataDir, Path.GetDirectoryName(DefaultJournalPath), StringComparison.OrdinalIgnoreCase);
     }
+
+    /// <summary>Create the data folder (if missing) with an Administrators + SYSTEM only ACL. Defaults to true for
+    /// the default ProgramData folder, false elsewhere (tests).</summary>
+    public bool SecureDataFolder { get; init; }
 
     /// <summary>How often a paused move polls shouldPause (spec: 1 s).</summary>
     public TimeSpan PausePollInterval { get; init; } = TimeSpan.FromSeconds(1);
@@ -49,6 +61,13 @@ public sealed class DiskMoveRunner
 
     /// <summary>File.Exists only: the journal's ACL makes it unreadable to a non-admin process.</summary>
     public static bool HasUnfinishedJournal(string journalPath) => File.Exists(journalPath);
+
+    /// <summary>A journal ("journal.bin") or a pending marker ("pending.json") exists in the data folder: the app must
+    /// open the Resume screen. File.Exists only (both may be unreadable to a non-admin process).</summary>
+    public static bool HasUnfinishedMove(string dataDir) =>
+        File.Exists(Path.Combine(dataDir, JournalFileName)) || File.Exists(Path.Combine(dataDir, PendingFileName));
+
+    private string PendingPath => Path.Combine(DataDir, PendingFileName);
 
     private string DataDir => Path.GetDirectoryName(Path.GetFullPath(_journal))!;
 
@@ -64,6 +83,17 @@ public sealed class DiskMoveRunner
         public IDisposable? RecoveryLock;
         // Undo bookkeeping (only before step 3 of a fresh run).
         public bool Shrunk, JournalCreated, SourceHidden;
+        public readonly List<string> Warnings = [];
+        public char? FinalLetter;
+
+        public void Warn(MoveStep step, string message)
+        {
+            if (Warnings.Contains(message)) return;
+            Warnings.Add(message);
+            Progress.Report(new RunProgress(step, 0, 0, "Warning: " + message));
+        }
+
+        public DiskMoveResult Result(DiskMoveOutcome outcome) => new(outcome, FinalLetter, Warnings.ToList());
 
         public void ReleaseLocks()
         {
@@ -76,7 +106,7 @@ public sealed class DiskMoveRunner
 
     // ================================================================== RunAsync
 
-    public Task RunAsync(DiskSnapshot disk, PartitionSnapshot target, PartitionSnapshot source, MovePlan plan,
+    public Task<DiskMoveResult> RunAsync(DiskSnapshot disk, PartitionSnapshot target, PartitionSnapshot source, MovePlan plan,
         Func<IReadOnlyList<CheckResult>> recheck, IProgress<RunProgress> progress, Func<bool> shouldPause,
         CancellationToken cancelBeforeMove)
     {
@@ -90,12 +120,12 @@ public sealed class DiskMoveRunner
         return Task.Run(() => Run(disk, target, source, plan, recheck, progress, shouldPause, cancelBeforeMove));
     }
 
-    private void Run(DiskSnapshot disk, PartitionSnapshot target, PartitionSnapshot source, MovePlan plan,
+    private DiskMoveResult Run(DiskSnapshot disk, PartitionSnapshot target, PartitionSnapshot source, MovePlan plan,
         Func<IReadOnlyList<CheckResult>> recheck, IProgress<RunProgress> progress, Func<bool> shouldPause,
         CancellationToken cancel)
     {
-        if (HasUnfinishedJournal(_journal))
-            throw new DiskMoveException($"An unfinished move journal exists ({_journal}); resume it instead of starting a new move.");
+        if (HasUnfinishedJournal(_journal) || File.Exists(PendingPath))
+            throw new DiskMoveException($"An unfinished move exists in {DataDir}; resume it instead of starting a new move.");
         cancel.ThrowIfCancellationRequested();
 
         // ---------------------------------------------------------------- step 0: checks + layout backup
@@ -156,7 +186,10 @@ public sealed class DiskMoveRunner
                 SectorSize = disk.LogicalSectorSize,
                 ManageWinRe = manageWinRe,
             },
+            FinalLetter = source.DriveLetter,
         };
+        // Before step 1: without it a crash before the journal exists would strand X bytes after the source.
+        WritePending(new PendingMove(disk.Guid, source.Guid, source.DriveLetter ?? '\0', source.Size, target.Guid, amount, Now()));
 
         try
         {
@@ -205,6 +238,7 @@ public sealed class DiskMoveRunner
 
             // ------------------------------------------------------------ steps 3-7: forward only
             ContinueFrom(ctx, MoveStep.MoveSource, recordFirst: true);
+            return ctx.Result(DiskMoveOutcome.Completed);
         }
         finally
         {
@@ -257,6 +291,7 @@ public sealed class DiskMoveRunner
             moves.Add(new(s.DiskGuid, rg, s.SectorSize, s.RecoveryStart, s.RecoverySize, s.Amount, [(0L, s.RecoverySize)]));
         _b.CreateJournal(_journal, moves, s);
         ctx.JournalCreated = true;
+        DeletePending();   // the journal supersedes it
         cancel.ThrowIfCancellationRequested();
 
         HideSource(ctx);
@@ -290,33 +325,43 @@ public sealed class DiskMoveRunner
         ctx.JournalCreated = false;
         if (ctx.Shrunk) _b.ResizePartition(ctx.Disk, s.SourceGuid, s.SourceOriginalSize);
         ctx.Shrunk = false;
+        DeletePending();
     }
 
     // ================================================================== ResumeAsync
 
-    public Task ResumeAsync(IProgress<RunProgress> progress, Func<bool> shouldPause)
+    public Task<DiskMoveResult> ResumeAsync(IProgress<RunProgress> progress, Func<bool> shouldPause)
     {
         ArgumentNullException.ThrowIfNull(progress);
         ArgumentNullException.ThrowIfNull(shouldPause);
         return Task.Run(() => Resume(progress, shouldPause));
     }
 
-    private void Resume(IProgress<RunProgress> progress, Func<bool> shouldPause)
+    private DiskMoveResult Resume(IProgress<RunProgress> progress, Func<bool> shouldPause)
     {
-        if (!HasUnfinishedJournal(_journal)) return;
+        if (!HasUnfinishedJournal(_journal))
+        {
+            if (File.Exists(PendingPath)) return UndoPending(progress);
+            return new DiskMoveResult(DiskMoveOutcome.NothingToDo, null, []);
+        }
         var info = _b.ReadJournal(_journal, out var state);
-        if (info is null) return;
+        if (info is null) return new DiskMoveResult(DiskMoveOutcome.NothingToDo, null, []);
         if (state is null) throw new DiskMoveException($"The journal {_journal} has no restore information.");
+        DeletePending();   // a crash right after CreateJournal can leave both: the journal wins
 
         int disk = _b.FindDiskNumber(state.DiskGuid);
         var step = info.Step < MoveStep.LockSource ? MoveStep.LockSource : info.Step;
-        var ctx = new Ctx { Disk = disk, State = state, Progress = progress, ShouldPause = shouldPause, ManageWinRe = state.ManageWinRe };
+        var ctx = new Ctx
+        {
+            Disk = disk, State = state, Progress = progress, ShouldPause = shouldPause, ManageWinRe = state.ManageWinRe,
+            FinalLetter = state.SourceLetter == '\0' ? null : state.SourceLetter,
+        };
         progress.Report(new RunProgress(step, 0, 0, $"Resuming at step {(int)step}"));
 
         if (step == MoveStep.Done)
         {
             Finish(ctx);
-            return;
+            return ctx.Result(DiskMoveOutcome.Completed);
         }
         CheckResumeLayout(ctx, info, step);   // read-only; throws before any write
 
@@ -331,11 +376,47 @@ public sealed class DiskMoveRunner
             {
                 ContinueFrom(ctx, step, recordFirst: false);
             }
+            return ctx.Result(DiskMoveOutcome.Completed);
         }
         finally
         {
             ctx.ReleaseLocks();
         }
+    }
+
+    /// <summary>No journal but a pending marker: the attempt stopped in step 1 or 2 before any data moved. Never
+    /// continue it silently: give the source its original size back and remove the marker.</summary>
+    private DiskMoveResult UndoPending(IProgress<RunProgress> progress)
+    {
+        PendingMove pending;
+        try
+        {
+            pending = PendingMove.FromJsonBytes(File.ReadAllBytes(PendingPath));
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            throw new DiskMoveException($"The pending move marker {PendingPath} cannot be read: {ex.Message}", ex);
+        }
+        progress.Report(new RunProgress(MoveStep.ShrinkSource, 0, 0, "Undoing the interrupted attempt"));
+        int disk = _b.FindDiskNumber(pending.DiskGuid);
+        long size = _b.PartitionSize(disk, pending.SourceGuid);
+        if (size > pending.SourceOriginalSize)
+            throw new DiskMoveStateMismatchException(
+                $"The source is {size} bytes, larger than its original {pending.SourceOriginalSize}; nothing was changed. Marker: {PendingPath}.");
+        string name = pending.SourceLetter == '\0' ? "the source partition" : $"{pending.SourceLetter}:";
+        string warning;
+        if (size < pending.SourceOriginalSize)
+        {
+            _b.ResizePartition(disk, pending.SourceGuid, pending.SourceOriginalSize);
+            warning = $"The previous attempt was interrupted before any data moved; {name} was restored to its original size.";
+        }
+        else
+        {
+            warning = $"The previous attempt was interrupted before any data moved; {name} was not changed.";
+        }
+        DeletePending();
+        progress.Report(new RunProgress(MoveStep.ShrinkSource, 0, 0, "Warning: " + warning));
+        return new DiskMoveResult(DiskMoveOutcome.Undone, pending.SourceLetter == '\0' ? null : pending.SourceLetter, [warning]);
     }
 
     /// <summary>The disk must be in exactly one of the states the recorded step allows. Read-only.</summary>
@@ -474,7 +555,16 @@ public sealed class DiskMoveRunner
         }
         ctx.SourceLock?.Dispose();
         ctx.SourceLock = null;
-        if (s.SourceLetter != '\0') _b.AssignLetter(s.SourceVolumePath!, s.SourceLetter);
+        if (s.SourceLetter != '\0') NoteLetter(ctx, MoveStep.CommitSource, _b.AssignLetter(s.SourceVolumePath!, s.SourceLetter));
+    }
+
+    /// <summary>Records the source's final letter; a different one than before is a warning, never a stop.</summary>
+    private static void NoteLetter(Ctx ctx, MoveStep step, char letter)
+    {
+        ctx.FinalLetter = letter;
+        char original = ctx.State.SourceLetter;
+        if (original != '\0' && char.ToUpperInvariant(letter) != char.ToUpperInvariant(original))
+            ctx.Warn(step, $"{original}: was taken by another drive, so your data drive is now {letter}:.");
     }
 
     /// <summary>Step 5: WinRE off, lock + hide + dismount the Recovery, move it, set its start, exact attributes
@@ -524,9 +614,9 @@ public sealed class DiskMoveRunner
         }
         catch (DiskMoveException) when (s.WinReWasEnabled)
         {
-            ctx.Progress.Report(new RunProgress(MoveStep.MoveRecovery, 0, 0, "Re-creating the Recovery partition (KB5028997)"));
-            _b.RecreateRecoveryPartition(ctx.Disk, rg, s.RecoveryNewStart, s.RecoverySize);
-            _b.SetWinRe(true);
+            // The move is committed and winre.wim is safe on C: (reagentc /disable put it there). Never re-create the
+            // partition automatically: tell the user and finish steps 6-7.
+            ctx.Warn(MoveStep.MoveRecovery, WinReWarning);
         }
     }
 
@@ -551,11 +641,22 @@ public sealed class DiskMoveRunner
         long srcSize = _b.PartitionSize(ctx.Disk, s.SourceGuid), srcStart = _b.PartitionStart(ctx.Disk, s.SourceGuid);
         if (srcSize != s.SourceShrunkSize || srcStart != s.SourceNewStart) problems.Add($"source is at {srcStart} (+{srcSize})");
         if (ctx.ManageWinRe && _b.WinReEnabled() != s.WinReWasEnabled)
-            problems.Add($"Windows RE is not {(s.WinReWasEnabled ? "enabled" : "disabled")} as before");
+        {
+            if (s.WinReWasEnabled) ctx.Warn(MoveStep.Verify, WinReWarning);   // not a failure of the move itself
+            else problems.Add("Windows RE is enabled but was disabled before");
+        }
         if (s.SourceLetter != '\0')
         {
-            int rc = _b.Chkdsk(s.SourceLetter);
-            if (rc != 0) problems.Add($"chkdsk {s.SourceLetter}: returned {rc}");
+            if (_b.GetLetter(s.SourceVolumePath!) is not char letter)
+            {
+                problems.Add($"the source has no drive letter (it was {s.SourceLetter}:)");
+            }
+            else
+            {
+                NoteLetter(ctx, MoveStep.Verify, letter);
+                int rc = _b.Chkdsk(letter);
+                if (rc != 0) problems.Add($"chkdsk {letter}: returned {rc}");
+            }
         }
         if (problems.Count > 0)
             throw new DiskMoveVerificationException("Verification failed: " + string.Join("; ", problems) +
@@ -571,9 +672,43 @@ public sealed class DiskMoveRunner
 
     // ================================================================== layout backups
 
+    /// <summary>Creates the data folder; with <see cref="SecureDataFolder"/> a new folder gets a protected ACL that
+    /// grants only Administrators and SYSTEM full control (inherited by the files in it).</summary>
+    private void EnsureDataDir()
+    {
+        if (Directory.Exists(DataDir)) return;
+        if (!SecureDataFolder)
+        {
+            Directory.CreateDirectory(DataDir);
+            return;
+        }
+        Directory.CreateDirectory(Path.GetDirectoryName(DataDir)!);
+        var sec = new DirectorySecurity();
+        sec.SetAccessRuleProtection(isProtected: true, preserveInheritance: false);
+        foreach (var sid in new[] { WellKnownSidType.BuiltinAdministratorsSid, WellKnownSidType.LocalSystemSid })
+            sec.AddAccessRule(new FileSystemAccessRule(new SecurityIdentifier(sid, null), FileSystemRights.FullControl,
+                InheritanceFlags.ContainerInherit | InheritanceFlags.ObjectInherit, PropagationFlags.None, AccessControlType.Allow));
+        new DirectoryInfo(DataDir).Create(sec);
+    }
+
+    /// <summary>Atomic: write a temp file, flush it to disk, then rename it over the marker.</summary>
+    private void WritePending(PendingMove pending)
+    {
+        EnsureDataDir();
+        string tmp = PendingPath + ".tmp";
+        using (var fs = new FileStream(tmp, FileMode.Create, FileAccess.Write, FileShare.None))
+        {
+            fs.Write(pending.ToJsonBytes());
+            fs.Flush(flushToDisk: true);
+        }
+        File.Move(tmp, PendingPath, overwrite: true);
+    }
+
+    private void DeletePending() => File.Delete(PendingPath);
+
     private void SaveBackups(DiskSnapshot disk, int diskNo)
     {
-        Directory.CreateDirectory(DataDir);
+        EnsureDataDir();
         string stamp = Now().ToString(StampFormat, CultureInfo.InvariantCulture);
         File.WriteAllBytes(Path.Combine(DataDir, $"layout-{stamp}.json"),
             JsonSerializer.SerializeToUtf8Bytes(disk, new JsonSerializerOptions { WriteIndented = true }));

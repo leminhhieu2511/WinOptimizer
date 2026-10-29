@@ -7,6 +7,8 @@ using System.Runtime.ExceptionServices;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.RegularExpressions;
+using System.Xml;
+using System.Xml.Linq;
 using Microsoft.Win32.SafeHandles;
 
 namespace WinOptimizer.Services.DiskSpace;
@@ -15,13 +17,12 @@ namespace WinOptimizer.Services.DiskSpace;
 /// The real <see cref="IDiskMoveBackend"/>: DiskMove.dll for exact GPT attributes, partition start, NTFS patch,
 /// volume lock/verify/dismount, journal and moves; IOCTL_DISK_GET_DRIVE_LAYOUT_EX (read-only) for starts and sizes;
 /// the Win32 mount point API for drive letters (tolerating Windows dropping / re-adding the letter around a hide);
-/// WMI only for MSFT_Partition.Resize; reagentc / chkdsk / diskpart as processes. Needs administrator rights.
+/// WMI only for MSFT_Partition.Resize; WinRE state from ReAgent.xml (reagentc /info as fallback); reagentc and chkdsk
+/// as processes. Needs administrator rights.
 /// </summary>
 public sealed class WindowsDiskMoveBackend : IDiskMoveBackend
 {
     private const string StorageScope = @"root\Microsoft\Windows\Storage";
-    private static readonly Guid RecoveryType = PartitionTypes.Recovery;
-    private const ulong RecoveryAttributes = 0x8000000000000001UL;
 
     private readonly IDiskLayoutSource _layout;
 
@@ -258,33 +259,55 @@ public sealed class WindowsDiskMoveBackend : IDiskMoveBackend
             throw new DiskMoveException($"Cannot remove the drive letter {root}: {new Win32Exception(err).Message}");
     }
 
-    /// <summary>The volume re-arrives asynchronously after a layout change, and Windows often gives the letter back
-    /// itself (SetVolumeMountPoint then fails with error 145), so each attempt first checks where the letter leads.
-    /// Letters Windows auto-assigned meanwhile are dropped. Up to about 20 s.</summary>
-    public void AssignLetter(string volumePath, char letter)
+    /// <summary>
+    /// The volume re-arrives asynchronously after a layout change, and Windows often gives the letter back itself
+    /// (SetVolumeMountPoint then fails with error 145), so each attempt first checks where the letter leads.
+    /// - The letter leads to this volume, or SetVolumeMountPoint succeeds: drop letters Windows auto-assigned; done.
+    /// - The letter leads to ANOTHER volume (e.g. a USB drive took it during the move): keep the letter Windows
+    ///   auto-assigned to this volume, else assign the first free letter D..Z. Never leave it without a letter.
+    /// Waits up to about 20 s for the volume to arrive.
+    /// </summary>
+    public char AssignLetter(string volumePath, char letter)
     {
         string vol = Norm(volumePath), root = Root(letter);
-        DropOtherLetters(vol, letter);
         int err = 0;
-        string? other = null;
-        bool ok = false;
-        for (int attempt = 0; attempt < 40 && !ok; attempt++)
+        for (int attempt = 0; attempt < 40; attempt++)
         {
             string? now = Resolve(root);
-            if (Same(now, vol)) ok = true;
-            else if (SetVolumeMountPointW(root, vol)) ok = true;
-            else
+            if (Same(now, vol) || (now is null && SetVolumeMountPointW(root, vol)))
             {
-                err = Marshal.GetLastWin32Error();
-                other = now;
-                Thread.Sleep(500);
+                DropOtherLetters(vol, letter);
+                return char.ToUpperInvariant(letter);
             }
+            err = Marshal.GetLastWin32Error();
+            if (now is not null && Letters(vol) is { } current)   // taken by another volume, and ours has arrived
+            {
+                if (current.Count > 0) return current[0];
+                foreach (char c in FreeLetters())
+                    if (SetVolumeMountPointW(Root(c), vol)) return c;
+            }
+            Thread.Sleep(500);
         }
-        DropOtherLetters(vol, letter);
-        if (!ok)
-            throw new DiskMoveException(other is not null
-                ? $"The drive letter {root} is now used by another volume ({other}); give it back to the moved partition in Disk Management."
-                : $"Cannot give the drive letter {root} back: {new Win32Exception(err).Message}");
+        throw new DiskMoveException($"Cannot give the moved partition a drive letter ({root}): {new Win32Exception(err).Message}");
+    }
+
+    public char? GetLetter(string volumePath) => Letters(Norm(volumePath)) is { Count: > 0 } l ? l[0] : null;
+
+    /// <summary>Drive letters of the volume (sorted), or null if the volume is not there (yet).</summary>
+    private static List<char>? Letters(string vol)
+    {
+        var buf = new char[4096];
+        if (!GetVolumePathNamesForVolumeNameW(vol, buf, buf.Length, out _)) return null;
+        return new string(buf).Split('\0', StringSplitOptions.RemoveEmptyEntries)
+            .Where(m => m.Length == 3 && m[1] == ':' && m[2] == '\\').Select(m => char.ToUpperInvariant(m[0])).Order().ToList();
+    }
+
+    /// <summary>D..Z not used by any drive (GetLogicalDrives) and not resolving to a volume.</summary>
+    private static IEnumerable<char> FreeLetters()
+    {
+        uint used = GetLogicalDrives();
+        for (char c = 'D'; c <= 'Z'; c++)
+            if ((used & (1u << (c - 'A'))) == 0 && Resolve(Root(c)) is null) yield return c;
     }
 
     private static void DropOtherLetters(string vol, char keep)
@@ -300,10 +323,36 @@ public sealed class WindowsDiskMoveBackend : IDiskMoveBackend
 
     private static string SystemTool(string exe) => Path.Combine(Environment.SystemDirectory, exe);
 
+    /// <summary>Primary: %WINDIR%\System32\Recovery\ReAgent.xml (locale-independent, maintained by reagentc);
+    /// fallback: the English "Windows RE status" line of reagentc /info; null if neither gives a state.</summary>
     public bool? WinReEnabled()
     {
+        string xml = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Windows), "System32", "Recovery", "ReAgent.xml");
+        try
+        {
+            if (File.Exists(xml) && ParseReAgentXml(File.ReadAllText(xml)) is bool state) return state;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            // fall back to reagentc
+        }
         var (_, output) = RunTool(SystemTool("reagentc.exe"), "/info", TimeSpan.FromMinutes(2));
         return ParseWinReStatus(output);
+    }
+
+    /// <summary>ReAgent.xml: &lt;InstallState state="1"/&gt; = enabled, "0" = disabled; null if missing or malformed.</summary>
+    public static bool? ParseReAgentXml(string xml)
+    {
+        try
+        {
+            var state = XDocument.Parse(xml).Descendants().FirstOrDefault(e => e.Name.LocalName == "InstallState")
+                ?.Attribute("state")?.Value.Trim();
+            return state switch { "1" => true, "0" => false, _ => null };
+        }
+        catch (XmlException)
+        {
+            return null;
+        }
     }
 
     /// <summary>"Windows RE status:   Enabled|Disabled" (reagentc /info); null if absent (e.g. localized output).</summary>
@@ -325,36 +374,6 @@ public sealed class WindowsDiskMoveBackend : IDiskMoveBackend
         catch (Exception ex) when (ex is Win32Exception or InvalidOperationException or IOException)
         {
             throw new DiskMoveException($"reagentc could not be run: {ex.Message}", ex);
-        }
-    }
-
-    /// <summary>KB5028997: delete the Recovery partition and create a new empty one at the same place (diskpart);
-    /// reagentc /enable then copies winre.wim from C:\Windows\System32\Recovery into it.</summary>
-    public void RecreateRecoveryPartition(int disk, Guid part, long offset, long size)
-    {
-        var e = Entry(disk, part);
-        if (e.Start != offset || e.Length != size || e.Type != RecoveryType)
-            throw new DiskMoveStateMismatchException("The Recovery partition is not where it should be; it was not re-created.");
-        const long MiB = 1L << 20;
-        if (offset % 1024 != 0 || size % MiB != 0)
-            throw new DiskMoveException("The Recovery partition is not aligned for diskpart; re-create it manually (KB5028997).");
-        string script = Path.Combine(Path.GetTempPath(), $"wo-recovery-{Guid.NewGuid():N}.txt");
-        File.WriteAllText(script,
-            $"select disk {disk}\r\nselect partition {e.Number}\r\ndelete partition override\r\n" +
-            $"create partition primary offset={offset / 1024} size={size / MiB}\r\n" +
-            $"set id={RecoveryType} override\r\ngpt attributes=0x{RecoveryAttributes:x16}\r\n" +
-            "format quick fs=ntfs label=\"Windows RE tools\"\r\n", Encoding.ASCII);
-        try
-        {
-            var (rc, output) = RunTool(SystemTool("diskpart.exe"), $"/s \"{script}\"", TimeSpan.FromMinutes(5));
-            var created = ReadLayout(disk).Entries.SingleOrDefault(x => x.Start == offset);
-            if (rc != 0 || created is null || created.Length != size || created.Type != RecoveryType ||
-                created.Attributes != RecoveryAttributes)
-                throw new DiskMoveException($"Re-creating the Recovery partition failed (diskpart exit {rc}): {output.Trim()}");
-        }
-        finally
-        {
-            try { File.Delete(script); } catch (IOException) { }
         }
     }
 
@@ -497,6 +516,9 @@ public sealed class WindowsDiskMoveBackend : IDiskMoveBackend
 
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     private static extern bool DeleteVolumeMountPointW(string mountPoint);
+
+    [DllImport("kernel32.dll")]
+    private static extern uint GetLogicalDrives();
 
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     private static extern bool SetVolumeMountPointW(string mountPoint, string volumeName);

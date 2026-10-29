@@ -25,8 +25,12 @@ public interface IDiskMoveBackend
 
     /// <summary>Removes the drive letter of the volume; succeeds if Windows already removed it.</summary>
     void RemoveLetter(string volumePath, char letter);
-    /// <summary>Gives the volume its letter back; succeeds if Windows already did, drops letters Windows auto-assigned.</summary>
-    void AssignLetter(string volumePath, char letter);
+    /// <summary>Gives the volume its letter back (succeeds if Windows already did; drops letters Windows auto-assigned).
+    /// If another volume holds that letter, keeps the letter Windows auto-assigned or assigns the first free one
+    /// from D..Z. Returns the letter the volume has now; throws only if it can get none.</summary>
+    char AssignLetter(string volumePath, char letter);
+    /// <summary>First drive letter of the volume, or null (read-only).</summary>
+    char? GetLetter(string volumePath);
 
     /// <summary>Opens the volume and takes FSCTL_LOCK_VOLUME; dispose to release. Throws if in use or absent.</summary>
     IDisposable LockVolume(string volumePath);
@@ -34,13 +38,11 @@ public interface IDiskMoveBackend
     bool VerifyVolume(IDisposable volume, int disk, long start, long length);
     void Dismount(IDisposable volume);
 
-    /// <summary>"Windows RE status" from reagentc /info; null if it cannot be determined.</summary>
+    /// <summary>WinRE state: ReAgent.xml InstallState, else the English "Windows RE status" of reagentc /info; null if unknown.</summary>
     bool? WinReEnabled();
-    /// <summary>reagentc /enable or /disable (no-op if already so); throws if WinRE does not end in that state.</summary>
+    /// <summary>reagentc /enable or /disable (no-op if already so); throws <see cref="DiskMoveException"/> if WinRE
+    /// does not end in that state.</summary>
     void SetWinRe(bool enabled);
-    /// <summary>KB5028997 fallback: deletes the (moved) Recovery partition and creates a new one at the same place
-    /// (Recovery type, attributes 0x8000000000000001, NTFS) for reagentc /enable to fill.</summary>
-    void RecreateRecoveryPartition(int disk, Guid part, long offset, long size);
 
     /// <summary>First 34 and last 33 sectors of the disk (primary and backup GPT).</summary>
     byte[] ReadRawGpt(int disk, int sectorSize);
