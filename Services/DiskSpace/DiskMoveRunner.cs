@@ -63,9 +63,22 @@ public sealed class DiskMoveRunner
     public static bool HasUnfinishedJournal(string journalPath) => File.Exists(journalPath);
 
     /// <summary>A journal ("journal.bin") or a pending marker ("pending.json") exists in the data folder: the app must
-    /// open the Resume screen. File.Exists only (both may be unreadable to a non-admin process).</summary>
-    public static bool HasUnfinishedMove(string dataDir) =>
-        File.Exists(Path.Combine(dataDir, JournalFileName)) || File.Exists(Path.Combine(dataDir, PendingFileName));
+    /// open the Resume screen. Uses directory listing only: the files are readable by administrators only, so
+    /// File.Exists is false for a non-admin process, but BUILTIN\Users may list the folder
+    /// (<see cref="CreateDataFolderSecurity"/>). A missing folder means no move.</summary>
+    public static bool HasUnfinishedMove(string dataDir)
+    {
+        try
+        {
+            return Directory.EnumerateFiles(dataDir).Select(Path.GetFileName).Any(n =>
+                string.Equals(n, JournalFileName, StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(n, PendingFileName, StringComparison.OrdinalIgnoreCase));
+        }
+        catch (DirectoryNotFoundException)
+        {
+            return false;
+        }
+    }
 
     private string PendingPath => Path.Combine(DataDir, PendingFileName);
 
@@ -715,24 +728,50 @@ public sealed class DiskMoveRunner
 
     // ================================================================== layout backups
 
-    /// <summary>Creates the data folder; with <see cref="SecureDataFolder"/> a new folder gets a protected ACL that
-    /// grants only Administrators and SYSTEM full control (inherited by the files in it).</summary>
+    /// <summary>Creates the data folder. With <see cref="SecureDataFolder"/> a new folder gets
+    /// <see cref="CreateDataFolderSecurity"/>, and an existing one (for example made by an older build with an
+    /// Administrators-only ACL) gets it re-applied, so a non-admin start can always see an unfinished move.</summary>
     private void EnsureDataDir()
     {
-        if (Directory.Exists(DataDir)) return;
         if (!SecureDataFolder)
         {
             Directory.CreateDirectory(DataDir);
             return;
         }
+        if (Directory.Exists(DataDir))
+        {
+            ApplyDataFolderSecurity(DataDir);
+            return;
+        }
         Directory.CreateDirectory(Path.GetDirectoryName(DataDir)!);
+        new DirectoryInfo(DataDir).Create(CreateDataFolderSecurity());
+    }
+
+    /// <summary>
+    /// The data folder's ACL (protected: nothing inherited from ProgramData).
+    /// Administrators and SYSTEM: full control, inherited by the files (journal, pending marker, backups), which
+    /// therefore stay readable by administrators only.
+    /// BUILTIN\Users: list the folder and read its attributes and permissions, on this folder only (not inherited),
+    /// so a non-admin process can see THAT a journal or pending marker exists (<see cref="HasUnfinishedMove"/>)
+    /// without being able to read either.
+    /// </summary>
+    public static DirectorySecurity CreateDataFolderSecurity()
+    {
         var sec = new DirectorySecurity();
         sec.SetAccessRuleProtection(isProtected: true, preserveInheritance: false);
         foreach (var sid in new[] { WellKnownSidType.BuiltinAdministratorsSid, WellKnownSidType.LocalSystemSid })
             sec.AddAccessRule(new FileSystemAccessRule(new SecurityIdentifier(sid, null), FileSystemRights.FullControl,
                 InheritanceFlags.ContainerInherit | InheritanceFlags.ObjectInherit, PropagationFlags.None, AccessControlType.Allow));
-        new DirectoryInfo(DataDir).Create(sec);
+        sec.AddAccessRule(new FileSystemAccessRule(new SecurityIdentifier(WellKnownSidType.BuiltinUsersSid, null),
+            FileSystemRights.ListDirectory | FileSystemRights.ReadAttributes | FileSystemRights.ReadExtendedAttributes |
+            FileSystemRights.ReadPermissions,
+            InheritanceFlags.None, PropagationFlags.None, AccessControlType.Allow));
+        return sec;
     }
+
+    /// <summary>Sets <see cref="CreateDataFolderSecurity"/> on an existing folder (needs admin rights or ownership).</summary>
+    public static void ApplyDataFolderSecurity(string dataDir) =>
+        new DirectoryInfo(dataDir).SetAccessControl(CreateDataFolderSecurity());
 
     /// <summary>Atomic: write a temp file, flush it to disk, then rename it over the marker.</summary>
     private void WritePending(PendingMove pending)

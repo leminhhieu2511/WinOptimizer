@@ -41,6 +41,23 @@ public static class DiskMoveSession
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { return false; }
     }
 
+    /// <summary>Administrator only: re-applies <see cref="DiskMoveRunner.CreateDataFolderSecurity"/> to the default data
+    /// folder if it exists (an older build made it Administrators-only, hiding an unfinished move from non-admin
+    /// starts). Best effort; the test folder is left alone.</summary>
+    public static void RepairDataFolderSecurity()
+    {
+        if (TestTargetDisk is not null) return;
+        try
+        {
+            if (Directory.Exists(DataDir)) DiskMoveRunner.ApplyDataFolderSecurity(DataDir);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or InvalidOperationException
+                                       or System.Security.Principal.IdentityNotMappedException)
+        {
+            // Not fatal: the runner re-applies it the next time it writes there.
+        }
+    }
+
     /// <summary>Windows RE is disabled/re-enabled around the Recovery move, except on a test target.</summary>
     public static bool ManageWinRe => TestTargetDisk is null;
 

@@ -83,6 +83,10 @@ public partial class App : Application
             else TaskbarHider.RestoreAll();
         };
 
+        // Administrator: give an existing disk-move data folder the current ACL (Users may list it), so a later
+        // non-admin start can detect an interrupted move.
+        if (AdminHelper.IsAdmin) DiskMoveSession.RepairDataFolderSecurity();
+
         var window = new MainWindow();
         MainWindow = window;
         window.Show();
@@ -168,14 +172,25 @@ public partial class App : Application
         window.Activate();
     }
 
+    private static bool _busyMessageShown;
+
     /// <summary>Exits the app (window, tray menu, ⚡ menu, --exit). Refused while a disk space move runs.</summary>
     public static void ExitApp()
     {
         if (DiskMoveSession.IsRunning)
         {
             ShowMainWindow();
-            MessageBox.Show(Current.MainWindow!, DiskMoveSession.BusyMessage, DiskMoveSession.BusyTitle,
-                MessageBoxButton.OK, MessageBoxImage.Warning);
+            if (_busyMessageShown) return;   // repeated Exit / --exit: one message box at a time
+            _busyMessageShown = true;
+            try
+            {
+                MessageBox.Show(Current.MainWindow!, DiskMoveSession.BusyMessage, DiskMoveSession.BusyTitle,
+                    MessageBoxButton.OK, MessageBoxImage.Warning);
+            }
+            finally
+            {
+                _busyMessageShown = false;
+            }
             return;
         }
         AutoProfileService.Shutdown();

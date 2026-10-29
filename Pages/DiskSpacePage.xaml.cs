@@ -438,13 +438,22 @@ public partial class DiskSpacePage : UserControl
         return new Border { Style = (Style)FindResource("Card"), Child = row, BorderBrush = brush };
     }
 
+    /// <summary>"Close for me". Reached from an async void click handler, so nothing may escape from here.</summary>
     private async Task CloseHoldersAsync(IReadOnlyList<LockHolder> holders)
     {
-        bool ok = await Task.Run(() => RestartManagerHelper.CloseApps(holders));
-        if (!ok)
-            MessageBox.Show(Window.GetWindow(this), "Some programs could not be closed. Close them yourself, then click Check again.",
-                "Close for me", MessageBoxButton.OK, MessageBoxImage.Information);
-        await AnalyzeAsync();
+        try
+        {
+            bool ok = await Task.Run(() => RestartManagerHelper.CloseApps(holders));
+            if (!ok)
+                MessageBox.Show(Window.GetWindow(this), "Some programs could not be closed. Close them yourself, then click Check again.",
+                    "Close for me", MessageBoxButton.OK, MessageBoxImage.Information);
+            await AnalyzeAsync();
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show(Window.GetWindow(this), "Closing the programs failed: " + ex.Message +
+                "\n\nClose them yourself, then click Check again.", "Close for me", MessageBoxButton.OK, MessageBoxImage.Warning);
+        }
     }
 
     private void BackToMap_Click(object sender, RoutedEventArgs e) => ShowScreen(Screen.Map);
@@ -623,7 +632,6 @@ public partial class DiskSpacePage : UserControl
         _sourceLetter = a.Source.DriveLetter;
         _hasRecovery = plan.HasRecovery;
 
-        BeginRun(resuming: false);
         var progress = new Progress<RunProgress>(OnProgress);
         IReadOnlyList<CheckResult> Recheck()
         {
@@ -638,6 +646,7 @@ public partial class DiskSpacePage : UserControl
 
         try
         {
+            BeginRun(resuming: false);   // inside the try: EndRun (finally) always clears the running flag
             var runner = new DiskMoveRunner(new WindowsDiskMoveBackend(), DiskMoveSession.JournalPath, DiskMoveSession.ManageWinRe);
             var result = await runner.RunAsync(a.Disk, a.Target, a.Source, plan, Recheck, progress, _guard!.ShouldPause, _cts!.Token);
             await ShowResultAsync(result);
@@ -836,9 +845,14 @@ public partial class DiskSpacePage : UserControl
             SpeedText.Text = "";
         }
 
-        if (!_resuming && p.Step >= MoveStep.MoveSource)
+        if (!_resuming && p.Step >= MoveStep.MoveSource && p.Step != MoveStep.Done)
         {
-            CancelRow.Visibility = Visibility.Collapsed;   // the point of no return has passed
+            // The point of no return has passed. A Cancel clicked after the runner's last check is too late: say so.
+            bool lateCancel = _cts?.IsCancellationRequested == true;
+            CancelRow.Visibility = lateCancel ? Visibility.Visible : Visibility.Collapsed;
+            CancelButton.IsEnabled = false;
+            if (lateCancel)
+                CancelHintText.Text = "The cancel came too late: the data had already started moving, so the move will be finished.";
         }
     }
 
@@ -1084,9 +1098,9 @@ public partial class DiskSpacePage : UserControl
         _amount = state?.Amount ?? info.Pending?.Amount ?? 0;
         _hasRecovery = state?.RecoveryGuid is not null;
 
-        BeginRun(resuming: true);
         try
         {
+            BeginRun(resuming: true);   // inside the try: EndRun (finally) always clears the running flag
             var runner = new DiskMoveRunner(new WindowsDiskMoveBackend(), DiskMoveSession.JournalPath, DiskMoveSession.ManageWinRe);
             var result = await runner.ResumeAsync(new Progress<RunProgress>(OnProgress), _guard!.ShouldPause);
             _resumeInfo = null;
