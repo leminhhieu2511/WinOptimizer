@@ -329,6 +329,132 @@ static void move_two_moves_in_order(void)
     fx_free(&f);
 }
 
+/* Two partitions on one 12 MiB image, moved like the real caller does (farthest partition first):
+   move 0 = "data" [3 MiB, 9 MiB) -> +1 MiB, then move 1 = "recovery" [1 MiB, 3 MiB) -> +1 MiB into the space
+   move 0 vacated. Both journal moves live in one journal, so the slot's move_index changes mid-sequence. */
+typedef struct fx2 { fx f; dm_move_plan plans[2]; dm_extent e0[3], e1[2]; } fx2;
+
+static void fx2_reset(fx2 *t)
+{
+    fx *f = &t->f;
+    memcpy(f->disk.data, f->orig, (size_t)f->size);
+    mem_io_free(&f->jr);
+    memset(&f->fault, 0, sizeof f->fault);
+    mem_io_init(&f->jr, &f->fault);
+    f->jio = mem_io_as_dm_io(&f->jr);
+    ASSERT_EQ_INT(dm_journal_create(&f->jio, t->plans, 2, "blob", 4), DM_OK);
+    f->fault.writes = 0;
+}
+
+static void fx2_make(fx2 *t)
+{
+    memset(t, 0, sizeof *t);
+    make_image(&t->f, 512, 9 * MIB, 1 * MIB, 0, 12);       /* 1 + 9 + 1 + 1 = 12 MiB random image */
+    dm_extent e0[3] = { { 1 * MIB + 100, 700 * KIB }, { 2 * MIB + 3, 1 * MIB + 5 }, { 4 * MIB - 1, 2 } };
+    dm_extent e1[2] = { { 4096 + 7, 300 * KIB }, { 1 * MIB - 9, 18 } };
+    memcpy(t->e0, e0, sizeof e0);
+    memcpy(t->e1, e1, sizeof e1);
+    t->plans[0] = t->f.plan;
+    t->plans[0].old_start = 3 * MIB; t->plans[0].length = 6 * MIB; t->plans[0].shift = 1 * MIB;
+    t->plans[0].extents = t->e0;     t->plans[0].extent_count = 3;
+    t->plans[1] = t->f.plan;
+    t->plans[1].old_start = 1 * MIB; t->plans[1].length = 2 * MIB; t->plans[1].shift = 1 * MIB;
+    t->plans[1].extents = t->e1;     t->plans[1].extent_count = 2;
+    memset(t->plans[1].partition_guid, 0x33, 16);
+    fx2_reset(t);
+}
+
+/* The caller's real sequence. */
+static dm_status run_both(fx2 *t)
+{
+    dm_status s = dm_run_move(&t->f.dio, &t->f.jio, 0, NULL, NULL);
+    return s != DM_OK ? s : dm_run_move(&t->f.dio, &t->f.jio, 1, NULL, NULL);
+}
+
+static void assert_both_moved(fx2 *t)
+{
+    assert_moved(t->f.disk.data, &t->plans[0], t->f.orig);
+    assert_moved(t->f.disk.data, &t->plans[1], t->f.orig);
+    /* nothing before move 1's source or after move 0's destination is touched */
+    ASSERT_TRUE(memcmp(t->f.disk.data, t->f.orig, (size_t)(1 * MIB)) == 0);
+    ASSERT_TRUE(memcmp(t->f.disk.data + 10 * MIB, t->f.orig + 10 * MIB, (size_t)(2 * MIB)) == 0);
+    dm_journal_info info; uint32_t alen; char app[8];
+    ASSERT_EQ_INT(dm_journal_read(&t->f.jio, &info, app, sizeof app, &alen), DM_OK);
+    ASSERT_EQ_U32(info.move_index, 1);
+    ASSERT_EQ_U64(info.chunks_done, info.chunk_count[1]);
+}
+
+static uint64_t two_moves_clean_writes(fx2 *t, uint64_t *move0_writes)
+{
+    fx2_reset(t);
+    ASSERT_EQ_INT(dm_run_move(&t->f.dio, &t->f.jio, 0, NULL, NULL), DM_OK);
+    *move0_writes = t->f.fault.writes;
+    ASSERT_EQ_INT(dm_run_move(&t->f.dio, &t->f.jio, 1, NULL, NULL), DM_OK);
+    assert_both_moved(t);
+    return t->f.fault.writes;
+}
+
+static void move_crash_every_write_two_moves(void)
+{
+    clock_t t0 = clock();
+    fx2 *t = (fx2 *)malloc(sizeof *t);
+    ASSERT_TRUE(t != NULL);
+    fx2_make(t);
+    uint64_t w0 = 0, total = two_moves_clean_writes(t, &w0);
+    ASSERT_TRUE(w0 >= 4 && total > w0 + 2);
+    for (uint64_t n = 1; n <= total; n++) {
+        fx2_reset(t);
+        t->f.fault.fail_after_writes = n;
+        dm_status s = run_both(t);
+        if (s != DM_E_IO) DM_FAIL("N=%llu: crashed sequence returned %d", (unsigned long long)n, (int)s);
+        t->f.fault.tripped = 0;
+        t->f.fault.fail_after_writes = 0;
+        s = run_both(t);
+        if (s != DM_OK) DM_FAIL("N=%llu: resumed sequence returned %d", (unsigned long long)n, (int)s);
+        assert_both_moved(t);
+    }
+    printf("  move_crash_every_write_two_moves: %llu writes per clean run (%llu in move 0), %.2f s\n",
+           (unsigned long long)total, (unsigned long long)w0, (double)(clock() - t0) / CLOCKS_PER_SEC);
+    fx_free(&t->f);
+    free(t);
+}
+
+/* Crash at N, crash again during the resume at M writes later, then a clean resume. */
+static void move_crash_twice(void)
+{
+    fx2 *t = (fx2 *)malloc(sizeof *t);
+    ASSERT_TRUE(t != NULL);
+    fx2_make(t);
+    uint64_t w0 = 0, total = two_moves_clean_writes(t, &w0);
+    /* (N, M): within move 0, across the transition (last write of move 0 / first of move 1), within move 1 */
+    const uint64_t pairs[][2] = {
+        { 1, 1 }, { 2, 1 }, { 3, 2 }, { w0 / 2, 1 }, { w0 / 2, 3 }, { w0 - 1, 1 }, { w0 - 1, 2 },
+        { w0, 1 }, { w0, 2 }, { w0 + 1, 1 }, { w0 + 2, 2 }, { total - 2, 1 }, { total - 1, 1 }, { total, 1 },
+    };
+    int second_crashes = 0;
+    for (size_t i = 0; i < sizeof pairs / sizeof pairs[0]; i++) {
+        uint64_t n = pairs[i][0], m = pairs[i][1];
+        fx2_reset(t);
+        t->f.fault.fail_after_writes = n;
+        ASSERT_EQ_INT(run_both(t), DM_E_IO);
+        t->f.fault.tripped = 0;
+        t->f.fault.fail_after_writes = t->f.fault.writes + m;    /* M writes after those already done */
+        dm_status s = run_both(t);
+        if (s == DM_E_IO) second_crashes++;
+        else if (s != DM_OK) DM_FAIL("(N=%llu, M=%llu): second run returned %d", (unsigned long long)n,
+                                     (unsigned long long)m, (int)s);
+        t->f.fault.tripped = 0;
+        t->f.fault.fail_after_writes = 0;
+        s = run_both(t);
+        if (s != DM_OK) DM_FAIL("(N=%llu, M=%llu): clean resume returned %d", (unsigned long long)n,
+                                (unsigned long long)m, (int)s);
+        assert_both_moved(t);
+    }
+    ASSERT_TRUE(second_crashes >= 10);    /* the second fault really hit in (almost) every pair */
+    fx_free(&t->f);
+    free(t);
+}
+
 static void move_rejects_bad_args(void)
 {
     fx f;
@@ -354,6 +480,8 @@ void dm_run_mover(void)
     DM_RUN(move_4kn_sectors);
     DM_RUN(move_crash_every_write);
     DM_RUN(move_crash_random_large);
+    DM_RUN(move_crash_every_write_two_moves);
+    DM_RUN(move_crash_twice);
     DM_RUN(move_verify_failure);
     DM_RUN(move_stop_between_chunks);
     DM_RUN(move_stop_before_first_chunk);
