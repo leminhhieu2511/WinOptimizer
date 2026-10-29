@@ -53,10 +53,12 @@ public sealed class VhdxFixture : IDisposable
     public static readonly Guid RecoveryType = new("de94bba4-06d1-4d40-a16a-bfd50179d6ac");
     public static readonly Guid MsrType = new("e3c9e316-0b5c-4db8-817d-f92df00215ae");
 
-    /// <summary>Scratch folder for the VHDX files, diskpart scripts, journals and logs (outside the repo).</summary>
-    public static string ScratchDir { get; } = Environment.GetEnvironmentVariable("WINOPT_VHDX_DIR") is { Length: > 0 } d
-        ? d
-        : @"C:\Users\Admin\AppData\Local\Temp\claude\D--My-Folders-MyTools\9aad3355-e3b1-4bea-bbdf-c06a486414c6\scratchpad\vhdx-int";
+    /// <summary>Scratch folder for the VHDX files, diskpart scripts, journals and logs (outside the repo):
+    /// %WINOPT_VHDX_DIR%, else "%TEMP%\WinOptimizer.VhdxTests". Created if missing.</summary>
+    public static string ScratchDir { get; } = Directory.CreateDirectory(
+        Environment.GetEnvironmentVariable("WINOPT_VHDX_DIR") is { Length: > 0 } d
+            ? d
+            : Path.Combine(Path.GetTempPath(), "WinOptimizer.VhdxTests")).FullName;
 
     static readonly ManagementScope Scope = new(@"\\.\root\Microsoft\Windows\Storage");
     static readonly object CleanupLock = new();
