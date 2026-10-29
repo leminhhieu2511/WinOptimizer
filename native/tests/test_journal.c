@@ -100,7 +100,7 @@ static void test_journal_torn_slot_write(void)
     mem_fault f; memset(&f, 0, sizeof f);
     mem_io m; mem_io_init(&m, &f);
     dm_io io = mem_io_as_dm_io(&m);
-    ASSERT_EQ_INT(dm_journal_create(&io, &p, 1, NULL, 0), DM_OK);   /* writes 1 (header), 2 (slot A) */
+    ASSERT_EQ_INT(dm_journal_create(&io, &p, 1, NULL, 0), DM_OK);   /* writes 1 (clear slots), 2 (header), 3 (slot A) */
     ASSERT_EQ_INT(dm_journal_set_step(&io, 1), DM_OK);              /* write 3 (slot B) */
     ASSERT_EQ_INT(dm_journal_progress(&io, 0, 4, 77), DM_OK);       /* write 4 (slot A) */
     f.fail_after_writes = f.writes + 1;                             /* tear the next slot write */
@@ -194,6 +194,77 @@ static void test_journal_200k_extents(void)
     mem_io_free(&m);
 }
 
+static void prefill_old_journal(mem_io *m, const dm_move_plan *p)
+{
+    dm_io io = mem_io_as_dm_io(m);
+    ASSERT_EQ_INT(dm_journal_create(&io, p, 1, NULL, 0), DM_OK);
+    ASSERT_EQ_INT(dm_journal_set_step(&io, 4), DM_OK);
+    ASSERT_EQ_INT(dm_journal_progress(&io, 0, 9, 0x1234), DM_OK);   /* newest slot: seq 3, chunks_done 9 */
+    ASSERT_EQ_INT(dm_journal_progress(&io, 0, 11, 0x5678), DM_OK);  /* seq 4 -> slot B holds the higher seq */
+}
+
+static void test_journal_stale_slot_from_previous_journal(void)
+{
+    dm_extent e = { 0, 1 * MIB };
+    for (int variant = 0; variant < 2; variant++) {   /* 0: identical header, 1: different header */
+        dm_move_plan oldp = mk_plan(&e, 1, 1);
+        dm_move_plan newp = oldp;
+        if (variant) newp.shift = 16 * MIB;
+        mem_io m; mem_io_init(&m, NULL);
+        prefill_old_journal(&m, &oldp);
+        dm_io io = mem_io_as_dm_io(&m);
+        ASSERT_EQ_INT(dm_journal_create(&io, &newp, 1, NULL, 0), DM_OK);
+        dm_journal_info info; uint32_t alen;
+        ASSERT_EQ_INT(dm_journal_read(&io, &info, NULL, 0, &alen), DM_OK);
+        ASSERT_EQ_U64(info.seq, 1);
+        ASSERT_EQ_U64(info.chunks_done, 0);
+        ASSERT_EQ_U32(info.step, 0);
+        mem_io_free(&m);
+    }
+}
+
+static void test_journal_stale_slot_not_bound_to_other_header(void)
+{
+    /* an old slot written under a different header must not validate under a new header of equal size */
+    dm_extent e = { 0, 1 * MIB };
+    dm_move_plan oldp = mk_plan(&e, 1, 1), newp = oldp;
+    newp.shift = 16 * MIB;
+    mem_io a, b; mem_io_init(&a, NULL); mem_io_init(&b, NULL);
+    prefill_old_journal(&a, &oldp);
+    dm_io ioa = mem_io_as_dm_io(&a), iob = mem_io_as_dm_io(&b);
+    ASSERT_EQ_INT(dm_journal_create(&iob, &newp, 1, NULL, 0), DM_OK);
+    ASSERT_TRUE(a.size == b.size);
+    memcpy(b.data + 4096, a.data + 4096, (size_t)(a.size - 4096));   /* new header, old slots */
+    dm_journal_info info; uint32_t alen;
+    ASSERT_EQ_INT(dm_journal_read(&iob, &info, NULL, 0, &alen), DM_E_JOURNAL_CORRUPT);
+    (void)ioa;
+    mem_io_free(&a); mem_io_free(&b);
+}
+
+static void test_journal_crash_between_header_and_slot(void)
+{
+    dm_extent e = { 0, 1 * MIB };
+    /* create issues 3 writes: clear slots (1), header (2), slot A (3) */
+    for (uint64_t fail_at = 1; fail_at <= 3; fail_at++) {
+        dm_move_plan oldp = mk_plan(&e, 1, 1);
+        mem_io m; mem_io_init(&m, NULL);
+        prefill_old_journal(&m, &oldp);
+        mem_fault f; memset(&f, 0, sizeof f);
+        f.fail_after_writes = fail_at;
+        m.fault = &f;
+        dm_io io = mem_io_as_dm_io(&m);
+        dm_move_plan newp = oldp; newp.shift = 16 * MIB;
+        ASSERT_EQ_INT(dm_journal_create(&io, &newp, 1, NULL, 0), DM_E_IO);
+        ASSERT_TRUE(f.tripped);
+        dm_journal_info info; uint32_t alen;
+        dm_status rs = dm_journal_read(&io, &info, NULL, 0, &alen);
+        /* fail_at 1: crash before the header changed -> the intact old journal is still a consistent whole;
+           fail_at 2/3: new header present -> no slot may validate, never the stale seq-4 slot */
+        if (fail_at >= 2) ASSERT_EQ_INT(rs, DM_E_JOURNAL_CORRUPT);
+        mem_io_free(&m);
+    }
+}
+
 void dm_run_journal(void)
 {
     DM_RUN(test_journal_roundtrip);
@@ -202,4 +273,7 @@ void dm_run_journal(void)
     DM_RUN(test_journal_corrupt_header);
     DM_RUN(test_journal_rejects_bad_args);
     DM_RUN(test_journal_200k_extents);
+    DM_RUN(test_journal_stale_slot_from_previous_journal);
+    DM_RUN(test_journal_stale_slot_not_bound_to_other_header);
+    DM_RUN(test_journal_crash_between_header_and_slot);
 }

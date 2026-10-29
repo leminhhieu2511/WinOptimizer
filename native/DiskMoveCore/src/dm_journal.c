@@ -34,22 +34,22 @@ typedef struct slot { uint64_t seq; uint32_t step, move_index; uint64_t chunks_d
 
 typedef struct hdr {
     uint8_t *buf;                       /* NULL when only the prefix was loaded */
-    uint32_t size, move_count, app_len;
+    uint32_t size, move_count, app_len, crc;   /* crc = stored header CRC32C (binds the slots) */
     uint64_t move_off[DM_MAX_MOVES];    /* offset of each move record */
     uint64_t move_chunks[DM_MAX_MOVES];
 } hdr;
 
-static void slot_encode(uint8_t *b, const slot *s)
+static void slot_encode(uint8_t *b, const slot *s, uint32_t bind)
 {
     memset(b, 0, SLOT_SIZE);
     put64(b, s->seq); put32(b + 8, s->step); put32(b + 12, s->move_index);
     put64(b + 16, s->chunks_done); put64(b + 24, s->last_hash);
-    put32(b + SLOT_CRC, dm_crc32c(0, b, SLOT_CRC));
+    put32(b + SLOT_CRC, dm_crc32c(bind, b, SLOT_CRC));
 }
 
-static int slot_decode(const uint8_t *b, slot *s)
+static int slot_decode(const uint8_t *b, slot *s, uint32_t bind)
 {
-    if (get32(b + SLOT_CRC) != dm_crc32c(0, b, SLOT_CRC)) return 0;
+    if (get32(b + SLOT_CRC) != dm_crc32c(bind, b, SLOT_CRC)) return 0;
     s->seq = get64(b);
     if (s->seq < 1) return 0;
     s->step = get32(b + 8); s->move_index = get32(b + 12);
@@ -100,6 +100,7 @@ static dm_status hdr_load(const dm_io *j, hdr *h)
     }
     if (pos + 4 > h->size) goto corrupt;
     if (get32(h->buf + pos) != dm_crc32c(0, h->buf, (size_t)pos)) goto corrupt;
+    h->crc = get32(h->buf + pos);
     return DM_OK;
 corrupt:
     s = DM_E_JOURNAL_CORRUPT;
@@ -110,7 +111,7 @@ fail:
 }
 
 /* Reads both slots; picks the newest valid one in *cur and the slot index to write next in *target. */
-static dm_status slots_read(const dm_io *j, uint32_t header_size, slot *cur, int *target)
+static dm_status slots_read(const dm_io *j, uint32_t header_size, uint32_t bind, slot *cur, int *target)
 {
     uint8_t b[2][SLOT_SIZE];
     slot sl[2];
@@ -118,7 +119,7 @@ static dm_status slots_read(const dm_io *j, uint32_t header_size, slot *cur, int
     for (int i = 0; i < 2; i++) {
         dm_status s = j->read(j->ctx, (uint64_t)header_size + (uint64_t)i * SLOT_SIZE, b[i], SLOT_SIZE);
         if (s != DM_OK) return s;
-        ok[i] = slot_decode(b[i], &sl[i]);
+        ok[i] = slot_decode(b[i], &sl[i], bind);
     }
     if (!ok[0] && !ok[1]) return DM_E_JOURNAL_CORRUPT;
     int newest = !ok[0] ? 1 : !ok[1] ? 0 : (sl[1].seq > sl[0].seq ? 1 : 0);
@@ -127,13 +128,36 @@ static dm_status slots_read(const dm_io *j, uint32_t header_size, slot *cur, int
     return DM_OK;
 }
 
-static dm_status slot_write(const dm_io *j, uint32_t header_size, int target, const slot *s)
+static dm_status slot_write(const dm_io *j, uint32_t header_size, uint32_t bind, int target, const slot *s)
 {
     uint8_t b[SLOT_SIZE];
-    slot_encode(b, s);
+    slot_encode(b, s, bind);
     dm_status st = j->write(j->ctx, (uint64_t)header_size + (uint64_t)target * SLOT_SIZE, b, SLOT_SIZE);
     if (st != DM_OK) return st;
     return flush_io(j);
+}
+
+/* Cheap read of the stored header CRC (no full header load): walks the move records with small reads. */
+static dm_status hdr_stored_crc(const dm_io *j, const uint8_t *prefix, uint32_t hs, uint32_t *crc)
+{
+    uint32_t mc = get32(prefix + 16), al = get32(prefix + 20);
+    if (mc < 1 || mc > DM_MAX_MOVES || al > hs - HDR_FIXED) return DM_E_JOURNAL_CORRUPT;
+    uint64_t pos = HDR_FIXED + (uint64_t)al;
+    uint8_t b[8];
+    for (uint32_t i = 0; i < mc; i++) {
+        if (pos + MOVE_FIXED > hs) return DM_E_JOURNAL_CORRUPT;
+        dm_status s = j->read(j->ctx, pos + 60, b, 8);
+        if (s != DM_OK) return s;
+        uint64_t cc = get64(b);
+        pos += MOVE_FIXED;
+        if (cc > (hs - pos) / 16) return DM_E_JOURNAL_CORRUPT;
+        pos += cc * 16;
+    }
+    if (pos + 4 > hs) return DM_E_JOURNAL_CORRUPT;
+    dm_status s = j->read(j->ctx, pos, b, 4);
+    if (s != DM_OK) return s;
+    *crc = get32(b);
+    return DM_OK;
 }
 
 /* Read-modify-write of the newest slot into the other slot. mode 0: step; mode 1: progress. */
@@ -144,14 +168,17 @@ static dm_status slot_update(const dm_io *j, int mode, uint32_t step, uint32_t m
     uint32_t hs;
     dm_status s = hdr_prefix(j, prefix, &hs);
     if (s != DM_OK) return s;
+    uint32_t bind;
+    s = hdr_stored_crc(j, prefix, hs, &bind);
+    if (s != DM_OK) return s;
     slot cur; int target;
-    s = slots_read(j, hs, &cur, &target);
+    s = slots_read(j, hs, bind, &cur, &target);
     if (s != DM_OK) return s;
     slot n = cur;
     n.seq = cur.seq + 1;
     if (mode == 0) n.step = step;
     else { n.move_index = move_index; n.chunks_done = chunks_done; n.last_hash = last_hash; }
-    return slot_write(j, hs, target, &n);
+    return slot_write(j, hs, bind, target, &n);
 }
 
 dm_status dm_journal_create(const dm_io *j, const dm_move_plan *moves, uint32_t move_count,
@@ -196,13 +223,21 @@ dm_status dm_journal_create(const dm_io *j, const dm_move_plan *moves, uint32_t 
             put64(p, chunks[i][c].offset); put64(p + 8, chunks[i][c].length);
         }
     }
-    put32(p, dm_crc32c(0, buf, (size_t)(p - buf)));
+    uint32_t hcrc = dm_crc32c(0, buf, (size_t)(p - buf));
+    put32(p, hcrc);
 
-    s = j->write(j->ctx, 0, buf, (uint32_t)hs);
+    {   /* clear both slots BEFORE the header so no stale slot (even one bound to an identical header) survives */
+        uint8_t *zero = (uint8_t *)calloc(2, SLOT_SIZE);
+        if (!zero) { s = DM_E_NOMEM; goto done; }
+        s = j->write(j->ctx, hs, zero, 2 * SLOT_SIZE);
+        free(zero);
+        if (s == DM_OK) s = flush_io(j);
+    }
+    if (s == DM_OK) s = j->write(j->ctx, 0, buf, (uint32_t)hs);
     if (s == DM_OK) s = flush_io(j);
     if (s == DM_OK) {
         slot first = { 1, 0, 0, 0, 0 };
-        s = slot_write(j, (uint32_t)hs, 0, &first);
+        s = slot_write(j, (uint32_t)hs, hcrc, 0, &first);
     }
 done:
     free(buf);
@@ -218,7 +253,7 @@ dm_status dm_journal_read(const dm_io *j, dm_journal_info *info,
     dm_status s = hdr_load(j, &h);
     if (s != DM_OK) return s;
     slot cur; int target;
-    s = slots_read(j, h.size, &cur, &target);
+    s = slots_read(j, h.size, h.crc, &cur, &target);
     if (s != DM_OK) { free(h.buf); return s; }
 
     memset(info, 0, sizeof *info);
