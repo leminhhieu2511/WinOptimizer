@@ -25,17 +25,19 @@ public static class DiskMovePlanner
 
     /// <summary>
     /// Precondition: <paramref name="target"/> is the Windows partition and the source lies after it on the same disk.
-    /// <paramref name="sourceMinSize"/> (optional) enables the upper-bound check.
+    /// <paramref name="sourceMinSize"/> is the measured minimum size of the source; the amount may not exceed <see cref="MaxAmount"/>.
     /// </summary>
     public static MovePlan Plan(DiskSnapshot disk, PartitionSnapshot target, PartitionSnapshot source, long amount,
-        long? sourceMinSize = null)
+        long sourceMinSize)
     {
         if (!target.IsWindowsPartition)
             throw new ArgumentException("Target must be the Windows partition.", nameof(target));
         if (source.Offset <= target.Offset)
             throw new ArgumentException("Source must be located after the target.", nameof(source));
-        if (amount < MinAmount || amount % MiB != 0 || amount >= source.Size ||
-            (sourceMinSize is long min && amount > MaxAmount(source, min)))
+        if (sourceMinSize <= 0 || sourceMinSize > source.Size)
+            throw new ArgumentOutOfRangeException(nameof(sourceMinSize), sourceMinSize,
+                "Minimum size must be positive and not larger than the source partition.");
+        if (amount < MinAmount || amount % MiB != 0 || amount > MaxAmount(source, sourceMinSize))
             throw new ArgumentOutOfRangeException(nameof(amount), amount,
                 "Amount must be a whole number of MiB, at least 1 GiB and within the maximum allowed.");
 

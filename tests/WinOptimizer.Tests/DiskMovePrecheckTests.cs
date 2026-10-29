@@ -73,6 +73,13 @@ public class DiskMovePrecheckTests
     }
 
     [Fact]
+    public void TwoRecoveriesBetween_IsBlocker()
+    {
+        var extra = Part(9, PartitionTypes.Recovery, 0, 500 * MiB, recovery: true);
+        Has(Run(new LayoutBuilder { ExtraBetween = extra }.Build()), CheckCode.ForeignPartitionBetween, CheckSeverity.Blocker);
+    }
+
+    [Fact]
     public void RecoveryAfterSource_IsNotBetween()
     {
         var r = Run(new LayoutBuilder { RecoveryAfterD = true }.Build());
@@ -165,7 +172,7 @@ public class DiskMovePrecheckTests
 
     [Fact]
     public void UnalignedSize_IsBlocker() =>
-        Has(Run(new LayoutBuilder { RecoverySize = 100 * MiB + 512 }.Build()), CheckCode.UnalignedPartition, CheckSeverity.Blocker);
+        Has(Run(new LayoutBuilder { RecoveryAfterD = true, DSize = 150 * GiB + 512 }.Build()), CheckCode.UnalignedPartition, CheckSeverity.Blocker);
 
     [Fact]
     public void UnusualSectorSize_IsBlocker() =>

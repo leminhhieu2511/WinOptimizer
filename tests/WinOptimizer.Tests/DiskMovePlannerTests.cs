@@ -29,19 +29,19 @@ public class DiskMovePlannerTests
     public void Planner_OnlyMovesPartitionsBetweenTargetAndSource()
     {
         var a = new LayoutBuilder().Build();
-        var pa = DiskMovePlanner.Plan(a.Disk, a.C, a.D, 20 * GiB);
+        var pa = DiskMovePlanner.Plan(a.Disk, a.C, a.D, 20 * GiB, 40 * GiB);
         Assert.Equal(new[] { a.D, a.Recovery }, pa.PartitionsToShift);
         Assert.True(pa.HasRecovery);
         Assert.Equal(a.D.Size + a.Recovery.Size, pa.BytesToCopy);
 
         var b = new LayoutBuilder { RecoveryAfterD = true }.Build();
-        var pb = DiskMovePlanner.Plan(b.Disk, b.C, b.D, 20 * GiB);
+        var pb = DiskMovePlanner.Plan(b.Disk, b.C, b.D, 20 * GiB, 40 * GiB);
         Assert.Equal(new[] { b.D }, pb.PartitionsToShift);
         Assert.False(pb.HasRecovery);
 
         var after = Part(9, PartitionTypes.BasicData, 0, 10 * GiB, 'E', "NTFS");
         var c = new LayoutBuilder { ExtraAfterD = after }.Build();
-        var pc = DiskMovePlanner.Plan(c.Disk, c.C, c.D, 20 * GiB);
+        var pc = DiskMovePlanner.Plan(c.Disk, c.C, c.D, 20 * GiB, 40 * GiB);
         Assert.Equal(new[] { c.D, c.Recovery }, pc.PartitionsToShift);
     }
 
@@ -53,7 +53,7 @@ public class DiskMovePlannerTests
     public void Planner_RejectsAmountOutsideRange(long amount)
     {
         var b = new LayoutBuilder().Build();
-        Assert.Throws<ArgumentOutOfRangeException>(() => DiskMovePlanner.Plan(b.Disk, b.C, b.D, amount));
+        Assert.Throws<ArgumentOutOfRangeException>(() => DiskMovePlanner.Plan(b.Disk, b.C, b.D, amount, 40 * GiB));
     }
 
     [Fact]
@@ -69,15 +69,15 @@ public class DiskMovePlannerTests
     public void Planner_RejectsSourceNotAfterTarget()
     {
         var b = new LayoutBuilder().Build();
-        Assert.Throws<ArgumentException>(() => DiskMovePlanner.Plan(b.Disk, b.D, b.C, 2 * GiB));
-        Assert.Throws<ArgumentException>(() => DiskMovePlanner.Plan(b.Disk, b.C, b.C, 2 * GiB));
+        Assert.Throws<ArgumentException>(() => DiskMovePlanner.Plan(b.Disk, b.D, b.C, 2 * GiB, 40 * GiB));
+        Assert.Throws<ArgumentException>(() => DiskMovePlanner.Plan(b.Disk, b.C, b.C, 2 * GiB, 40 * GiB));
     }
 
     [Fact]
     public void Planner_RejectsNonWindowsTarget()
     {
         var b = new LayoutBuilder().Build();
-        Assert.Throws<ArgumentException>(() => DiskMovePlanner.Plan(b.Disk, b.Recovery, b.D, 2 * GiB));
+        Assert.Throws<ArgumentException>(() => DiskMovePlanner.Plan(b.Disk, b.Recovery, b.D, 2 * GiB, 40 * GiB));
     }
 
     [Fact]
@@ -85,6 +85,24 @@ public class DiskMovePlannerTests
     {
         var oem = Part(9, PartitionTypes.BasicData, 0, 500 * MiB, fs: "NTFS");
         var b = new LayoutBuilder { ExtraBetween = oem }.Build();
-        Assert.Throws<ArgumentException>(() => DiskMovePlanner.Plan(b.Disk, b.C, b.D, 2 * GiB));
+        Assert.Throws<ArgumentException>(() => DiskMovePlanner.Plan(b.Disk, b.C, b.D, 2 * GiB, 40 * GiB));
+    }
+
+    [Fact]
+    public void Planner_RejectsTwoRecoveriesBetween()
+    {
+        var extra = Part(9, PartitionTypes.Recovery, 0, 500 * MiB, recovery: true);
+        var b = new LayoutBuilder { ExtraBetween = extra }.Build();
+        Assert.Throws<ArgumentException>(() => DiskMovePlanner.Plan(b.Disk, b.C, b.D, 2 * GiB, 40 * GiB));
+    }
+
+    [Theory]
+    [InlineData(0L)]
+    [InlineData(-1L)]
+    [InlineData(151 * GiB)]
+    public void Planner_RejectsInvalidMinSize(long min)
+    {
+        var b = new LayoutBuilder().Build();
+        Assert.Throws<ArgumentOutOfRangeException>(() => DiskMovePlanner.Plan(b.Disk, b.C, b.D, 2 * GiB, min));
     }
 }
