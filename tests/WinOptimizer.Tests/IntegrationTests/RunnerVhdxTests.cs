@@ -14,6 +14,7 @@ namespace WinOptimizer.Tests.IntegrationTests;
 /// on every call), any volume but DLIKE/RLIKE, any journal outside the scratch folder, and reagentc.
 /// </summary>
 [Trait("Category", "Integration")]
+[Collection(VhdxCollection.Name)]
 public sealed class RunnerVhdxTests(ITestOutputHelper output)
 {
     const long Amount = 512 * VhdxFixture.MiB;

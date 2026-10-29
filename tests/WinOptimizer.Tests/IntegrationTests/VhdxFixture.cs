@@ -41,6 +41,17 @@ public sealed record VhdxPartition(uint Number, long Offset, long Size, Guid Gui
 }
 
 /// <summary>
+/// The VHDX test classes never run in parallel with each other: two diskpart/VDS sessions, letter assignments and
+/// kill/resume timings on two VHDXs at once: the first combined run (both classes together) had 3 CLI kill-test
+/// failures, 2 of them in tests that overlapped a runner test.
+/// </summary>
+[CollectionDefinition(Name, DisableParallelization = true)]
+public sealed class VhdxCollection
+{
+    public const string Name = "VHDX integration (serial)";
+}
+
+/// <summary>
 /// Creates, attaches and lays out a throw-away VHDX (diskpart /s) and hands out its disk number only after
 /// checking (MSFT_Disk) that it is that VHDX and neither the boot nor the system disk. Detached and deleted on
 /// Dispose. Layout (GPT, no ESP, no Windows volume): [MSR added by diskpart] CLIKE 1024 MB NTFS (letter),

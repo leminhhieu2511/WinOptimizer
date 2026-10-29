@@ -14,6 +14,7 @@ namespace WinOptimizer.Tests.IntegrationTests;
 /// file hash must match and chkdsk must be clean. Needs admin; never touches a disk other than the VHDX.
 /// </summary>
 [Trait("Category", "Integration")]
+[Collection(VhdxCollection.Name)]
 public sealed class NativeMoveVhdxTests(ITestOutputHelper output)
 {
     const long Shift = 512 * VhdxFixture.MiB;
