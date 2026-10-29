@@ -82,26 +82,32 @@ public static class SystemFactsProbe
         return list;
     }
 
-    private static IReadOnlyDictionary<char, string> GetBitLocker(IEnumerable<char> letters, bool admin)
+    /// <summary>What reading BitLocker state produced.</summary>
+    public abstract record BitLockerOutcome
+    {
+        /// <summary>The WMI namespace or class does not exist (no BitLocker on this Windows edition).</summary>
+        public sealed record NotPresent : BitLockerOutcome;
+        /// <summary>Volumes the namespace listed, with their ConversionStatus.</summary>
+        public sealed record Listed(IReadOnlyList<(char Letter, uint ConversionStatus)> Volumes) : BitLockerOutcome;
+        /// <summary>Access denied or any other failure.</summary>
+        public sealed record Failed : BitLockerOutcome;
+    }
+
+    public static IReadOnlyDictionary<char, string> MapBitLocker(IEnumerable<char> letters, BitLockerOutcome outcome)
     {
         var map = letters.ToDictionary(c => c, _ => Unknown);
-        if (!admin) return map; // WMI BitLocker access needs admin: Unknown is treated like BitLocker by the prechecks
-        try
+        switch (outcome)
         {
-            var scope = new ManagementScope(@"root\cimv2\Security\MicrosoftVolumeEncryption");
-            scope.Connect();
-            using var searcher = new ManagementObjectSearcher(scope, new ObjectQuery("SELECT * FROM Win32_EncryptableVolume"));
-            using var results = searcher.Get();
-            foreach (var o in results)
-            {
-                using (o)
+            case BitLockerOutcome.NotPresent:
+                // No BitLocker support (e.g. Windows Home): nothing can be encrypted, so every drive counts as decrypted.
+                foreach (var c in map.Keys.ToList()) map[c] = "FullyDecrypted";
+                break;
+            case BitLockerOutcome.Listed listed:
+                foreach (var (letter, status) in listed.Volumes)
                 {
-                    if (o["DriveLetter"] is not string { Length: > 0 } dl) continue;
-                    char c = char.ToUpperInvariant(dl[0]);
+                    char c = char.ToUpperInvariant(letter);
                     if (!map.ContainsKey(c)) continue;
-                    var inv = ((ManagementObject)o).InvokeMethod("GetConversionStatus", null, null);
-                    if (inv is null || Convert.ToUInt32(inv["ReturnValue"]) != 0) continue;
-                    map[c] = Convert.ToUInt32(inv["ConversionStatus"]) switch
+                    map[c] = status switch
                     {
                         0 => "FullyDecrypted",
                         1 => "FullyEncrypted",
@@ -112,14 +118,44 @@ public static class SystemFactsProbe
                         _ => Unknown,
                     };
                 }
+                break;
+        }
+        return map; // Failed, or letters the namespace did not list: Unknown (blocks, the safe choice)
+    }
+
+    private static IReadOnlyDictionary<char, string> GetBitLocker(IEnumerable<char> letters, bool admin)
+    {
+        var all = letters.ToList();
+        if (!admin) return MapBitLocker(all, new BitLockerOutcome.Failed()); // WMI BitLocker access needs admin
+        try
+        {
+            var scope = new ManagementScope(@"root\cimv2\Security\MicrosoftVolumeEncryption");
+            scope.Connect();
+            var volumes = new List<(char, uint)>();
+            using var searcher = new ManagementObjectSearcher(scope, new ObjectQuery("SELECT * FROM Win32_EncryptableVolume"));
+            using var results = searcher.Get();
+            foreach (var o in results)
+            {
+                using (o)
+                {
+                    if (o["DriveLetter"] is not string { Length: > 0 } dl) continue;
+                    var inv = ((ManagementObject)o).InvokeMethod("GetConversionStatus", null, null);
+                    if (inv is null || Convert.ToUInt32(inv["ReturnValue"]) != 0) continue;
+                    volumes.Add((dl[0], Convert.ToUInt32(inv["ConversionStatus"])));
+                }
             }
+            return MapBitLocker(all, new BitLockerOutcome.Listed(volumes));
+        }
+        catch (ManagementException ex) when (ex.ErrorCode is ManagementStatus.InvalidNamespace
+                                                 or ManagementStatus.InvalidClass or ManagementStatus.NotFound)
+        {
+            return MapBitLocker(all, new BitLockerOutcome.NotPresent());
         }
         catch (Exception ex) when (ex is ManagementException or UnauthorizedAccessException or COMException
                                        or InvalidCastException or FormatException)
         {
-            // Keep Unknown for what we could not read.
+            return MapBitLocker(all, new BitLockerOutcome.Failed());
         }
-        return map;
     }
 
     /// <summary>Counts the blocks of <c>bcdedit /enum osloader</c>. Each block starts with a title over a line of dashes.</summary>

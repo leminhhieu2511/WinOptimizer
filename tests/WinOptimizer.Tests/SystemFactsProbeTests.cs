@@ -73,3 +73,32 @@ public class SystemFactsProbeTests(Xunit.Abstractions.ITestOutputHelper output)
         }
     }
 }
+
+public class BitLockerMappingTests
+{
+    private static readonly char[] Letters = ['C', 'D', 'E'];
+
+    [Fact]
+    public void NamespaceMissing_MapsEveryLetterToFullyDecrypted()
+    {
+        var map = SystemFactsProbe.MapBitLocker(Letters, new SystemFactsProbe.BitLockerOutcome.NotPresent());
+        Assert.All(Letters, c => Assert.Equal("FullyDecrypted", map[c]));
+    }
+
+    [Fact]
+    public void Listed_MapsStatusesAndKeepsUnlistedLettersUnknown()
+    {
+        var map = SystemFactsProbe.MapBitLocker(Letters, new SystemFactsProbe.BitLockerOutcome.Listed(
+            [('c', 1u), ('D', 0u)]));
+        Assert.Equal("FullyEncrypted", map['C']);
+        Assert.Equal("FullyDecrypted", map['D']);
+        Assert.Equal("Unknown", map['E']);
+    }
+
+    [Fact]
+    public void OtherError_KeepsEveryLetterUnknown()
+    {
+        var map = SystemFactsProbe.MapBitLocker(Letters, new SystemFactsProbe.BitLockerOutcome.Failed());
+        Assert.All(Letters, c => Assert.Equal("Unknown", map[c]));
+    }
+}
