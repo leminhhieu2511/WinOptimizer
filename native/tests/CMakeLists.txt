@@ -16,3 +16,8 @@ endforeach()
 target_compile_definitions(test_win32_io PRIVATE DMW_STATIC UNICODE _UNICODE)
 target_include_directories(test_win32_io PRIVATE "${CMAKE_SOURCE_DIR}/DiskMove/src")
 target_link_libraries(test_win32_io PRIVATE DiskMoveWin32)
+
+# The CLI's restore sidecar + hide-attribute math (pure; no disk).
+target_sources(test_cli_restore PRIVATE "${CMAKE_SOURCE_DIR}/DiskMoveCli/cli_restore.c")
+target_compile_definitions(test_cli_restore PRIVATE DMW_STATIC UNICODE _UNICODE)
+target_include_directories(test_cli_restore PRIVATE "${CMAKE_SOURCE_DIR}/DiskMoveCli" "${CMAKE_SOURCE_DIR}/DiskMove/include")

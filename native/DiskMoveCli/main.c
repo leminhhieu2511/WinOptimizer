@@ -5,8 +5,9 @@
  *                       --shift <b> --sector <n> --journal <p> [--no-commit]
  *       1. Locks the volume and verifies (dmw_volume_verify) that it is exactly [start, start+length) on
  *          --disk; refuses otherwise. Nothing is written before this check.
- *       2. Saves the original GPT attributes + mount points to "<journal>.cli-restore", sets
- *          HIDDEN | NO_DRIVE_LETTER and removes the mount points, then dismounts.
+ *       2. Reads the original GPT attributes, saves them + partition GUID + mount points to
+ *          "<journal>.cli-restore" (flushed), then ONE layout write sets original | HIDDEN | NO_DRIVE_LETTER;
+ *          removes the mount points, then dismounts.
  *       3. Creates the journal (one extent: the whole partition), copies, patches the NTFS HiddenSectors and
  *          moves the GPT entry to start + shift, all under the lock.
  *       4. Only after a fully committed move: original attributes back, mount points re-created, sidecar
@@ -22,12 +23,16 @@
  *       or, after an earlier partial commit, at --start.
  *   diskmove-cli status --journal <p>   (also prints pending restore info)
  *
+ * Every command first refuses a --disk that holds the Windows volume or an EFI system / active partition
+ * (dmw_disk_is_system; read-only, fails closed).
+ *
  * Progress lines: "progress <done>/<total>". Ctrl+C stops between two chunks (exit code 7 = DM_E_STOPPED).
  * Exit code = dm_status of the failing step (0 = success, 1 = bad command line).
  */
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <diskmove/dmw_api.h>
+#include "cli_restore.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -161,54 +166,7 @@ bad:
     return 0;
 }
 
-/* ---- restore sidecar: "<journal>.cli-restore" ---- */
-
-#define MAX_MOUNTS 8
-#define HIDE_ATTRS (DMW_GPT_ATTRIBUTE_HIDDEN | DMW_GPT_ATTRIBUTE_NO_DRIVE_LETTER)
-
-typedef struct restore_info {
-    uint64_t attributes;                 /* original GPT attributes */
-    wchar_t  volume[MAX_PATH];           /* \\?\Volume{...}\ */
-    int      mount_count;
-    wchar_t  mounts[MAX_MOUNTS][MAX_PATH];
-} restore_info;
-
-static void sidecar_path(const wchar_t *journal, wchar_t *out, size_t cap)
-{
-    swprintf(out, cap, L"%ls.cli-restore", journal);
-}
-
-static int sidecar_write(const wchar_t *path, const restore_info *ri)
-{
-    FILE *f = _wfopen(path, L"w, ccs=UTF-8");
-    if (!f) return 0;
-    fwprintf(f, L"attributes 0x%016llX\nvolume %ls\n", (unsigned long long)ri->attributes, ri->volume);
-    for (int i = 0; i < ri->mount_count; i++) fwprintf(f, L"mount %ls\n", ri->mounts[i]);
-    int ok = fflush(f) == 0 && _commit(_fileno(f)) == 0;
-    return fclose(f) == 0 && ok;
-}
-
-static int sidecar_read(const wchar_t *path, restore_info *ri)
-{
-    memset(ri, 0, sizeof *ri);
-    FILE *f = _wfopen(path, L"r, ccs=UTF-8");
-    if (!f) return 0;
-    wchar_t line[MAX_PATH + 32];
-    int have_attr = 0;
-    while (fgetws(line, MAX_PATH + 32, f)) {
-        line[wcscspn(line, L"\r\n")] = 0;
-        if (wcsncmp(line, L"attributes ", 11) == 0) {
-            ri->attributes = _wcstoui64(line + 11, NULL, 0);
-            have_attr = 1;
-        } else if (wcsncmp(line, L"volume ", 7) == 0) {
-            wcscpy_s(ri->volume, MAX_PATH, line + 7);
-        } else if (wcsncmp(line, L"mount ", 6) == 0 && ri->mount_count < MAX_MOUNTS) {
-            wcscpy_s(ri->mounts[ri->mount_count++], MAX_PATH, line + 6);
-        }
-    }
-    fclose(f);
-    return have_attr && ri->volume[0];
-}
+/* ---- restore sidecar (cli_restore.c) ---- */
 
 static void print_restore_hint(const restore_info *ri, const wchar_t *sidecar)
 {
@@ -246,7 +204,7 @@ static int volume_identity(const wchar_t *volume_arg, restore_info *ri)
         fprintf(stderr, "cannot list mount points of %ls (error %lu)\n", ri->volume, GetLastError());
         return 0;
     }
-    for (const wchar_t *m = names; *m && ri->mount_count < MAX_MOUNTS; m += wcslen(m) + 1)
+    for (const wchar_t *m = names; *m && ri->mount_count < CLI_MAX_MOUNTS; m += wcslen(m) + 1)
         wcscpy_s(ri->mounts[ri->mount_count++], MAX_PATH, m);
     return 1;
 }
@@ -271,7 +229,11 @@ static int remount(const restore_info *ri)
         wchar_t cur[MAX_PATH];
         if (GetVolumeNameForVolumeMountPointW(ri->mounts[i], cur, MAX_PATH) && _wcsicmp(cur, ri->volume) == 0)
             continue;   /* already there */
-        if (!SetVolumeMountPointW(ri->mounts[i], ri->volume)) {
+        /* The volume re-arrives asynchronously after UPDATE_PROPERTIES: retry for up to ~10 s. */
+        BOOL set = FALSE;
+        for (int attempt = 0; attempt < 20 && !(set = SetVolumeMountPointW(ri->mounts[i], ri->volume)); attempt++)
+            Sleep(500);
+        if (!set) {
             fprintf(stderr, "cannot re-create mount point %ls (error %lu)\n", ri->mounts[i], GetLastError());
             ok = 0;
         } else {
@@ -302,18 +264,35 @@ static int restore_volume(const wchar_t *disk, const uint8_t part_guid[16], cons
     return 0;
 }
 
-/* ---- volume guard ---- */
+/* ---- guards ---- */
 
-/* Locks the volume and checks it is exactly the partition [start, start + length) on disk; *v stays NULL
-   on failure. Nothing has been written when this returns. */
-static int lock_and_verify(const wchar_t *volume_path, const wchar_t *disk, uint64_t start, uint64_t length,
+/* Every command calls this first: --disk must be a whole disk that holds neither the Windows volume nor an
+   EFI system / active partition. Read-only; refuses (fails closed) on any error. */
+static int guard_disk(const wchar_t *disk, uint32_t *disk_number)
+{
+    dm_status s = dmw_disk_number(disk, disk_number);
+    if (s != DM_OK) return report(s, "disk number");
+    int is_system = 1;
+    s = dmw_disk_is_system(*disk_number, &is_system);
+    if (s != DM_OK) {
+        fprintf(stderr, "cannot tell whether disk %u is the system disk: refusing\n", *disk_number);
+        return report(s, "system disk check");
+    }
+    if (is_system) {
+        fprintf(stderr, "disk %u holds the Windows volume or a boot/EFI system partition: refusing\n", *disk_number);
+        return report(DM_E_INVALID_ARG, "system disk check");
+    }
+    printf("disk %u is not the system disk\n", *disk_number);
+    return 0;
+}
+
+/* Locks the volume and checks it is exactly the partition [start, start + length) on disk_number; *v stays
+   NULL on failure. Nothing has been written when this returns. */
+static int lock_and_verify(const wchar_t *volume_path, uint32_t disk_number, uint64_t start, uint64_t length,
                            uint64_t alt_start, dmw_volume **v)
 {
     *v = NULL;
-    uint32_t disk_number = 0;
-    dm_status s = dmw_disk_number(disk, &disk_number);
-    if (s != DM_OK) return report(s, "disk number");
-    s = dmw_volume_lock(volume_path, v);
+    dm_status s = dmw_volume_lock(volume_path, v);
     if (s != DM_OK) return report(s, "volume lock");
     printf("volume locked\n");
     s = dmw_volume_verify(*v, disk_number, start, length);
@@ -373,33 +352,41 @@ static int cmd_move(void)
     uint64_t new_start = plan.old_start + plan.shift;
 
     wchar_t sidecar[MAX_PATH * 2];
-    sidecar_path(journal, sidecar, MAX_PATH * 2);
+    cli_sidecar_path(journal, sidecar, MAX_PATH * 2);
     if (GetFileAttributesW(sidecar) != INVALID_FILE_ATTRIBUTES) {
         fprintf(stderr, "%ls exists: a previous move is unfinished (finish it with resume/commit)\n", sidecar);
         return report(DM_E_INVALID_ARG, "move");
     }
+    uint32_t disk_number = 0;
+    int rc = guard_disk(disk, &disk_number);
+    if (rc) return rc;
     restore_info ri;
     memset(&ri, 0, sizeof ri);
+    memcpy(ri.partition_guid, plan.partition_guid, 16);
     if (!volume_identity(volume, &ri)) return report(DM_E_INVALID_ARG, "volume identity");
 
     /* 1. Lock + verify: nothing is written unless --volume really is [start, start+length) on --disk. */
     dmw_volume *v = NULL;
-    int rc = lock_and_verify(volume, disk, plan.old_start, plan.length, plan.old_start, &v);
+    rc = lock_and_verify(volume, disk_number, plan.old_start, plan.length, plan.old_start, &v);
     if (rc) return rc;
 
-    /* 2. Hide it before the first write, so Windows cannot remount it at the old offset if the lock is lost:
-          HIDDEN | NO_DRIVE_LETTER, mount points removed; originals saved in the sidecar. */
-    dm_status s = dmw_set_partition_attributes(disk, plan.partition_guid, HIDE_ATTRS, &ri.attributes);
+    /* 2. Hide it before the first write, so Windows cannot remount it at the old offset if the lock is lost.
+          Read the original attributes, persist them (sidecar, flushed), then ONE layout write sets
+          original | HIDDEN | NO_DRIVE_LETTER, so a crash at any point never loses an original bit. */
+    dm_status s = dmw_get_partition_attributes(disk, plan.partition_guid, &ri.attributes);
     if (s != DM_OK) {
         dmw_volume_close(v);
-        return report(s, "hide partition");
+        return report(s, "read partition attributes");
     }
-    int ok = sidecar_write(sidecar, &ri);
-    if ((ri.attributes | HIDE_ATTRS) != HIDE_ATTRS)   /* keep the other original bits */
-        s = dmw_set_partition_attributes(disk, plan.partition_guid, ri.attributes | HIDE_ATTRS, NULL);
-    if (!ok || s != DM_OK) {
-        if (!ok) fprintf(stderr, "cannot write %ls\n", sidecar);
-        rc = report(ok ? s : DM_E_IO, "hide partition");
+    if (!cli_sidecar_write(sidecar, &ri)) {
+        fprintf(stderr, "cannot write %ls\n", sidecar);
+        dmw_volume_close(v);
+        DeleteFileW(sidecar);
+        return report(DM_E_IO, "write restore sidecar");
+    }
+    s = dmw_set_partition_attributes(disk, plan.partition_guid, cli_hidden_attributes(ri.attributes), NULL);
+    if (s != DM_OK) {
+        rc = report(s, "hide partition");
         restore_volume(disk, plan.partition_guid, &ri, sidecar, &v);   /* nothing written yet */
         return rc;
     }
@@ -453,12 +440,12 @@ static int cmd_move(void)
 }
 
 /* Optional --volume for resume/commit: needs --length plus the start(s) the volume may sit at. */
-static int optional_lock(const wchar_t *disk, uint64_t start, uint64_t alt_start, uint64_t length, dmw_volume **v)
+static int optional_lock(uint32_t disk_number, uint64_t start, uint64_t alt_start, uint64_t length, dmw_volume **v)
 {
     *v = NULL;
     const wchar_t *volume = opt(L"--volume");
     if (!volume) return 0;
-    int rc = lock_and_verify(volume, disk, start, length, alt_start, v);
+    int rc = lock_and_verify(volume, disk_number, start, length, alt_start, v);
     if (rc) return rc;
     rc = dismount(*v);
     if (rc) {
@@ -477,8 +464,11 @@ static int cmd_resume(void)
         return usage();
     if (opt(L"--volume") && (!parse_u64(L"--start", &old_start) || !parse_u64(L"--length", &length)))
         return usage();
+    uint32_t disk_number = 0;
+    int rc = guard_disk(disk, &disk_number);
+    if (rc) return rc;
     dmw_volume *v = NULL;
-    int rc = optional_lock(disk, old_start, old_start, length, &v);
+    rc = optional_lock(disk_number, old_start, old_start, length, &v);
     if (rc) return rc;
     dm_status s = dmw_run_move(disk, journal, (uint32_t)index, on_progress, NULL);
     rc = report(s, "move");
@@ -487,8 +477,8 @@ static int cmd_resume(void)
     /* Copied but not committed: the volume must stay hidden until commit restores it. */
     wchar_t sidecar[MAX_PATH * 2];
     restore_info ri;
-    sidecar_path(journal, sidecar, MAX_PATH * 2);
-    if (sidecar_read(sidecar, &ri)) print_restore_hint(&ri, sidecar);
+    cli_sidecar_path(journal, sidecar, MAX_PATH * 2);
+    if (cli_sidecar_read(sidecar, &ri)) print_restore_hint(&ri, sidecar);
     printf("move done\nok\n");
     return 0;
 }
@@ -509,14 +499,21 @@ static int cmd_commit(void)
     restore_info ri;
     int have_restore = 0;
     if (journal) {
-        sidecar_path(journal, sidecar, MAX_PATH * 2);
-        have_restore = sidecar_read(sidecar, &ri);
+        cli_sidecar_path(journal, sidecar, MAX_PATH * 2);
+        have_restore = cli_sidecar_read(sidecar, &ri);
         if (!have_restore) printf("no restore info in %ls\n", sidecar);
+        if (have_restore && memcmp(ri.partition_guid, guid, 16) != 0) {
+            fprintf(stderr, "%ls belongs to another partition than --part-guid: refusing\n", sidecar);
+            return report(DM_E_INVALID_ARG, "restore sidecar");
+        }
     }
 
+    uint32_t disk_number = 0;
+    int rc = guard_disk(disk, &disk_number);
+    if (rc) return rc;
     /* Before the GPT change the volume sits at --old-start; after an earlier partial commit, at --start. */
     dmw_volume *v = NULL;
-    int rc = optional_lock(disk, old_start, start, length, &v);
+    rc = optional_lock(disk_number, old_start, start, length, &v);
     if (rc) return rc;
     rc = commit(disk, guid, start, length, (uint32_t)sector);
     if (rc) {
@@ -550,8 +547,8 @@ static int cmd_status(void)
            (unsigned long long)info.seq, app_len);
     wchar_t sidecar[MAX_PATH * 2];
     restore_info ri;
-    sidecar_path(journal, sidecar, MAX_PATH * 2);
-    if (sidecar_read(sidecar, &ri)) print_restore_hint(&ri, sidecar);
+    cli_sidecar_path(journal, sidecar, MAX_PATH * 2);
+    if (cli_sidecar_read(sidecar, &ri)) print_restore_hint(&ri, sidecar);
     return 0;
 }
 

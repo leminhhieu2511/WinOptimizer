@@ -57,11 +57,62 @@ dm_status dmw_layout_set_attributes(DRIVE_LAYOUT_INFORMATION_EX *layout, const u
     return DM_OK;
 }
 
+dm_status dmw_layout_get_attributes(const DRIVE_LAYOUT_INFORMATION_EX *layout, const uint8_t partition_guid[16],
+                                    uint64_t *attributes)
+{
+    if (!layout || !partition_guid || !attributes) return DM_E_INVALID_ARG;
+    if (layout->PartitionStyle != PARTITION_STYLE_GPT) return DM_E_INVALID_ARG;
+    for (DWORD i = 0; i < layout->PartitionCount; i++)
+        if (memcmp(&layout->PartitionEntry[i].Gpt.PartitionId, partition_guid, sizeof(GUID)) == 0) {
+            *attributes = layout->PartitionEntry[i].Gpt.Attributes;
+            return DM_OK;
+        }
+    return DM_E_NOT_FOUND;
+}
+
+/* EFI system partition type c12a7328-f81f-11d2-ba4b-00a0c93ec93b. */
+static const GUID k_esp_type = { 0xC12A7328, 0xF81F, 0x11D2, { 0xBA, 0x4B, 0x00, 0xA0, 0xC9, 0x3E, 0xC9, 0x3B } };
+
+int dmw_layout_has_system_partition(const DRIVE_LAYOUT_INFORMATION_EX *layout)
+{
+    if (!layout) return 0;
+    for (DWORD i = 0; i < layout->PartitionCount; i++) {
+        const PARTITION_INFORMATION_EX *e = &layout->PartitionEntry[i];
+        if (layout->PartitionStyle == PARTITION_STYLE_GPT && e->PartitionStyle == PARTITION_STYLE_GPT &&
+            memcmp(&e->Gpt.PartitionType, &k_esp_type, sizeof(GUID)) == 0)
+            return 1;                                       /* UEFI: ESP */
+        if (layout->PartitionStyle == PARTITION_STYLE_MBR && e->PartitionStyle == PARTITION_STYLE_MBR &&
+            (e->Mbr.BootIndicator || e->Mbr.PartitionType == 0xEF))
+            return 1;                                       /* BIOS: active partition, or MBR ESP */
+    }
+    return 0;
+}
+
 static dm_status ioctl(HANDLE h, DWORD code, void *in, DWORD in_len, void *out, DWORD out_len)
 {
     DWORD ret = 0;
     if (!DeviceIoControl(h, code, in, in_len, out, out_len, &ret, NULL)) return dmw_status_from_win32(GetLastError());
     return DM_OK;
+}
+
+/* IOCTL_DISK_GET_DRIVE_LAYOUT_EX into a malloc'd buffer (grown on ERROR_INSUFFICIENT_BUFFER). */
+static dm_status read_layout(HANDLE h, DRIVE_LAYOUT_INFORMATION_EX **out)
+{
+    *out = NULL;
+    DWORD cap = sizeof(DRIVE_LAYOUT_INFORMATION_EX) + 127 * sizeof(PARTITION_INFORMATION_EX);
+    for (;;) {
+        DRIVE_LAYOUT_INFORMATION_EX *lay = (DRIVE_LAYOUT_INFORMATION_EX *)malloc(cap);
+        if (!lay) return DM_E_NOMEM;
+        DWORD ret = 0;
+        if (DeviceIoControl(h, IOCTL_DISK_GET_DRIVE_LAYOUT_EX, NULL, 0, lay, cap, &ret, NULL)) {
+            *out = lay;
+            return DM_OK;
+        }
+        DWORD err = GetLastError();
+        free(lay);
+        if (err != ERROR_INSUFFICIENT_BUFFER || cap > (1u << 24)) return dmw_status_from_win32(err);
+        cap *= 2;
+    }
 }
 
 /* One layout edit: GET_DRIVE_LAYOUT_EX -> edit -> SET_DRIVE_LAYOUT_EX (only if changed) ->
@@ -75,21 +126,9 @@ static dm_status edit_layout(const wchar_t *disk_path, layout_edit_fn edit, void
     if (h == INVALID_HANDLE_VALUE) return dmw_status_from_win32(GetLastError());
 
     DISK_GEOMETRY_EX geo;
-    dm_status s = ioctl(h, IOCTL_DISK_GET_DRIVE_GEOMETRY_EX, NULL, 0, &geo, sizeof geo);
-
     DRIVE_LAYOUT_INFORMATION_EX *lay = NULL;
-    DWORD cap = sizeof(DRIVE_LAYOUT_INFORMATION_EX) + 127 * sizeof(PARTITION_INFORMATION_EX);
-    while (s == DM_OK) {
-        lay = (DRIVE_LAYOUT_INFORMATION_EX *)malloc(cap);
-        if (!lay) { s = DM_E_NOMEM; break; }
-        DWORD ret = 0;
-        if (DeviceIoControl(h, IOCTL_DISK_GET_DRIVE_LAYOUT_EX, NULL, 0, lay, cap, &ret, NULL)) break;
-        DWORD err = GetLastError();
-        free(lay);
-        lay = NULL;
-        if (err != ERROR_INSUFFICIENT_BUFFER || cap > (1u << 24)) { s = dmw_status_from_win32(err); break; }
-        cap *= 2;
-    }
+    dm_status s = ioctl(h, IOCTL_DISK_GET_DRIVE_GEOMETRY_EX, NULL, 0, &geo, sizeof geo);
+    if (s == DM_OK) s = read_layout(h, &lay);
 
     int changed = 0;
     if (s == DM_OK) s = edit(lay, geo.Geometry.BytesPerSector, ctx, &changed);
@@ -100,6 +139,16 @@ static dm_status edit_layout(const wchar_t *disk_path, layout_edit_fn edit, void
     }
     if (s == DM_OK) s = ioctl(h, IOCTL_DISK_UPDATE_PROPERTIES, NULL, 0, NULL, 0);
     free(lay);
+    CloseHandle(h);
+    return s;
+}
+
+/* Read-only layout query (GENERIC_READ only). */
+static dm_status query_layout(const wchar_t *disk_path, DRIVE_LAYOUT_INFORMATION_EX **out)
+{
+    HANDLE h = CreateFileW(disk_path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
+    if (h == INVALID_HANDLE_VALUE) return dmw_status_from_win32(GetLastError());
+    dm_status s = read_layout(h, out);
     CloseHandle(h);
     return s;
 }
@@ -187,5 +236,61 @@ DMW_API dm_status DMW_CALL dmw_patch_ntfs_hidden_sectors(const wchar_t *disk_pat
     if (s == DM_OK && backup != start) s = patch_one(&io, buf, start, length, backup, sector_size, hidden);
     VirtualFree(buf, 0, MEM_RELEASE);
     dmw_file_close(&f);
+    return s;
+}
+
+DMW_API dm_status DMW_CALL dmw_get_partition_attributes(const wchar_t *disk_path, const uint8_t partition_guid[16],
+                                                        uint64_t *attributes)
+{
+    if (!disk_path || !disk_path[0] || !partition_guid || !attributes) return DM_E_INVALID_ARG;
+    DRIVE_LAYOUT_INFORMATION_EX *lay = NULL;
+    dm_status s = query_layout(disk_path, &lay);
+    if (s == DM_OK) s = dmw_layout_get_attributes(lay, partition_guid, attributes);
+    free(lay);
+    return s;
+}
+
+/* Disk extents of the volume holding the Windows directory contain disk_number? */
+static dm_status windows_volume_on_disk(uint32_t disk_number, int *hit)
+{
+    wchar_t win[MAX_PATH], mount[MAX_PATH], vol[MAX_PATH];
+    UINT n = GetSystemWindowsDirectoryW(win, MAX_PATH);
+    if (n == 0 || n >= MAX_PATH) return DM_E_IO;
+    if (!GetVolumePathNameW(win, mount, MAX_PATH)) return dmw_status_from_win32(GetLastError());
+    if (!GetVolumeNameForVolumeMountPointW(mount, vol, MAX_PATH)) return dmw_status_from_win32(GetLastError());
+    size_t len = wcslen(vol);
+    if (len && vol[len - 1] == L'\\') vol[len - 1] = 0;   /* volume device, not its root directory */
+
+    /* Query only: no data access, nothing is locked or written. */
+    HANDLE h = CreateFileW(vol, 0, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
+    if (h == INVALID_HANDLE_VALUE) return dmw_status_from_win32(GetLastError());
+    union { VOLUME_DISK_EXTENTS e; uint8_t raw[sizeof(VOLUME_DISK_EXTENTS) + 31 * sizeof(DISK_EXTENT)]; } buf;
+    DWORD ret = 0;
+    dm_status s = DM_OK;
+    if (!DeviceIoControl(h, IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS, NULL, 0, &buf, sizeof buf, &ret, NULL))
+        s = dmw_status_from_win32(GetLastError());
+    CloseHandle(h);
+    if (s != DM_OK) return s;
+    *hit = 0;
+    for (DWORD i = 0; i < buf.e.NumberOfDiskExtents && i < 32; i++)
+        if (buf.e.Extents[i].DiskNumber == disk_number) *hit = 1;
+    return DM_OK;
+}
+
+DMW_API dm_status DMW_CALL dmw_disk_is_system(uint32_t disk_number, int *is_system)
+{
+    if (!is_system) return DM_E_INVALID_ARG;
+    *is_system = 1;   /* fail closed: callers refuse on any error */
+    int hit = 0;
+    dm_status s = windows_volume_on_disk(disk_number, &hit);
+    if (s != DM_OK || hit) return s;
+
+    /* Boot side: an ESP (GPT) or active/ESP partition (MBR) anywhere on the disk. Needs read access. */
+    wchar_t path[64];
+    swprintf(path, 64, L"\\\\.\\PhysicalDrive%u", disk_number);
+    DRIVE_LAYOUT_INFORMATION_EX *lay = NULL;
+    s = query_layout(path, &lay);
+    if (s == DM_OK) *is_system = dmw_layout_has_system_partition(lay);
+    free(lay);
     return s;
 }

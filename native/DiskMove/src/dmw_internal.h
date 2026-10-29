@@ -39,6 +39,12 @@ dm_status dmw_layout_move_partition(DRIVE_LAYOUT_INFORMATION_EX *layout, const u
 dm_status dmw_layout_set_attributes(DRIVE_LAYOUT_INFORMATION_EX *layout, const uint8_t partition_guid[16],
                                     uint64_t attributes, uint64_t *old_attributes, int *changed);
 
+/* Pure part of dmw_get_partition_attributes. */
+dm_status dmw_layout_get_attributes(const DRIVE_LAYOUT_INFORMATION_EX *layout, const uint8_t partition_guid[16],
+                                    uint64_t *attributes);
+/* Pure part of dmw_disk_is_system (boot side): GPT ESP, or MBR active / type 0xEF partition. */
+int dmw_layout_has_system_partition(const DRIVE_LAYOUT_INFORMATION_EX *layout);
+
 /* Pure part of dmw_volume_verify. */
 dm_status dmw_extents_match(const VOLUME_DISK_EXTENTS *ext, uint32_t disk_number, uint64_t start, uint64_t length);
 

@@ -489,6 +489,68 @@ static void layout_sets_attributes(void)
     ASSERT_EQ_INT(dmw_layout_set_attributes(NULL, id, hidden, &old, &changed), DM_E_INVALID_ARG);
 }
 
+static void layout_gets_attributes(void)
+{
+    layout_buf b, before;
+    make_layout(&b);
+    before = b;
+    uint8_t id[16]; memset(id, 0x41, 16);
+    uint64_t a = 0;
+    ASSERT_EQ_INT(dmw_layout_get_attributes(&b.hdr, id, &a), DM_OK);
+    ASSERT_EQ_U64(a, 0x8000000000000001ull);
+    ASSERT_TRUE(memcmp(&b, &before, sizeof b) == 0);   /* read-only */
+    b.hdr.PartitionEntry[1].Gpt.Attributes = 0x1000000000000005ull;
+    ASSERT_EQ_INT(dmw_layout_get_attributes(&b.hdr, id, &a), DM_OK);
+    ASSERT_EQ_U64(a, 0x1000000000000005ull);
+    memset(id, 0x77, 16);
+    ASSERT_EQ_INT(dmw_layout_get_attributes(&b.hdr, id, &a), DM_E_NOT_FOUND);
+    b.hdr.PartitionStyle = PARTITION_STYLE_MBR;
+    ASSERT_EQ_INT(dmw_layout_get_attributes(&b.hdr, id, &a), DM_E_INVALID_ARG);
+    ASSERT_EQ_INT(dmw_layout_get_attributes(NULL, id, &a), DM_E_INVALID_ARG);
+}
+
+static void layout_detects_system_partition(void)
+{
+    static const GUID esp = { 0xC12A7328, 0xF81F, 0x11D2, { 0xBA, 0x4B, 0x00, 0xA0, 0xC9, 0x3E, 0xC9, 0x3B } };
+    static const GUID basic = { 0xEBD0A0A2, 0xB9E5, 0x4433, { 0x87, 0xC0, 0x68, 0xB6, 0xB7, 0x26, 0x99, 0xC7 } };
+    layout_buf b;
+    make_layout(&b);
+    for (int i = 0; i < 3; i++) b.hdr.PartitionEntry[i].Gpt.PartitionType = basic;
+    ASSERT_EQ_INT(dmw_layout_has_system_partition(&b.hdr), 0);   /* data-only GPT disk (the VHDX case) */
+    b.hdr.PartitionEntry[2].Gpt.PartitionType = esp;
+    ASSERT_EQ_INT(dmw_layout_has_system_partition(&b.hdr), 1);   /* ESP anywhere */
+
+    /* MBR: active partition, or type 0xEF. */
+    memset(&b, 0, sizeof b);
+    b.hdr.PartitionStyle = PARTITION_STYLE_MBR;
+    b.hdr.PartitionCount = 2;
+    for (int i = 0; i < 2; i++) {
+        b.hdr.PartitionEntry[i].PartitionStyle = PARTITION_STYLE_MBR;
+        b.hdr.PartitionEntry[i].Mbr.PartitionType = 0x07;
+    }
+    ASSERT_EQ_INT(dmw_layout_has_system_partition(&b.hdr), 0);
+    b.hdr.PartitionEntry[1].Mbr.BootIndicator = TRUE;
+    ASSERT_EQ_INT(dmw_layout_has_system_partition(&b.hdr), 1);
+    b.hdr.PartitionEntry[1].Mbr.BootIndicator = FALSE;
+    b.hdr.PartitionEntry[0].Mbr.PartitionType = 0xEF;
+    ASSERT_EQ_INT(dmw_layout_has_system_partition(&b.hdr), 1);
+    ASSERT_EQ_INT(dmw_layout_has_system_partition(NULL), 0);
+}
+
+/* Read-only smoke test on this machine: the disk holding the Windows volume (disk 0 here) is a system disk.
+   Only queries volume extents; nothing is opened for data access, locked or written. */
+static void disk_is_system_smoke(void)
+{
+    int is_system = 0;
+    ASSERT_EQ_INT(dmw_disk_is_system(0, &is_system), DM_OK);
+    ASSERT_EQ_INT(is_system, 1);
+    ASSERT_EQ_INT(dmw_disk_is_system(0, NULL), DM_E_INVALID_ARG);
+    /* A disk that does not exist: fails closed (error + is_system = 1). */
+    is_system = 0;
+    ASSERT_TRUE(dmw_disk_is_system(9999, &is_system) != DM_OK);
+    ASSERT_EQ_INT(is_system, 1);
+}
+
 typedef union extents_buf {
     VOLUME_DISK_EXTENTS e;
     uint8_t raw[sizeof(VOLUME_DISK_EXTENTS) + sizeof(DISK_EXTENT)];
@@ -535,6 +597,7 @@ static void disk_only_calls_refuse_plain_file(void)
     ASSERT_TRUE(dmw_set_partition_attributes(path, id, DMW_GPT_ATTRIBUTE_HIDDEN, &old) != DM_OK);
     ASSERT_EQ_INT(dmw_set_partition_attributes(none, id, DMW_GPT_ATTRIBUTE_HIDDEN, &old), DM_E_NOT_FOUND);
     ASSERT_TRUE(dmw_set_partition_start(path, id, MIB) != DM_OK);
+    ASSERT_TRUE(dmw_get_partition_attributes(path, id, &old) != DM_OK);
     uint64_t size = 0;
     uint8_t *got = read_file(path, &size);
     ASSERT_TRUE(got && size == sizeof data && memcmp(got, data, sizeof data) == 0);
@@ -557,6 +620,9 @@ static void misc_args(void)
     ASSERT_EQ_INT(dmw_volume_verify(NULL, 0, 0, MIB), DM_E_INVALID_ARG);
     uint32_t dn = 0;
     ASSERT_EQ_INT(dmw_disk_number(NULL, &dn), DM_E_INVALID_ARG);
+    uint64_t at = 0;
+    ASSERT_EQ_INT(dmw_get_partition_attributes(NULL, id, &at), DM_E_INVALID_ARG);
+    ASSERT_EQ_INT(dmw_get_partition_attributes(L"x", id, NULL), DM_E_INVALID_ARG);
     ASSERT_EQ_INT(dmw_disk_number(L"x", NULL), DM_E_INVALID_ARG);
     ASSERT_EQ_INT(dmw_journal_create(NULL, NULL, 0, NULL, 0), DM_E_INVALID_ARG);
     ASSERT_EQ_INT(dmw_status_from_win32(ERROR_ACCESS_DENIED), DM_E_ACCESS);
@@ -580,6 +646,9 @@ void dm_run_win32_io(void)
     DM_RUN(layout_moves_partition);
     DM_RUN(layout_rejects_bad_moves);
     DM_RUN(layout_sets_attributes);
+    DM_RUN(layout_gets_attributes);
+    DM_RUN(layout_detects_system_partition);
+    DM_RUN(disk_is_system_smoke);
     DM_RUN(volume_extent_match);
     DM_RUN(disk_only_calls_refuse_plain_file);
     DM_RUN(misc_args);

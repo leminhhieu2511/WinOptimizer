@@ -71,6 +71,15 @@ DMW_API dm_status DMW_CALL dmw_set_partition_start(const wchar_t *disk_path, con
    *old_attributes (may be NULL) receives the attributes found before the call. */
 DMW_API dm_status DMW_CALL dmw_set_partition_attributes(const wchar_t *disk_path, const uint8_t partition_guid[16],
                                                         uint64_t attributes, uint64_t *old_attributes);
+/* Read-only: the GPT attributes of the entry with this PartitionId (GET_DRIVE_LAYOUT_EX, GENERIC_READ). */
+DMW_API dm_status DMW_CALL dmw_get_partition_attributes(const wchar_t *disk_path, const uint8_t partition_guid[16],
+                                                        uint64_t *attributes);
+
+/* Read-only guard for test tools: *is_system = 1 if disk_number holds any extent of the volume of the
+   Windows directory, or has an EFI system partition (GPT type c12a7328-...) / an active or 0xEF partition
+   (MBR). Fails closed: on any error *is_system = 1 and the error is returned. The product does NOT use
+   this (it targets the system disk by design). */
+DMW_API dm_status DMW_CALL dmw_disk_is_system(uint32_t disk_number, int *is_system);
 
 /* Sets HiddenSectors (u32 at 0x1C) = start / sector_size in the NTFS boot sector at start and the backup
    boot sector at start + length - sector_size. Sectors whose OEM ID is not "NTFS    " are left alone;
