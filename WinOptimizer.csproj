@@ -1,4 +1,4 @@
-﻿<Project Sdk="Microsoft.NET.Sdk">
+<Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
     <OutputType>WinExe</OutputType>
@@ -12,6 +12,9 @@
     <NoWarn>$(NoWarn);WPF0001</NoWarn>
     <AssemblyTitle>WinOptimizer</AssemblyTitle>
     <Version>1.0.0</Version>
+    <PlatformTarget>x64</PlatformTarget>
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <SelfContained>false</SelfContained>
   </PropertyGroup>
 
   <ItemGroup>
@@ -19,5 +22,36 @@
     <Using Remove="System.Windows.Forms" />
     <Using Remove="System.Drawing" />
   </ItemGroup>
+
+  <ItemGroup>
+    <!-- Native C sources/tests are built by CMake, not by the C# compiler. -->
+    <Compile Remove="tests/**;native/**" />
+    <Page Remove="tests/**;native/**" />
+    <None Remove="tests/**;native/**" />
+    <EmbeddedResource Remove="tests/**;native/**" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Produced by the native build (Task 6); only copied once it exists. -->
+    <None Include="native/build/DiskMove/$(Configuration)/DiskMove.dll" Condition="Exists('native/build/DiskMove/$(Configuration)/DiskMove.dll')">
+      <Link>DiskMove.dll</Link>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+  </ItemGroup>
+
+  <!-- Build the native DiskMove projects with CMake (incremental: CMake skips up-to-date targets). -->
+  <Target Name="BuildNative" BeforeTargets="BeforeBuild">
+    <PropertyGroup>
+      <NativeDir>$(MSBuildProjectDirectory)\native</NativeDir>
+      <NativeBuildDir>$(NativeDir)\build</NativeBuildDir>
+      <VsWhere>$([System.Environment]::GetEnvironmentVariable('ProgramFiles(x86)'))\Microsoft Visual Studio\Installer\vswhere.exe</VsWhere>
+    </PropertyGroup>
+    <Exec Command="&quot;$(VsWhere)&quot; -latest -products * -find **\CMake\bin\cmake.exe" ConsoleToMSBuild="true" StandardOutputImportance="low">
+      <Output TaskParameter="ConsoleOutput" PropertyName="CMakeExe" />
+    </Exec>
+    <Error Condition="'$(CMakeExe)' == '' Or !Exists('$(CMakeExe)')" Text="cmake.exe not found via vswhere. Install the Visual Studio 'C++ CMake tools for Windows' component." />
+    <Exec Condition="!Exists('$(NativeBuildDir)\CMakeCache.txt')" Command="&quot;$(CMakeExe)&quot; -S &quot;$(NativeDir)&quot; -B &quot;$(NativeBuildDir)&quot; -G &quot;Visual Studio 18 2026&quot; -A x64" />
+    <Exec Command="&quot;$(CMakeExe)&quot; --build &quot;$(NativeBuildDir)&quot; --config $(Configuration)" />
+  </Target>
 
 </Project>
