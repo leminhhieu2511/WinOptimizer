@@ -19,7 +19,6 @@ public sealed class NativeMoveVhdxTests(ITestOutputHelper output)
     const long Shift = 512 * VhdxFixture.MiB;
     const int FileCount = 2000;
     const int FileSeed = 20261027;
-    const int KillSeed = 7_20261029;
 
     static readonly string CliPath = typeof(NativeMoveVhdxTests).Assembly
         .GetCustomAttributes<AssemblyMetadataAttribute>().Single(a => a.Key == "DiskMoveCliPath").Value!;
@@ -78,27 +77,72 @@ public sealed class NativeMoveVhdxTests(ITestOutputHelper output)
         }
     }
 
-    [AdminFact]
-    public void Move_KilledRandomly_ResumesCleanly()
+    /// <summary>
+    /// Kills "move" (TerminateProcess) at a point taken from its own output: after ~10/50/90 % of the copied
+    /// bytes, or right after the "phase hide/patch/commit-gpt/restore" line. Checks the crash state in the
+    /// journal, recovers (resume + commit, or undo + move when nothing was copied) and checks the result.
+    /// </summary>
+    [AdminTheory]
+    [InlineData("progress:10")]
+    [InlineData("progress:50")]
+    [InlineData("progress:90")]
+    [InlineData("phase:hide")]
+    [InlineData("phase:patch")]
+    [InlineData("phase:commit-gpt")]
+    [InlineData("phase:restore")]
+    public void Move_KilledAtPoint_ResumesCleanly(string killAt)
     {
-        var rng = new Random(KillSeed);
-        var delays = Enumerable.Range(0, 5).Select(_ => rng.Next(200, 3001)).ToArray();
-        Log("kill delays (ms): " + string.Join(", ", delays));
+        string name = "kill-" + killAt.Replace(':', '-');
         try
         {
-            for (int i = 0; i < delays.Length; i++)
-            {
-                string name = $"kill-{i}";
-                Log($"===== iteration {i}: kill after {delays[i]} ms");
-                using var vhdx = VhdxFixture.Create(name, Log);
-                var m = Prepare(vhdx, name);
-                KillAndRecover(m, delays[i]);
-                AssertMoved(vhdx, m);
-            }
+            using var vhdx = VhdxFixture.Create(name, Log);
+            var m = Prepare(vhdx, name);
+            KillAt(m, killAt);
+            Recover(m, killAt);
+            AssertMoved(vhdx, m);
         }
         finally
         {
-            SaveLog("kill");
+            SaveLog(name);
+        }
+    }
+
+    /// <summary>
+    /// A crashed move must not be resumed on another disk: "resume --disk" of a second (offline) VHDX is
+    /// refused with DM_E_JOURNAL_MISMATCH (exit code 6), its bytes and the journal stay unchanged, and the
+    /// right disk then resumes normally.
+    /// </summary>
+    [AdminFact]
+    public void Resume_OnAnotherDisk_IsRefusedWithoutWriting()
+    {
+        const string name = "wrong-disk";
+        try
+        {
+            using var other = VhdxFixture.Create(name + "-other", Log);
+            other.SetOffline();   // no file-system writes there while its bytes are compared
+            using var vhdx = VhdxFixture.Create(name, Log);
+            var m = Prepare(vhdx, name);
+            KillAt(m, "progress:10");
+            var (statusRc, journalBefore) = Cli(["status", "--journal", m.Journal]);
+            Assert.Equal(0, statusRc);
+
+            string otherDisk = other.DiskPath;
+            string rawBefore = RawHash(otherDisk, m.OldStart, m.Length + Shift);
+            var (rc, outp) = Cli(["resume", "--disk", otherDisk, "--journal", m.Journal, "--move", "0"]);
+            Assert.True(rc == 6, $"resume on another disk: expected DM_E_JOURNAL_MISMATCH (6), got {rc}: {outp}");
+            Assert.Contains("DM_E_JOURNAL_MISMATCH", outp);
+            Assert.DoesNotContain("progress ", outp);
+            Assert.Equal(rawBefore, RawHash(otherDisk, m.OldStart, m.Length + Shift));
+            var (_, journalAfter) = Cli(["status", "--journal", m.Journal]);
+            Assert.Equal(journalBefore, journalAfter);
+            Log("RESULT resume on another disk refused; other disk bytes and journal unchanged");
+
+            Recover(m, "progress:10");
+            AssertMoved(vhdx, m);
+        }
+        finally
+        {
+            SaveLog(name);
         }
     }
 
@@ -231,8 +275,11 @@ public sealed class NativeMoveVhdxTests(ITestOutputHelper output)
 
     // ------------------------------------------------------------------ kill + recover
 
-    void KillAndRecover(MoveCase m, int delayMs, int attempt = 0)
+    /// <summary>Runs "move" and kills it (TerminateProcess) as soon as its output reaches the kill point
+    /// ("progress:P" = P % of the bytes copied, "phase:X" = the line "phase X"); fails if it ends by itself.</summary>
+    void KillAt(MoveCase m, string killAt, int attempt = 0)
     {
+        string[] kp = killAt.Split(':');
         var outBuf = new StringBuilder();
         var psi = new ProcessStartInfo(CliPath)
         {
@@ -240,46 +287,86 @@ public sealed class NativeMoveVhdxTests(ITestOutputHelper output)
         };
         foreach (var a in m.MoveArgs([])) psi.ArgumentList.Add(a);
         var sw = Stopwatch.StartNew();
-        using var p = Process.Start(psi)!;
-        p.OutputDataReceived += (_, e) => { if (e.Data != null) lock (outBuf) outBuf.AppendLine(e.Data); };
+        using var p = new Process { StartInfo = psi };
+        int killed = 0;
+        string trigger = "";
+        p.OutputDataReceived += (_, e) =>
+        {
+            if (e.Data == null) return;
+            lock (outBuf) outBuf.AppendLine(e.Data);
+            if (!IsKillPoint(kp, e.Data) || Interlocked.Exchange(ref killed, 1) != 0) return;
+            try { p.Kill(true); } catch (InvalidOperationException) { /* already gone */ }
+            trigger = e.Data;
+        };
         p.ErrorDataReceived += (_, e) => { if (e.Data != null) lock (outBuf) outBuf.AppendLine("ERR " + e.Data); };
+        p.Start();
         p.BeginOutputReadLine();
         p.BeginErrorReadLine();
-        bool exited = p.WaitForExit(delayMs);
-        if (!exited)
-        {
-            p.Kill(true);
-            p.WaitForExit();
-        }
+        Assert.True(p.WaitForExit(600_000), "move hung");
         p.WaitForExit();   // flush the async readers
         string moveOut;
         lock (outBuf) moveOut = outBuf.ToString();
-        string last = moveOut.TrimEnd().Split('\n').LastOrDefault()?.Trim() ?? "";
-        Log($"move {(exited ? $"EXITED by itself (rc {p.ExitCode})" : "KILLED")} after {sw.ElapsedMilliseconds} ms; " +
-            $"progress lines {moveOut.Split('\n').Count(l => l.StartsWith("progress"))}; last line '{last}'\n{Tail(moveOut, 12)}");
-        if (exited && IsLockBusy(p.ExitCode, moveOut) && attempt < 5)
+        Log($"move {(killed != 0 ? $"KILLED at '{trigger}'" : $"EXITED by itself (rc {p.ExitCode})")} after " +
+            $"{sw.ElapsedMilliseconds} ms\n{Tail(moveOut, 8)}");
+        if (killed == 0 && IsLockBusy(p.ExitCode, moveOut) && attempt < 5)
         {
-            Thread.Sleep(2000);   // nothing was changed: try the same kill again
-            KillAndRecover(m, delayMs, attempt + 1);
+            Thread.Sleep(2000);   // nothing was changed: try again
+            KillAt(m, killAt, attempt + 1);
             return;
         }
-        if (exited)
-        {
-            Assert.True(p.ExitCode == 0, $"move failed by itself ({p.ExitCode}): {moveOut}");
-            return;
-        }
+        Assert.True(killed != 0, $"kill point {killAt} never reached: {moveOut}");
+    }
 
-        // Crash state, read without opening the (possibly hidden, half-moved) volume: journal + sidecar only.
+    static bool IsKillPoint(string[] kp, string line)
+    {
+        if (kp[0] == "phase") return line == "phase " + kp[1];
+        if (!line.StartsWith("progress ")) return false;
+        var dt = line["progress ".Length..].Split('/');
+        return dt.Length == 2 && ulong.TryParse(dt[0], out ulong done) && ulong.TryParse(dt[1], out ulong total) &&
+               total > 0 && done * 100 >= total * ulong.Parse(kp[1]);
+    }
+
+    static ulong StatusValue(string status, string key) =>
+        ulong.Parse(status.Split('\n').Select(l => l.Trim()).First(l => l.StartsWith(key + " "))
+                          .Split(' ', StringSplitOptions.RemoveEmptyEntries)[1]);
+
+    /// <summary>Checks the crash state (journal + sidecar only: the hidden volume is not opened), then finishes
+    /// the move: resume + commit if the journal exists, otherwise undo the hiding and move again.</summary>
+    void Recover(MoveCase m, string killAt)
+    {
         bool sidecar = File.Exists(m.Sidecar);
         var (statusRc, statusOut) = Cli(["status", "--journal", m.Journal]);
-        Log($"after kill: sidecar {sidecar}, journal status rc {statusRc}; " + VolumeProbe(m.VolumePath));
+        Log($"after kill at {killAt}: sidecar {sidecar}, journal status rc {statusRc}; " + VolumeProbe(m.VolumePath));
+        ulong done = 0, count = 0;
+        if (statusRc == 0)
+        {
+            done = StatusValue(statusOut, "chunks_done");
+            count = StatusValue(statusOut, "chunk_count");
+            Log($"journal: {done}/{count} chunks done");
+        }
+        if (killAt.StartsWith("progress:"))   // mid-copy: partial progress, still hidden
+        {
+            Assert.Equal(0, statusRc);
+            Assert.True(done > 0 && done < count, $"expected partial progress, got {done}/{count}");
+            Assert.True(sidecar, "the sidecar must exist mid-copy");
+        }
+        else if (killAt is "phase:patch" or "phase:commit-gpt" or "phase:restore")   // copied, not finished
+        {
+            Assert.Equal(0, statusRc);
+            Assert.True(done == count && count > 0, $"expected a finished copy, got {done}/{count}");
+            if (killAt != "phase:restore") Assert.True(sidecar, "the sidecar must exist before the restore");
+        }
 
         if (statusRc == 0)
         {
-            // The journal exists, so copying may have started: finish it (resume), then commit + restore.
+            // The journal exists, so copying may have started: finish it (resume without a volume lock: a
+            // hidden volume has no device), then commit + restore.
             Log("RECOVERY resume + commit (journal valid)");
             var (rc, outp) = Cli(m.ResumeArgs());
             Assert.True(rc == 0, $"resume failed ({rc}): {outp}");
+            int copied = outp.Split('\n').Count(l => l.StartsWith("progress "));
+            Log($"resume reported {copied} copied chunk(s)");
+            if (done < count) Assert.True(copied > 0, "the resume must copy the remaining chunks");
             (rc, outp) = Cli(m.CommitArgs());
             Assert.True(rc == 0, $"commit failed ({rc}): {outp}");
             return;
@@ -309,6 +396,25 @@ public sealed class NativeMoveVhdxTests(ITestOutputHelper output)
     }
 
     static string Tail(string s, int lines) => string.Join('\n', s.TrimEnd().Split('\n').TakeLast(lines));
+
+    /// <summary>SHA-256 of [offset, offset + length) of a disk, read-only.</summary>
+    static string RawHash(string disk, long offset, long length)
+    {
+        using var h = Native.CreateFileW(disk, 0x80000000 /* GENERIC_READ */, 3, IntPtr.Zero, 3, 0, IntPtr.Zero);
+        Assert.False(h.IsInvalid, $"open {disk}: error {Marshal.GetLastWin32Error()}");
+        using var sha = System.Security.Cryptography.IncrementalHash.CreateHash(
+            System.Security.Cryptography.HashAlgorithmName.SHA256);
+        var buf = new byte[4 * VhdxFixture.MiB];
+        for (long pos = 0; pos < length;)
+        {
+            int want = (int)Math.Min(buf.Length, length - pos);
+            int got = RandomAccess.Read(h, buf.AsSpan(0, want), offset + pos);
+            Assert.True(got == want, $"short read at {offset + pos}");
+            sha.AppendData(buf, 0, got);
+            pos += got;
+        }
+        return Convert.ToHexString(sha.GetHashAndReset());
+    }
 
     void WaitForLetter(char letter)
     {

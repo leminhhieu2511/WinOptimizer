@@ -336,6 +336,15 @@ public sealed class VhdxFixture : IDisposable
         return serial;
     }
 
+    /// <summary>Takes the VHDX disk offline (diskpart): its volumes go away, so nothing writes to it.</summary>
+    public void SetOffline()
+    {
+        int disk = DiskNumber;
+        int rc = Diskpart(Path.Combine(ScratchDir, Name + ".offline.txt"), $"select disk {disk}\r\noffline disk\r\n", _log);
+        if (rc != 0) throw new InvalidOperationException($"diskpart offline failed ({rc})");
+        AssertSafe();
+    }
+
     public void Dispose()
     {
         if (_disposed) return;
