@@ -27,4 +27,10 @@ int  cli_sidecar_write(const wchar_t *path, const restore_info *ri);
 /* Returns 1 only if attributes, partition and volume lines were all present and valid. */
 int  cli_sidecar_read(const wchar_t *path, restore_info *ri);
 
+/* 1 if a mount point that now resolves to resolved_now (NULL: to nothing) leads to volume. */
+int  cli_mount_point_is(const wchar_t *resolved_now, const wchar_t *volume);
+/* After DeleteVolumeMountPoint(m): 1 if m no longer leads to volume. delete_ok = its result; resolved_now =
+   what m resolves to now (GetVolumeNameForVolumeMountPoint), NULL if nothing. */
+int  cli_mount_point_removed(int delete_ok, const wchar_t *resolved_now, const wchar_t *volume);
+
 #endif

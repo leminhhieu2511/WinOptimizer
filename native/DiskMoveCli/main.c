@@ -211,35 +211,52 @@ static int volume_identity(const wchar_t *volume_arg, restore_info *ri)
 
 static int is_drive_root(const wchar_t *m) { return m[0] && m[1] == L':' && m[2] == L'\\' && !m[3]; }
 
-/* Re-creates the recorded mount points; drops a drive letter Windows auto-assigned meanwhile. */
-static int remount(const restore_info *ri)
+/* Drops drive letters of the volume that are not recorded (Windows auto-assigned them), if it had one. */
+static void drop_auto_letters(const restore_info *ri)
 {
     wchar_t names[4096];
     DWORD len = 0;
-    int ok = 1, want_letter = 0;
+    int want_letter = 0;
     for (int i = 0; i < ri->mount_count; i++) want_letter |= is_drive_root(ri->mounts[i]);
-    if (GetVolumePathNamesForVolumeNameW(ri->volume, names, 4096, &len)) {
-        for (const wchar_t *m = names; *m; m += wcslen(m) + 1) {
-            int recorded = 0;
-            for (int i = 0; i < ri->mount_count; i++) recorded |= _wcsicmp(m, ri->mounts[i]) == 0;
-            if (!recorded && want_letter && is_drive_root(m)) DeleteVolumeMountPointW(m);
-        }
+    if (!want_letter || !GetVolumePathNamesForVolumeNameW(ri->volume, names, 4096, &len)) return;
+    for (const wchar_t *m = names; *m; m += wcslen(m) + 1) {
+        int recorded = 0;
+        for (int i = 0; i < ri->mount_count; i++) recorded |= _wcsicmp(m, ri->mounts[i]) == 0;
+        if (!recorded && is_drive_root(m) && DeleteVolumeMountPointW(m)) printf("auto-assigned %ls removed\n", m);
     }
+}
+
+/* Re-creates the recorded mount points; drops a drive letter Windows auto-assigned meanwhile. */
+static int remount(const restore_info *ri)
+{
+    int ok = 1;
+    drop_auto_letters(ri);
     for (int i = 0; i < ri->mount_count; i++) {
-        wchar_t cur[MAX_PATH];
-        if (GetVolumeNameForVolumeMountPointW(ri->mounts[i], cur, MAX_PATH) && _wcsicmp(cur, ri->volume) == 0)
-            continue;   /* already there */
-        /* The volume re-arrives asynchronously after UPDATE_PROPERTIES: retry for up to ~10 s. */
-        BOOL set = FALSE;
-        for (int attempt = 0; attempt < 20 && !(set = SetVolumeMountPointW(ri->mounts[i], ri->volume)); attempt++)
-            Sleep(500);
+        /* The volume re-arrives asynchronously after UPDATE_PROPERTIES, and Windows may give it its old letter
+           back by itself meanwhile (seen on the VHDX: SetVolumeMountPoint then fails with error 145), so every
+           attempt first checks whether the mount point already leads to the volume. Up to ~20 s. */
+        int set = 0, already = 0;
+        DWORD err = 0;
+        for (int attempt = 0; attempt < 40 && !set; attempt++) {
+            wchar_t cur[MAX_PATH];
+            int resolves = GetVolumeNameForVolumeMountPointW(ri->mounts[i], cur, MAX_PATH);
+            if (cli_mount_point_is(resolves ? cur : NULL, ri->volume)) {
+                set = already = 1;
+            } else if (SetVolumeMountPointW(ri->mounts[i], ri->volume)) {
+                set = 1;
+            } else {
+                err = GetLastError();
+                Sleep(500);
+            }
+        }
         if (!set) {
-            fprintf(stderr, "cannot re-create mount point %ls (error %lu)\n", ri->mounts[i], GetLastError());
+            fprintf(stderr, "cannot re-create mount point %ls (error %lu)\n", ri->mounts[i], err);
             ok = 0;
         } else {
-            printf("mount point %ls restored\n", ri->mounts[i]);
+            printf(already ? "mount point %ls already back\n" : "mount point %ls restored\n", ri->mounts[i]);
         }
     }
+    drop_auto_letters(ri);   /* a letter auto-assigned while we waited */
     return ok;
 }
 
@@ -391,14 +408,28 @@ static int cmd_move(void)
         return rc;
     }
     printf("partition hidden (original attributes 0x%016llX)\n", (unsigned long long)ri.attributes);
+    /* The lock handle must still be the volume at the old offset after the layout change. */
+    s = dmw_volume_verify(v, disk_number, plan.old_start, plan.length);
+    if (s != DM_OK) {
+        rc = report(s, "volume verify after hide");
+        restore_volume(disk, plan.partition_guid, &ri, sidecar, &v);   /* nothing written yet */
+        return rc;
+    }
+    printf("lock handle still valid after hide\n");
+    /* Windows drops the drive letter of a volume that becomes HIDDEN by itself (seen on a VHDX), so a mount
+       point that already leads nowhere (or elsewhere) counts as removed. */
     for (int i = 0; i < ri.mount_count; i++) {
-        if (!DeleteVolumeMountPointW(ri.mounts[i])) {
-            fprintf(stderr, "cannot remove mount point %ls (error %lu)\n", ri.mounts[i], GetLastError());
+        BOOL deleted = DeleteVolumeMountPointW(ri.mounts[i]);
+        DWORD err = deleted ? 0 : GetLastError();
+        wchar_t now[MAX_PATH];
+        int resolves = GetVolumeNameForVolumeMountPointW(ri.mounts[i], now, MAX_PATH);
+        if (!cli_mount_point_removed(deleted, resolves ? now : NULL, ri.volume)) {
+            fprintf(stderr, "cannot remove mount point %ls (error %lu)\n", ri.mounts[i], err);
             rc = report(DM_E_IO, "remove mount points");
             restore_volume(disk, plan.partition_guid, &ri, sidecar, &v);   /* nothing written yet */
             return rc;
         }
-        printf("mount point %ls removed\n", ri.mounts[i]);
+        printf(deleted ? "mount point %ls removed\n" : "mount point %ls already removed by Windows\n", ri.mounts[i]);
     }
 
     rc = dismount(v);
@@ -557,6 +588,8 @@ int wmain(int argc, wchar_t **argv)
     g_argc = argc;
     g_argv = argv;
     if (argc < 2) return usage();
+    /* Unbuffered, so a killed run (Task 7 kill test) still shows how far it got. */
+    setvbuf(stdout, NULL, _IONBF, 0);
     SetConsoleCtrlHandler(on_ctrl, TRUE);
     if (wcscmp(argv[1], L"move") == 0) return cmd_move();
     if (wcscmp(argv[1], L"resume") == 0) return cmd_resume();

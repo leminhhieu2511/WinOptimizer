@@ -96,9 +96,34 @@ static void sidecar_rejects_incomplete(void)
     DeleteFileW(side);
 }
 
+/* Hiding the partition makes Windows drop its drive letter by itself (seen on the VHDX, Task 7), so a failed
+   DeleteVolumeMountPoint is fine as long as the mount point no longer leads to the volume. */
+static void mount_point_removed_when_gone(void)
+{
+    const wchar_t *vol = L"\\\\?\\Volume{5c46a07b-d17e-47f1-9680-3d685b8245a3}\\";
+    ASSERT_TRUE(cli_mount_point_removed(1, NULL, vol));                         /* deleted by us */
+    ASSERT_TRUE(cli_mount_point_removed(1, vol, vol));                          /* deleted (stale lookup) */
+    ASSERT_TRUE(cli_mount_point_removed(0, NULL, vol));                         /* already gone */
+    ASSERT_TRUE(cli_mount_point_removed(0, L"\\\\?\\Volume{0000}\\", vol));     /* now another volume */
+    ASSERT_TRUE(!cli_mount_point_removed(0, vol, vol));                         /* still ours: real failure */
+    ASSERT_TRUE(!cli_mount_point_removed(0, L"\\\\?\\VOLUME{5C46A07B-D17E-47F1-9680-3D685B8245A3}\\", vol));
+}
+
+/* remount: Windows may give the letter back by itself before SetVolumeMountPoint runs (seen on the VHDX). */
+static void mount_point_already_back(void)
+{
+    const wchar_t *vol = L"\\\\?\\Volume{5c46a07b-d17e-47f1-9680-3d685b8245a3}\\";
+    ASSERT_TRUE(cli_mount_point_is(vol, vol));
+    ASSERT_TRUE(cli_mount_point_is(L"\\\\?\\VOLUME{5C46A07B-D17E-47F1-9680-3D685B8245A3}\\", vol));
+    ASSERT_TRUE(!cli_mount_point_is(NULL, vol));                                  /* not there yet */
+    ASSERT_TRUE(!cli_mount_point_is(L"\\\\?\\Volume{0000}\\", vol));              /* someone else's */
+}
+
 void dm_run_cli_restore(void)
 {
     DM_RUN(hidden_attributes_keep_every_bit);
     DM_RUN(sidecar_round_trip);
     DM_RUN(sidecar_rejects_incomplete);
+    DM_RUN(mount_point_removed_when_gone);
+    DM_RUN(mount_point_already_back);
 }

@@ -71,3 +71,13 @@ int cli_sidecar_read(const wchar_t *path, restore_info *ri)
     fclose(f);
     return have_attr && have_part && ri->volume[0];
 }
+
+int cli_mount_point_is(const wchar_t *resolved_now, const wchar_t *volume)
+{
+    return resolved_now && _wcsicmp(resolved_now, volume) == 0;
+}
+
+int cli_mount_point_removed(int delete_ok, const wchar_t *resolved_now, const wchar_t *volume)
+{
+    return delete_ok || !cli_mount_point_is(resolved_now, volume);
+}
