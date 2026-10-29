@@ -76,11 +76,13 @@ public enum DiskMoveOutcome
 public sealed record DiskMoveResult(DiskMoveOutcome Outcome, char? FinalSourceLetter, IReadOnlyList<string> Warnings);
 
 /// <summary>
-/// Written (atomically) before step 1 and deleted once the journal exists (step 2) or after an undo, so an
-/// interruption before the journal can still give the source its space back on the next start.
+/// Written (atomically) before step 1 and deleted once the journal exists (step 2), so an interruption before the
+/// journal can still give the source its space back on the next start. Re-written with <see cref="Undoing"/> = true
+/// before an undo (cancel / failure before step 3) changes anything, and deleted only when the undo is complete.
 /// </summary>
+/// <param name="Undoing">An undo was in progress: a resume finishes the undo even if a journal (step &lt; 3) exists.</param>
 public sealed record PendingMove(Guid DiskGuid, Guid SourceGuid, char SourceLetter, long SourceOriginalSize,
-    Guid TargetGuid, long Amount, DateTime Timestamp)
+    Guid TargetGuid, long Amount, DateTime Timestamp, bool Undoing = false)
 {
     public byte[] ToJsonBytes() => JsonSerializer.SerializeToUtf8Bytes(this);
 

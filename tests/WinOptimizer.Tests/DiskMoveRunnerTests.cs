@@ -431,6 +431,129 @@ public sealed class DiskMoveRunnerTests : IDisposable
         Assert.False(pendingAfterJournal, "the journal supersedes the marker");
     }
 
+    /// <summary>A cancel at the dismount starts the undo; it crashes at a point inside the undo; the resume must
+    /// finish the undo (never move forward), whatever the point.</summary>
+    [Theory]
+    [InlineData("SetAttributes(D,visible")]   // marker re-written (Undoing), nothing undone yet... then attrs back
+    [InlineData("AssignLetter(D")]
+    [InlineData("DeleteJournal")]
+    [InlineData("during-resize")]
+    [InlineData("Resize-back")]               // resized, marker not yet deleted
+    public async Task CrashInsideUndo_ResumeFinishesUndo(string point)
+    {
+        var f = new FakeDiskMoveBackend();
+        var b = Capture(f);
+        using var cts = new CancellationTokenSource();
+        bool pendingAtFirstUndoCall = false;
+        f.OnCall = c =>
+        {
+            if (c == "Dismount(D)") cts.Cancel();
+            if (c.StartsWith("SetAttributes(D,visible")) pendingAtFirstUndoCall = File.Exists(Pending);
+            bool hit = point switch
+            {
+                "Resize-back" => c == $"Resize(D,{b.DSize})",
+                "during-resize" => false,
+                _ => c.StartsWith(point),
+            };
+            if (hit) f.CrashAtCall = f.CallCount;
+        };
+        if (point == "during-resize") f.CrashBeforeResizeTo = b.DSize;
+        await Assert.ThrowsAnyAsync<Exception>(() => Run(f, ct: cts.Token));
+        Assert.True(f.Dead, "no crash");
+        Assert.True(pendingAtFirstUndoCall, "the marker must be back before the undo changes anything");
+        f.Revive();
+        Assert.True(File.Exists(Pending), "the marker must survive a crash inside the undo");
+        Assert.True(DiskMoveRunner.HasUnfinishedMove(_dir));
+
+        int before = f.Calls.Count;
+        var r = await Runner(f).ResumeAsync(new SyncProgress(), () => false);
+        var resumed = f.Calls.Skip(before).ToList();
+        Assert.DoesNotContain(resumed, c => c.StartsWith("RunMove") || c.StartsWith("Step(") || c.Contains("hidden"));
+        Assert.Equal(DiskMoveOutcome.Undone, r.Outcome);
+        Assert.Equal(b.DSize, f.D.Size);
+        Assert.Equal(b.DStart, f.D.Start);
+        Assert.Equal(b.DAttrs, f.D.Attrs);
+        Assert.Equal(b.DLetter, f.D.Letter);
+        Assert.False(DiskMoveRunner.HasUnfinishedJournal(Journal));
+        Assert.False(DiskMoveRunner.HasUnfinishedMove(_dir));
+    }
+
+    /// <summary>Every state-changing call of a cancelled run's undo, crashed and resumed.</summary>
+    [Fact]
+    public async Task CrashAtEveryUndoCall_ResumeFinishesUndo()
+    {
+        async Task<(FakeDiskMoveBackend, Before, CancellationTokenSource)> Start(int? crashAt)
+        {
+            var f = new FakeDiskMoveBackend();
+            var b = Capture(f);
+            var cts = new CancellationTokenSource();
+            f.OnCall = c => { if (c == "Dismount(D)") cts.Cancel(); };
+            f.CrashAtCall = crashAt;
+            await Assert.ThrowsAnyAsync<Exception>(() => Run(f, ct: cts.Token));
+            return (f, b, cts);
+        }
+        var (clean, _, c0) = await Start(null);
+        c0.Dispose();
+        int first = clean.Calls.FindIndex(c => c.StartsWith("SetAttributes(D,visible"));
+        int undoStart = clean.Calls.Take(first).Count(c => !c.StartsWith("Verify") && !c.StartsWith("Unlock") && c != "ReadRawGpt") + 1;
+        int total = clean.CallCount;
+        Assert.True(total - undoStart >= 3, $"undo calls {undoStart}..{total}");
+        for (int n = undoStart; n <= total; n++)
+        {
+            var (f, b, cts) = await Start(n);
+            cts.Dispose();
+            Assert.True(f.Dead, $"call {n}: no crash");
+            f.Revive();
+            var r = await Runner(f).ResumeAsync(new SyncProgress(), () => false);
+            Assert.Equal(DiskMoveOutcome.Undone, r.Outcome);
+            Assert.Equal(b.DSize, f.D.Size);
+            Assert.Equal(b.DAttrs, f.D.Attrs);
+            Assert.Equal(b.DLetter, f.D.Letter);
+            Assert.False(DiskMoveRunner.HasUnfinishedMove(_dir), $"call {n}");
+        }
+    }
+
+    [Fact]
+    public async Task CrashInsideRecheckAbort_ResumeFinishesUndo()
+    {
+        var f = new FakeDiskMoveBackend();
+        var b = Capture(f);
+        f.CrashBeforeResizeTo = b.DSize;
+        await Assert.ThrowsAnyAsync<Exception>(() => Run(f, recheck: () => [new CheckResult(CheckSeverity.Blocker, CheckCode.SourceInUse, "x")]));
+        f.Revive();
+        Assert.True(File.Exists(Pending));
+        AssertUndone(f, b, await Runner(f).ResumeAsync(new SyncProgress(), () => false));
+    }
+
+    [Fact]
+    public async Task TornJournalWithPending_ResumeUndoes()
+    {
+        var f = new FakeDiskMoveBackend();
+        var b = Capture(f);
+        f.OnCall = c => { if (c == "CreateJournal") f.CrashAtCall = f.CallCount; };
+        await Assert.ThrowsAnyAsync<Exception>(() => Run(f));
+        f.Revive();
+        File.WriteAllText(Journal, "{ torn");   // the create was cut short
+        AssertUndone(f, b, await Runner(f).ResumeAsync(new SyncProgress(), () => false));
+        Assert.False(File.Exists(Journal));
+    }
+
+    [Fact]
+    public async Task TornJournalWithPending_HiddenSource_StopsWithoutChanges()
+    {
+        var f = new FakeDiskMoveBackend();
+        f.OnCall = c => { if (c.StartsWith("SetAttributes(D,hidden")) f.CrashAtCall = f.CallCount; };
+        await Assert.ThrowsAnyAsync<Exception>(() => Run(f));
+        f.Revive();
+        File.WriteAllText(Journal, "{ torn");
+        File.WriteAllBytes(Pending, new PendingMove(f.DiskGuid, f.D.Guid, 'D', f.D.Size + X, f.C.Guid, X, DateTime.Now).ToJsonBytes());
+        int count = f.CallCount;
+        await Assert.ThrowsAsync<DiskMoveStateMismatchException>(() => Runner(f).ResumeAsync(new SyncProgress(), () => false));
+        Assert.Equal(count, f.CallCount);
+        Assert.True(File.Exists(Journal));
+        Assert.True(File.Exists(Pending));
+    }
+
     [Fact]
     public async Task Run_RefusesWhenPendingExists()
     {

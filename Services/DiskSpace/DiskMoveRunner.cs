@@ -310,12 +310,16 @@ public sealed class DiskMoveRunner
         _b.Dismount(ctx.SourceLock!);
     }
 
-    /// <summary>Undo of steps 1-2 (cancel, failed recheck, failure before step 3). Stops at the first failure,
-    /// keeping the journal while the source might still be hidden, so a resume can always finish.</summary>
+    /// <summary>Undo of steps 1-2 (cancel, failed recheck, failure before step 3). Order: (1) pending marker with
+    /// Undoing = true, (2) attributes + letter back, (3) delete the journal, (4) resize the source back, (5) delete the
+    /// marker last. Stops at the first failure; a resume then finishes the undo from the marker (+ journal).</summary>
     private void UndoBeforeMove(Ctx ctx)
     {
         var s = ctx.State;
         ctx.Progress.Report(new RunProgress(MoveStep.LockSource, 0, 0, "Undoing the changes"));
+        // Read-only first: the source must still be on this disk (also keeps a crashed process from touching the marker).
+        long size = _b.PartitionSize(ctx.Disk, s.SourceGuid);
+        WritePending(PendingFor(s, undoing: true));
         if (ctx.SourceHidden)
             _b.SetPartitionAttributes(ctx.Disk, s.SourceGuid, s.SourceGptAttributes);   // still locked: nothing mounts before
         ctx.ReleaseLocks();
@@ -323,7 +327,7 @@ public sealed class DiskMoveRunner
         ctx.SourceHidden = false;
         if (ctx.JournalCreated) _b.DeleteJournal(_journal);
         ctx.JournalCreated = false;
-        if (ctx.Shrunk) _b.ResizePartition(ctx.Disk, s.SourceGuid, s.SourceOriginalSize);
+        if (ctx.Shrunk || size != s.SourceOriginalSize) _b.ResizePartition(ctx.Disk, s.SourceGuid, s.SourceOriginalSize);
         ctx.Shrunk = false;
         DeletePending();
     }
@@ -344,9 +348,23 @@ public sealed class DiskMoveRunner
             if (File.Exists(PendingPath)) return UndoPending(progress);
             return new DiskMoveResult(DiskMoveOutcome.NothingToDo, null, []);
         }
-        var info = _b.ReadJournal(_journal, out var state);
+        var pending = ReadPending();
+        JournalInfo? info;
+        RestoreState? state;
+        try
+        {
+            info = _b.ReadJournal(_journal, out state);
+        }
+        catch (DiskMoveException ex) when (pending is not null)
+        {
+            // A marker next to an unreadable journal: the create was torn (the marker goes away right after a
+            // successful create) or an undo was running; either way no data has moved yet.
+            return UndoTornJournal(pending, progress, ex);
+        }
         if (info is null) return new DiskMoveResult(DiskMoveOutcome.NothingToDo, null, []);
         if (state is null) throw new DiskMoveException($"The journal {_journal} has no restore information.");
+        if (pending is { Undoing: true } && info.Step < MoveStep.MoveSource)
+            return UndoWithJournal(state, progress);   // finish the interrupted undo; nothing was moved
         DeletePending();   // a crash right after CreateJournal can leave both: the journal wins
 
         int disk = _b.FindDiskNumber(state.DiskGuid);
@@ -384,19 +402,44 @@ public sealed class DiskMoveRunner
         }
     }
 
+    /// <summary>An undo (cancel / failure before step 3) was interrupted while the journal still existed: restore
+    /// the attributes and letter, delete the journal, then give the source its size back (UndoPending).</summary>
+    private DiskMoveResult UndoWithJournal(RestoreState s, IProgress<RunProgress> progress)
+    {
+        progress.Report(new RunProgress(MoveStep.LockSource, 0, 0, "Finishing the interrupted undo"));
+        int disk = _b.FindDiskNumber(s.DiskGuid);
+        long start = _b.PartitionStart(disk, s.SourceGuid), size = _b.PartitionSize(disk, s.SourceGuid);
+        if (start != s.SourceStart || (size != s.SourceShrunkSize && size != s.SourceOriginalSize))
+            throw new DiskMoveStateMismatchException(
+                $"The source is at {start} (+{size} bytes), not where the journal left it; nothing was changed. Journal: {_journal}.");
+        if (_b.GetPartitionAttributes(disk, s.SourceGuid) != s.SourceGptAttributes)
+            _b.SetPartitionAttributes(disk, s.SourceGuid, s.SourceGptAttributes);   // nothing was moved: safe to show again
+        if (s.SourceLetter != '\0' && s.SourceVolumePath is not null) _b.AssignLetter(s.SourceVolumePath, s.SourceLetter);
+        _b.DeleteJournal(_journal);
+        return UndoPending(progress);
+    }
+
+    /// <summary>Pending marker + unreadable journal (m1): undo only if the source is provably untouched apart from
+    /// the shrink (visible, at its start, original or shrunk size); otherwise stop without changing anything.</summary>
+    private DiskMoveResult UndoTornJournal(PendingMove pending, IProgress<RunProgress> progress, Exception journalError)
+    {
+        int disk = _b.FindDiskNumber(pending.DiskGuid);
+        long size = _b.PartitionSize(disk, pending.SourceGuid);
+        ulong attrs = _b.GetPartitionAttributes(disk, pending.SourceGuid);
+        if ((attrs & GptHidden) != 0 || (size != pending.SourceOriginalSize && size != pending.SourceOriginalSize - pending.Amount))
+            throw new DiskMoveStateMismatchException(
+                $"The journal {_journal} cannot be read ({journalError.Message}) and the source is not in a state that is safe " +
+                "to undo automatically; nothing was changed.");
+        progress.Report(new RunProgress(MoveStep.LockSource, 0, 0, "The journal is incomplete; undoing the interrupted attempt"));
+        _b.DeleteJournal(_journal);
+        return UndoPending(progress);
+    }
+
     /// <summary>No journal but a pending marker: the attempt stopped in step 1 or 2 before any data moved. Never
     /// continue it silently: give the source its original size back and remove the marker.</summary>
     private DiskMoveResult UndoPending(IProgress<RunProgress> progress)
     {
-        PendingMove pending;
-        try
-        {
-            pending = PendingMove.FromJsonBytes(File.ReadAllBytes(PendingPath));
-        }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
-        {
-            throw new DiskMoveException($"The pending move marker {PendingPath} cannot be read: {ex.Message}", ex);
-        }
+        var pending = ReadPending() ?? throw new DiskMoveException($"The pending move marker {PendingPath} is gone.");
         progress.Report(new RunProgress(MoveStep.ShrinkSource, 0, 0, "Undoing the interrupted attempt"));
         int disk = _b.FindDiskNumber(pending.DiskGuid);
         long size = _b.PartitionSize(disk, pending.SourceGuid);
@@ -705,6 +748,23 @@ public sealed class DiskMoveRunner
     }
 
     private void DeletePending() => File.Delete(PendingPath);
+
+    private PendingMove PendingFor(RestoreState s, bool undoing) => new(s.DiskGuid, s.SourceGuid, s.SourceLetter,
+        s.SourceOriginalSize, s.TargetGuid, s.Amount, Now(), undoing);
+
+    /// <summary>The marker, or null if there is none.</summary>
+    private PendingMove? ReadPending()
+    {
+        if (!File.Exists(PendingPath)) return null;
+        try
+        {
+            return PendingMove.FromJsonBytes(File.ReadAllBytes(PendingPath));
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            throw new DiskMoveException($"The pending move marker {PendingPath} cannot be read: {ex.Message}", ex);
+        }
+    }
 
     private void SaveBackups(DiskSnapshot disk, int diskNo)
     {

@@ -58,6 +58,8 @@ public sealed class FakeDiskMoveBackend : IDiskMoveBackend
     /// <summary>Crash right after the state-changing call with this 1-based number has been applied.</summary>
     public int? CrashAtCall;
     public bool Dead { get; private set; }
+    /// <summary>Crash BEFORE a resize to this size is applied (a crash "during" the resize).</summary>
+    public long? CrashBeforeResizeTo;
     public int CallCount { get; private set; }
 
     public FakeDiskMoveBackend(bool withRecovery = true)
@@ -95,6 +97,8 @@ public sealed class FakeDiskMoveBackend : IDiskMoveBackend
     {
         Dead = false;
         CrashAtCall = null;
+        CrashBeforeResizeTo = null;
+        OnCall = null;
         foreach (var p in Parts) p.Locked = p.Dismounted = false;   // the process died: its handles are gone
     }
 
@@ -157,6 +161,12 @@ public sealed class FakeDiskMoveBackend : IDiskMoveBackend
         Disk(disk);
         var p = P(part);
         if (p.Size == newSize) return;
+        if (CrashBeforeResizeTo == newSize)
+        {
+            Dead = true;
+            foreach (var x in Parts) x.Locked = x.Dismounted = false;
+            throw new SimulatedCrashException();
+        }
         if (p.IsHidden || p.Locked) throw new InvalidOperationException($"fake: cannot resize hidden/locked {p.Name}");
         if (p.DataStart != p.Start) throw new InvalidOperationException($"fake: resize of {p.Name} whose data is elsewhere");
         NoOverlap(p, p.Start, newSize);
@@ -323,7 +333,15 @@ public sealed class FakeDiskMoveBackend : IDiskMoveBackend
         Alive();
         state = null;
         if (!File.Exists(path)) return null;
-        var j = Load(path);
+        JFile j;
+        try
+        {
+            j = Load(path);
+        }
+        catch (JsonException ex)
+        {
+            throw new DiskMoveException("fake: DM_E_JOURNAL_CORRUPT", ex);
+        }
         state = RestoreState.FromJsonBytes(j.App);
         return new JournalInfo(j.Moves.Count, (MoveStep)j.Step, j.MoveIndex, j.ChunksDone, j.ChunkCount);
     }
