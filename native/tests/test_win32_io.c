@@ -446,6 +446,102 @@ static void layout_rejects_bad_moves(void)
     ASSERT_TRUE(memcmp(&b, &before, sizeof b) == 0);
 }
 
+static void layout_sets_attributes(void)
+{
+    layout_buf b, before;
+    make_layout(&b);
+    before = b;
+    uint8_t id[16]; memset(id, 0x41, 16);
+    const uint64_t hidden = DMW_GPT_ATTRIBUTE_HIDDEN | DMW_GPT_ATTRIBUTE_NO_DRIVE_LETTER | 1;
+    uint64_t old = 0;
+    int changed = -1;
+    ASSERT_EQ_INT(dmw_layout_set_attributes(&b.hdr, id, hidden, &old, &changed), DM_OK);
+    ASSERT_EQ_INT(changed, 1);
+    ASSERT_EQ_U64(old, 0x8000000000000001ull);
+    PARTITION_INFORMATION_EX *p = &b.hdr.PartitionEntry[1];
+    ASSERT_EQ_U64(p->Gpt.Attributes, hidden);
+    ASSERT_TRUE(p->RewritePartition);
+    /* Nothing else moves: offset, length, type, id, name, other entries, header. */
+    ASSERT_EQ_U64(p->StartingOffset.QuadPart, before.hdr.PartitionEntry[1].StartingOffset.QuadPart);
+    ASSERT_EQ_U64(p->PartitionLength.QuadPart, before.hdr.PartitionEntry[1].PartitionLength.QuadPart);
+    ASSERT_TRUE(memcmp(&p->Gpt.PartitionType, &before.hdr.PartitionEntry[1].Gpt.PartitionType, sizeof(GUID)) == 0);
+    ASSERT_TRUE(memcmp(&p->Gpt.PartitionId, &before.hdr.PartitionEntry[1].Gpt.PartitionId, sizeof(GUID)) == 0);
+    ASSERT_TRUE(memcmp(p->Gpt.Name, before.hdr.PartitionEntry[1].Gpt.Name, sizeof p->Gpt.Name) == 0);
+    ASSERT_TRUE(memcmp(&b.hdr.PartitionEntry[0], &before.hdr.PartitionEntry[0], sizeof *p) == 0);
+    ASSERT_TRUE(memcmp(&b.hdr.PartitionEntry[2], &before.hdr.PartitionEntry[2], sizeof *p) == 0);
+    ASSERT_TRUE(memcmp(&b.hdr.Gpt, &before.hdr.Gpt, sizeof b.hdr.Gpt) == 0);
+
+    /* Idempotent; restoring gives the original back. */
+    before = b;
+    ASSERT_EQ_INT(dmw_layout_set_attributes(&b.hdr, id, hidden, &old, &changed), DM_OK);
+    ASSERT_EQ_INT(changed, 0);
+    ASSERT_EQ_U64(old, hidden);
+    ASSERT_TRUE(memcmp(&b, &before, sizeof b) == 0);
+    ASSERT_EQ_INT(dmw_layout_set_attributes(&b.hdr, id, 0x8000000000000001ull, NULL, &changed), DM_OK);
+    ASSERT_EQ_INT(changed, 1);
+    ASSERT_EQ_U64(p->Gpt.Attributes, 0x8000000000000001ull);
+
+    memset(id, 0x77, 16);
+    ASSERT_EQ_INT(dmw_layout_set_attributes(&b.hdr, id, hidden, &old, &changed), DM_E_NOT_FOUND);
+    memset(id, 0x41, 16);
+    b.hdr.PartitionStyle = PARTITION_STYLE_MBR;
+    ASSERT_EQ_INT(dmw_layout_set_attributes(&b.hdr, id, hidden, &old, &changed), DM_E_INVALID_ARG);
+    ASSERT_EQ_INT(dmw_layout_set_attributes(NULL, id, hidden, &old, &changed), DM_E_INVALID_ARG);
+}
+
+typedef union extents_buf {
+    VOLUME_DISK_EXTENTS e;
+    uint8_t raw[sizeof(VOLUME_DISK_EXTENTS) + sizeof(DISK_EXTENT)];
+} extents_buf;
+
+static void volume_extent_match(void)
+{
+    extents_buf b;
+    memset(&b, 0, sizeof b);
+    b.e.NumberOfDiskExtents = 1;
+    b.e.Extents[0].DiskNumber = 3;
+    b.e.Extents[0].StartingOffset.QuadPart = (LONGLONG)(1025 * MIB);
+    b.e.Extents[0].ExtentLength.QuadPart = (LONGLONG)(512 * MIB);
+    ASSERT_EQ_INT(dmw_extents_match(&b.e, 3, 1025 * MIB, 512 * MIB), DM_OK);
+    ASSERT_EQ_INT(dmw_extents_match(&b.e, 2, 1025 * MIB, 512 * MIB), DM_E_INVALID_ARG);       /* other disk */
+    ASSERT_EQ_INT(dmw_extents_match(&b.e, 3, 1024 * MIB, 512 * MIB), DM_E_INVALID_ARG);       /* other start */
+    ASSERT_EQ_INT(dmw_extents_match(&b.e, 3, 1025 * MIB, 511 * MIB), DM_E_INVALID_ARG);       /* other length */
+    ASSERT_EQ_INT(dmw_extents_match(&b.e, 3, 1025 * MIB, 512 * MIB + 4096), DM_E_INVALID_ARG);
+    /* A spanned volume (2 extents) never matches, even if the first extent does. */
+    b.e.NumberOfDiskExtents = 2;
+    DISK_EXTENT *second = (DISK_EXTENT *)(b.raw + sizeof(VOLUME_DISK_EXTENTS));
+    second->DiskNumber = 4;
+    ASSERT_EQ_INT(dmw_extents_match(&b.e, 3, 1025 * MIB, 512 * MIB), DM_E_INVALID_ARG);
+    b.e.NumberOfDiskExtents = 0;
+    ASSERT_EQ_INT(dmw_extents_match(&b.e, 3, 1025 * MIB, 512 * MIB), DM_E_INVALID_ARG);
+    ASSERT_EQ_INT(dmw_extents_match(NULL, 3, 1025 * MIB, 512 * MIB), DM_E_INVALID_ARG);
+}
+
+/* The disk-only entry points refuse a plain file (no device IOCTLs) and leave it untouched. */
+static void disk_only_calls_refuse_plain_file(void)
+{
+    wchar_t path[MAX_PATH], none[MAX_PATH];
+    temp_path(path, L"plain");
+    temp_path(none, L"none");
+    uint8_t data[4096];
+    memset(data, 0x5A, sizeof data);
+    ASSERT_TRUE(write_file(path, data, sizeof data));
+    uint8_t id[16]; memset(id, 0x41, 16);
+    uint32_t n = 77;
+    uint64_t old = 0;
+    ASSERT_TRUE(dmw_disk_number(path, &n) != DM_OK);
+    ASSERT_EQ_U32(n, 77);
+    ASSERT_EQ_INT(dmw_disk_number(none, &n), DM_E_NOT_FOUND);
+    ASSERT_TRUE(dmw_set_partition_attributes(path, id, DMW_GPT_ATTRIBUTE_HIDDEN, &old) != DM_OK);
+    ASSERT_EQ_INT(dmw_set_partition_attributes(none, id, DMW_GPT_ATTRIBUTE_HIDDEN, &old), DM_E_NOT_FOUND);
+    ASSERT_TRUE(dmw_set_partition_start(path, id, MIB) != DM_OK);
+    uint64_t size = 0;
+    uint8_t *got = read_file(path, &size);
+    ASSERT_TRUE(got && size == sizeof data && memcmp(got, data, sizeof data) == 0);
+    free(got);
+    DeleteFileW(path);
+}
+
 static void misc_args(void)
 {
     dmw_volume *v = (dmw_volume *)1;
@@ -456,6 +552,12 @@ static void misc_args(void)
     ASSERT_EQ_INT(dmw_free(NULL), DM_OK);
     uint8_t id[16] = { 0 };
     ASSERT_EQ_INT(dmw_set_partition_start(NULL, id, MIB), DM_E_INVALID_ARG);
+    ASSERT_EQ_INT(dmw_set_partition_attributes(NULL, id, 0, NULL), DM_E_INVALID_ARG);
+    ASSERT_EQ_INT(dmw_set_partition_attributes(L"x", NULL, 0, NULL), DM_E_INVALID_ARG);
+    ASSERT_EQ_INT(dmw_volume_verify(NULL, 0, 0, MIB), DM_E_INVALID_ARG);
+    uint32_t dn = 0;
+    ASSERT_EQ_INT(dmw_disk_number(NULL, &dn), DM_E_INVALID_ARG);
+    ASSERT_EQ_INT(dmw_disk_number(L"x", NULL), DM_E_INVALID_ARG);
     ASSERT_EQ_INT(dmw_journal_create(NULL, NULL, 0, NULL, 0), DM_E_INVALID_ARG);
     ASSERT_EQ_INT(dmw_status_from_win32(ERROR_ACCESS_DENIED), DM_E_ACCESS);
     ASSERT_EQ_INT(dmw_status_from_win32(ERROR_FILE_NOT_FOUND), DM_E_NOT_FOUND);
@@ -477,5 +579,8 @@ void dm_run_win32_io(void)
     DM_RUN(patch_rejects_and_skips);
     DM_RUN(layout_moves_partition);
     DM_RUN(layout_rejects_bad_moves);
+    DM_RUN(layout_sets_attributes);
+    DM_RUN(volume_extent_match);
+    DM_RUN(disk_only_calls_refuse_plain_file);
     DM_RUN(misc_args);
 }

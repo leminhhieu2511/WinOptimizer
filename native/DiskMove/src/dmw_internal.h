@@ -34,4 +34,12 @@ dm_status dmw_journal_create_ex(const wchar_t *path, const dm_move_plan *moves, 
 dm_status dmw_layout_move_partition(DRIVE_LAYOUT_INFORMATION_EX *layout, const uint8_t partition_guid[16],
                                     uint64_t new_start, uint32_t sector_size, int *changed);
 
+/* Pure part of dmw_set_partition_attributes. *old_attributes (may be NULL) gets the previous value;
+   *changed = 0 when the attributes already match. */
+dm_status dmw_layout_set_attributes(DRIVE_LAYOUT_INFORMATION_EX *layout, const uint8_t partition_guid[16],
+                                    uint64_t attributes, uint64_t *old_attributes, int *changed);
+
+/* Pure part of dmw_volume_verify. */
+dm_status dmw_extents_match(const VOLUME_DISK_EXTENTS *ext, uint32_t disk_number, uint64_t start, uint64_t length);
+
 #endif /* DISKMOVE_DMW_INTERNAL_H */

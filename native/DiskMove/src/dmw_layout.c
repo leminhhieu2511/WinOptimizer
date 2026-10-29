@@ -25,11 +25,33 @@ dm_status dmw_layout_move_partition(DRIVE_LAYOUT_INFORMATION_EX *layout, const u
     if (new_start < lo || end > hi) return DM_E_INVALID_ARG;
     for (DWORD i = 0; i < layout->PartitionCount; i++) {
         if (&e[i] == target || e[i].PartitionLength.QuadPart <= 0) continue;
-        uint64_t os = (uint64_t)e[i].StartingOffset.QuadPart, oe = os + (uint64_t)e[i].PartitionLength.QuadPart;
+        uint64_t os = (uint64_t)e[i].StartingOffset.QuadPart, ol = (uint64_t)e[i].PartitionLength.QuadPart;
+        uint64_t oe = os > UINT64_MAX - ol ? UINT64_MAX : os + ol;
         if (new_start < oe && os < end) return DM_E_INVALID_ARG;
     }
 
     target->StartingOffset.QuadPart = (LONGLONG)new_start;
+    target->RewritePartition = TRUE;
+    *changed = 1;
+    return DM_OK;
+}
+
+dm_status dmw_layout_set_attributes(DRIVE_LAYOUT_INFORMATION_EX *layout, const uint8_t partition_guid[16],
+                                     uint64_t attributes, uint64_t *old_attributes, int *changed)
+{
+    if (!layout || !partition_guid || !changed) return DM_E_INVALID_ARG;
+    *changed = 0;
+    if (layout->PartitionStyle != PARTITION_STYLE_GPT) return DM_E_INVALID_ARG;
+    PARTITION_INFORMATION_EX *target = NULL;
+    for (DWORD i = 0; i < layout->PartitionCount; i++)
+        if (memcmp(&layout->PartitionEntry[i].Gpt.PartitionId, partition_guid, sizeof(GUID)) == 0) {
+            target = &layout->PartitionEntry[i];
+            break;
+        }
+    if (!target) return DM_E_NOT_FOUND;
+    if (old_attributes) *old_attributes = target->Gpt.Attributes;
+    if (target->Gpt.Attributes == attributes) return DM_OK;   /* already set */
+    target->Gpt.Attributes = attributes;
     target->RewritePartition = TRUE;
     *changed = 1;
     return DM_OK;
@@ -42,10 +64,12 @@ static dm_status ioctl(HANDLE h, DWORD code, void *in, DWORD in_len, void *out, 
     return DM_OK;
 }
 
-DMW_API dm_status DMW_CALL dmw_set_partition_start(const wchar_t *disk_path, const uint8_t partition_guid[16],
-                                                   uint64_t new_start)
+/* One layout edit: GET_DRIVE_LAYOUT_EX -> edit -> SET_DRIVE_LAYOUT_EX (only if changed) ->
+   IOCTL_DISK_UPDATE_PROPERTIES (always, so a retry after a failed refresh still refreshes). */
+typedef dm_status (*layout_edit_fn)(DRIVE_LAYOUT_INFORMATION_EX *lay, uint32_t sector_size, void *ctx, int *changed);
+
+static dm_status edit_layout(const wchar_t *disk_path, layout_edit_fn edit, void *ctx)
 {
-    if (!disk_path || !disk_path[0] || !partition_guid) return DM_E_INVALID_ARG;
     HANDLE h = CreateFileW(disk_path, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
                            OPEN_EXISTING, 0, NULL);
     if (h == INVALID_HANDLE_VALUE) return dmw_status_from_win32(GetLastError());
@@ -68,17 +92,53 @@ DMW_API dm_status DMW_CALL dmw_set_partition_start(const wchar_t *disk_path, con
     }
 
     int changed = 0;
-    if (s == DM_OK) s = dmw_layout_move_partition(lay, partition_guid, new_start, geo.Geometry.BytesPerSector, &changed);
+    if (s == DM_OK) s = edit(lay, geo.Geometry.BytesPerSector, ctx, &changed);
     if (s == DM_OK && changed) {
         DWORD in_len = (DWORD)(FIELD_OFFSET(DRIVE_LAYOUT_INFORMATION_EX, PartitionEntry) +
                                lay->PartitionCount * sizeof(PARTITION_INFORMATION_EX));
         s = ioctl(h, IOCTL_DISK_SET_DRIVE_LAYOUT_EX, lay, in_len, NULL, 0);
-        if (s == DM_OK) s = ioctl(h, IOCTL_DISK_UPDATE_PROPERTIES, NULL, 0, NULL, 0);
     }
+    if (s == DM_OK) s = ioctl(h, IOCTL_DISK_UPDATE_PROPERTIES, NULL, 0, NULL, 0);
     free(lay);
     CloseHandle(h);
     return s;
 }
+
+typedef struct move_ctx { const uint8_t *guid; uint64_t new_start; } move_ctx;
+
+static dm_status edit_move(DRIVE_LAYOUT_INFORMATION_EX *lay, uint32_t sector_size, void *ctx, int *changed)
+{
+    move_ctx *m = (move_ctx *)ctx;
+    return dmw_layout_move_partition(lay, m->guid, m->new_start, sector_size, changed);
+}
+
+DMW_API dm_status DMW_CALL dmw_set_partition_start(const wchar_t *disk_path, const uint8_t partition_guid[16],
+                                                   uint64_t new_start)
+{
+    if (!disk_path || !disk_path[0] || !partition_guid) return DM_E_INVALID_ARG;
+    move_ctx m = { partition_guid, new_start };
+    return edit_layout(disk_path, edit_move, &m);
+}
+
+typedef struct attr_ctx { const uint8_t *guid; uint64_t attributes, old; } attr_ctx;
+
+static dm_status edit_attributes(DRIVE_LAYOUT_INFORMATION_EX *lay, uint32_t sector_size, void *ctx, int *changed)
+{
+    (void)sector_size;
+    attr_ctx *a = (attr_ctx *)ctx;
+    return dmw_layout_set_attributes(lay, a->guid, a->attributes, &a->old, changed);
+}
+
+DMW_API dm_status DMW_CALL dmw_set_partition_attributes(const wchar_t *disk_path, const uint8_t partition_guid[16],
+                                                        uint64_t attributes, uint64_t *old_attributes)
+{
+    if (!disk_path || !disk_path[0] || !partition_guid) return DM_E_INVALID_ARG;
+    attr_ctx a = { partition_guid, attributes, 0 };
+    dm_status s = edit_layout(disk_path, edit_attributes, &a);
+    if (s == DM_OK && old_attributes) *old_attributes = a.old;
+    return s;
+}
+
 
 #define BOOT_WINDOW 4096u
 

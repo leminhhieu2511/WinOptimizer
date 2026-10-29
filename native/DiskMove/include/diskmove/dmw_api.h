@@ -34,6 +34,12 @@ DMW_API dm_status DMW_CALL dmw_volume_lock(const wchar_t *volume_path, dmw_volum
 DMW_API dm_status DMW_CALL dmw_volume_dismount(dmw_volume *v);
 /* Closes the handle, which releases the lock. NULL is ignored. */
 DMW_API void      DMW_CALL dmw_volume_close(dmw_volume *v);
+/* IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS: DM_OK only if the volume is exactly one extent on disk_number
+   with StartingOffset == start and ExtentLength == length; otherwise DM_E_INVALID_ARG. Call it right after
+   dmw_volume_lock, before any write. */
+DMW_API dm_status DMW_CALL dmw_volume_verify(dmw_volume *v, uint32_t disk_number, uint64_t start, uint64_t length);
+/* IOCTL_STORAGE_GET_DEVICE_NUMBER of a disk path ("\\.\PhysicalDriveN"); DM_E_INVALID_ARG if not a disk. */
+DMW_API dm_status DMW_CALL dmw_disk_number(const wchar_t *disk_path, uint32_t *out);
 
 /* Creates (CREATE_ALWAYS: truncates any old file) the journal with a protected DACL granting only
    Administrators + SYSTEM full control, then writes it through (FILE_FLAG_WRITE_THROUGH + flush).
@@ -56,6 +62,15 @@ DMW_API dm_status DMW_CALL dmw_run_move(const wchar_t *disk_path, const wchar_t 
    another partition or leaves the usable LBA range; DM_E_NOT_FOUND if no entry has that GUID. */
 DMW_API dm_status DMW_CALL dmw_set_partition_start(const wchar_t *disk_path, const uint8_t partition_guid[16],
                                                    uint64_t new_start);
+
+#define DMW_GPT_ATTRIBUTE_HIDDEN          0x4000000000000000ull   /* GPT_BASIC_DATA_ATTRIBUTE_HIDDEN */
+#define DMW_GPT_ATTRIBUTE_NO_DRIVE_LETTER 0x8000000000000000ull   /* GPT_BASIC_DATA_ATTRIBUTE_NO_DRIVE_LETTER */
+
+/* Sets the GPT attributes of the entry with this PartitionId (same GET/SET_DRIVE_LAYOUT_EX +
+   IOCTL_DISK_UPDATE_PROPERTIES path as dmw_set_partition_start). Idempotent: no SET if unchanged.
+   *old_attributes (may be NULL) receives the attributes found before the call. */
+DMW_API dm_status DMW_CALL dmw_set_partition_attributes(const wchar_t *disk_path, const uint8_t partition_guid[16],
+                                                        uint64_t attributes, uint64_t *old_attributes);
 
 /* Sets HiddenSectors (u32 at 0x1C) = start / sector_size in the NTFS boot sector at start and the backup
    boot sector at start + length - sector_size. Sectors whose OEM ID is not "NTFS    " are left alone;
