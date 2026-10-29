@@ -65,6 +65,15 @@ dm_status dm_journal_load_move(const dm_io *j, uint32_t move_index, dm_move_plan
                                dm_extent **chunks, uint32_t *chunk_count);
 dm_status dm_journal_progress(const dm_io *j, uint32_t move_index, uint64_t chunks_done, uint64_t last_hash);
 
+/* ---- Backward chunk mover ---- */
+/* Return non-zero to request a stop; the core only stops between two chunks. */
+typedef int (*dm_progress_cb)(void *user, uint64_t bytes_done, uint64_t bytes_total);
+/* Runs (or resumes) move move_index from the journal. On completion returns DM_OK and the journal slot
+   has chunks_done == chunk_count. Moves run in order: a finished move returns DM_OK without I/O; starting
+   move i+1 before move i is complete returns DM_E_JOURNAL_MISMATCH. progress may be NULL. */
+dm_status dm_run_move(const dm_io *disk, const dm_io *journal, uint32_t move_index,
+                      dm_progress_cb progress, void *user);
+
 #ifdef __cplusplus
 }
 #endif
