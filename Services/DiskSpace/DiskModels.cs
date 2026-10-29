@@ -17,6 +17,38 @@ public interface IDiskLayoutSource
     IReadOnlyList<DiskSnapshot> GetDisks();
 }
 
+/// <summary>A process or service holding a handle on the source volume.</summary>
+public sealed record LockHolder(string Name, int ProcessId, bool IsService, bool CanClose);
+
+/// <summary>Machine-wide facts gathered before the prechecks run.</summary>
+/// <param name="BitLockerStatus">Per drive letter; "FullyDecrypted" is the only OK value. A missing letter counts as unknown.</param>
+/// <param name="SourceChkdskExitCode">Null = not checked yet.</param>
+/// <param name="SourceMinSize">Smallest size the source can shrink to; null = not measured yet.</param>
+public sealed record SystemFacts(bool IsAdmin, bool OnBattery, bool RebootPending,
+    IReadOnlyList<string> PagefilePaths, IReadOnlyDictionary<char, string> BitLockerStatus,
+    int BcdOsCount, int? SourceChkdskExitCode, long? SourceMinSize,
+    IReadOnlyList<LockHolder> SourceLockHolders, bool JournalExists);
+
+public enum CheckSeverity { Blocker, FixFirst, Warning }
+
+public enum CheckCode
+{
+    NotAdmin, DifferentDisk, NotBasicGpt, SourceNotNtfs, SourceBitLocker, WindowsOnSource,
+    MultipleOs, ForeignPartitionBetween, SourceFsErrors, DiskUnhealthy, TooLittleSpace,
+    SourceInUse, PagefileOnSource, OnBattery, RebootPending, JournalExists,
+    Backup, TargetBitLocker, SyncAppsOnSource, Duration,
+    UnalignedPartition
+}
+
+public sealed record CheckResult(CheckSeverity Severity, CheckCode Code, string Message);
+
+/// <summary>What the move will do. The whole of every shifted partition is copied, not just its used space.</summary>
+/// <param name="PartitionsToShift">Farthest from the target first: the source, then the Recovery partition between if any.</param>
+public sealed record MovePlan(long Amount, IReadOnlyList<PartitionSnapshot> PartitionsToShift, bool HasRecovery)
+{
+    public long BytesToCopy => PartitionsToShift.Sum(p => p.Size);
+}
+
 /// <summary>Well-known GPT partition type GUIDs.</summary>
 public static class PartitionTypes
 {
