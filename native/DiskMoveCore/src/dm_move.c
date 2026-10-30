@@ -4,6 +4,14 @@
  * (or free space): the source of the first unrecorded chunk is always intact and re-running it after a
  * crash is safe. Per chunk: read source, write destination, flush, read back and compare (re-write up to
  * VERIFY_RETRIES more times), then record progress in the journal.
+ *
+ * Boot sectors (journal v2). After a crash the half-moved partition is hidden, but Windows may still mount its
+ * OLD-offset volume device (seen on re-enumeration after any layout change) and write to it. So before chunk 0 of
+ * a fresh move (chunks_done == 0 only) the old first sector and the old backup boot sector are zeroed: a file
+ * system can then never recognise the old view. Never with chunks_done > 0: the old backup sector may already lie
+ * inside the copied destination. Because those two sectors are copied as zeros, the original ones (saved in the
+ * journal header by the caller before any write) are written to the destination after the last chunk, read back,
+ * and the journal records boot_restored. A complete move without that record re-applies the restore on entry.
  */
 #include <diskmove/dm_core.h>
 #include <stdlib.h>
@@ -50,10 +58,10 @@ static dm_status check_chunks(const dm_move_plan *p, const dm_extent *c, uint32_
     return DM_OK;
 }
 
-static dm_status copy_chunk(const dm_io *d, uint64_t src, uint64_t dst, uint32_t len, uint8_t *buf, uint8_t *chk)
+/* Writes buf to dst, flushes, reads back and compares (re-writes up to VERIFY_RETRIES more times). */
+static dm_status write_verified(const dm_io *d, uint64_t dst, const uint8_t *buf, uint32_t len, uint8_t *chk)
 {
-    dm_status s = d->read(d->ctx, src, buf, len);
-    if (s != DM_OK) return s;
+    dm_status s;
     for (int attempt = 0; attempt <= VERIFY_RETRIES; attempt++) {
         s = d->write(d->ctx, dst, buf, len);
         if (s == DM_OK) s = d->flush(d->ctx);
@@ -62,6 +70,45 @@ static dm_status copy_chunk(const dm_io *d, uint64_t src, uint64_t dst, uint32_t
         if (memcmp(buf, chk, len) == 0) return DM_OK;
     }
     return DM_E_VERIFY;
+}
+
+static dm_status copy_chunk(const dm_io *d, uint64_t src, uint64_t dst, uint32_t len, uint8_t *buf, uint8_t *chk)
+{
+    dm_status s = d->read(d->ctx, src, buf, len);
+    if (s != DM_OK) return s;
+    return write_verified(d, dst, buf, len, chk);
+}
+
+/* Zeroes the old first sector and the old backup boot sector, then flushes. Only before chunk 0. */
+static dm_status boot_invalidate(const dm_io *d, const dm_move_plan *p, uint8_t *buf)
+{
+    const uint32_t ss = p->sector_size;
+    memset(buf, 0, ss);
+    dm_status s = d->write(d->ctx, p->old_start, buf, ss);
+    if (s == DM_OK && p->length > ss) s = d->write(d->ctx, p->old_start + p->length - ss, buf, ss);
+    if (s == DM_OK) s = d->flush(d->ctx);
+    return s;
+}
+
+/* Writes the saved boot sectors of move i at its destination (verified), then records boot_restored.
+   Idempotent: running it again writes the same bytes. */
+static dm_status boot_restore(const dm_io *d, const dm_io *j, uint32_t move_index, uint8_t *buf, uint8_t *chk)
+{
+    dm_move_plan p;
+    dm_extent *ch = NULL;
+    uint32_t n = 0;
+    dm_status s = dm_journal_load_move(j, move_index, &p, &ch, &n);
+    dm_free(ch);
+    if (s != DM_OK) return s;
+    if (dm_plan_validate(&p) != DM_OK || p.sector_size > DM_MAX_SECTOR) return DM_E_JOURNAL_CORRUPT;
+    const uint32_t ss = p.sector_size;
+    const uint64_t dst = p.old_start + p.shift;
+    uint8_t *first = buf, *backup = buf + DM_MAX_SECTOR;
+    s = dm_journal_load_boot(j, move_index, first, backup);
+    if (s == DM_OK) s = write_verified(d, dst, first, ss, chk);
+    if (s == DM_OK && p.length > ss) s = write_verified(d, dst + p.length - ss, backup, ss, chk);
+    if (s == DM_OK) s = dm_journal_boot_restored(j, move_index);
+    return s;
 }
 
 dm_status dm_run_move(const dm_io *disk, const dm_io *journal, uint32_t move_index,
@@ -77,13 +124,16 @@ dm_status dm_run_move(const dm_io *disk, const dm_io *journal, uint32_t move_ind
     if (info.move_index >= info.move_count) return DM_E_JOURNAL_CORRUPT;
 
     uint64_t start;
+    int restore_prev = 0;
     if (move_index < info.move_index) return DM_OK;                    /* finished earlier */
     if (move_index > info.move_index) {
         if (move_index != info.move_index + 1 || info.chunks_done != info.chunk_count[info.move_index])
             return DM_E_JOURNAL_MISMATCH;
+        restore_prev = !info.boot_restored;   /* crashed between move i's last chunk and its restore */
         start = 0;
     } else {
         start = info.chunks_done;
+        if (start == info.chunk_count[move_index] && info.boot_restored) return DM_OK;   /* complete: no I/O */
     }
 
     dm_move_plan plan;
@@ -93,18 +143,30 @@ dm_status dm_run_move(const dm_io *disk, const dm_io *journal, uint32_t move_ind
     if (s != DM_OK) return s;
     abuf a = { NULL, NULL }, b = { NULL, NULL };
     if (n != info.chunk_count[move_index] || start > n) { s = DM_E_JOURNAL_CORRUPT; goto done; }
-    if (start == n) goto done;                                         /* already complete */
     s = check_chunks(&plan, ch, n);
     if (s != DM_OK) goto done;
+    if (!abuf_alloc(&a) || !abuf_alloc(&b)) { s = DM_E_NOMEM; goto done; }
+
+    if (restore_prev) {
+        s = boot_restore(disk, journal, info.move_index, a.p, b.p);
+        if (s != DM_OK) goto done;
+    }
+    if (start == n) {                                                  /* complete, restore not recorded */
+        s = boot_restore(disk, journal, move_index, a.p, b.p);
+        goto done;
+    }
 
     uint64_t total = 0, done_bytes = 0;
     for (uint32_t i = 0; i < n; i++) {
         total += ch[i].length;
         if (i < start) done_bytes += ch[i].length;
     }
-    if (!abuf_alloc(&a) || !abuf_alloc(&b)) { s = DM_E_NOMEM; goto done; }
 
     if (progress && progress(user, done_bytes, total)) { s = DM_E_STOPPED; goto done; }
+    if (start == 0) {                                                  /* never once a chunk is recorded */
+        s = boot_invalidate(disk, &plan, a.p);
+        if (s != DM_OK) goto done;
+    }
     for (uint32_t i = (uint32_t)start; i < n; i++) {
         const uint32_t len = (uint32_t)ch[i].length;
         const uint64_t src = plan.old_start + ch[i].offset;
@@ -115,6 +177,7 @@ dm_status dm_run_move(const dm_io *disk, const dm_io *journal, uint32_t move_ind
         done_bytes += len;
         if (progress && progress(user, done_bytes, total) && i + 1 < n) { s = DM_E_STOPPED; goto done; }
     }
+    s = boot_restore(disk, journal, move_index, a.p, b.p);
 done:
     free(a.raw);
     free(b.raw);

@@ -2,15 +2,19 @@
  * Crash-safe journal. Layout (all little-endian):
  *
  * Header, written once by dm_journal_create:
- *   0   magic "WODMJRN1" (8)      8  version u32 = 1     12 header_size u32 (used bytes rounded to 4096)
+ *   0   magic "WODMJRN1" (8)      8  version u32 = 2     12 header_size u32 (used bytes rounded to 4096)
  *   16  move_count u32            20 app_len u32         24 app blob (app_len bytes)
  *   then per move: disk_guid[16] partition_guid[16] sector_size u32 old_start u64 length u64 shift u64
- *                  chunk_count u64, chunk_count * { offset u64, length u64 }
+ *                  chunk_count u64 (68 bytes),
+ *                  boot_first[sector_size] boot_backup[sector_size]   (v2: the saved original boot sectors),
+ *                  chunk_count * { offset u64, length u64 }
  *   then CRC32C (u32) of every preceding header byte; zero padding up to header_size.
  * Slots, 4096 bytes each at header_size and header_size + 4096:
- *   0 seq u64, 8 step u32, 12 move_index u32, 16 chunks_done u64, 24 last_hash u64, 4092 crc32c u32
+ *   0 seq u64, 8 step u32, 12 move_index u32, 16 chunks_done u64, 24 last_hash u64,
+ *   32 boot_restored u32 (v2), 4092 crc32c u32
  *   (CRC covers bytes 0..4091, i.e. the fields plus zero padding, so a write torn after a sector
  *   boundary can never produce a valid slot).
+ * Any other version (v1 had no boot sectors and no boot_restored) is DM_E_JOURNAL_CORRUPT.
  */
 #include <diskmove/dm_core.h>
 #include <stdlib.h>
@@ -22,6 +26,7 @@
 #define SLOT_CRC    (SLOT_SIZE - 4u)
 #define HDR_ALIGN   4096u
 #define HDR_MAX     (1u << 30)
+#define JRN_VERSION 2u
 
 static const uint8_t k_magic[8] = { 'W', 'O', 'D', 'M', 'J', 'R', 'N', '1' };
 
@@ -30,20 +35,27 @@ static void put64(uint8_t *p, uint64_t v) { for (int i = 0; i < 8; i++) p[i] = (
 static uint32_t get32(const uint8_t *p) { uint32_t v = 0; for (int i = 3; i >= 0; i--) v = (v << 8) | p[i]; return v; }
 static uint64_t get64(const uint8_t *p) { uint64_t v = 0; for (int i = 7; i >= 0; i--) v = (v << 8) | p[i]; return v; }
 
-typedef struct slot { uint64_t seq; uint32_t step, move_index; uint64_t chunks_done, last_hash; } slot;
+typedef struct slot {
+    uint64_t seq; uint32_t step, move_index; uint64_t chunks_done, last_hash; uint32_t boot_restored;
+} slot;
 
 typedef struct hdr {
     uint8_t *buf;                       /* NULL when only the prefix was loaded */
     uint32_t size, move_count, app_len, crc;   /* crc = stored header CRC32C (binds the slots) */
     uint64_t move_off[DM_MAX_MOVES];    /* offset of each move record */
     uint64_t move_chunks[DM_MAX_MOVES];
+    uint32_t move_sector[DM_MAX_MOVES];
 } hdr;
+
+/* Bytes of a move record before its chunk list. */
+static uint64_t move_rec_size(uint32_t sector_size) { return MOVE_FIXED + 2ull * sector_size; }
+static int sector_ok(uint32_t ss) { return ss == 512u || ss == 4096u; }
 
 static void slot_encode(uint8_t *b, const slot *s, uint32_t bind)
 {
     memset(b, 0, SLOT_SIZE);
     put64(b, s->seq); put32(b + 8, s->step); put32(b + 12, s->move_index);
-    put64(b + 16, s->chunks_done); put64(b + 24, s->last_hash);
+    put64(b + 16, s->chunks_done); put64(b + 24, s->last_hash); put32(b + 32, s->boot_restored);
     put32(b + SLOT_CRC, dm_crc32c(bind, b, SLOT_CRC));
 }
 
@@ -53,7 +65,7 @@ static int slot_decode(const uint8_t *b, slot *s, uint32_t bind)
     s->seq = get64(b);
     if (s->seq < 1) return 0;
     s->step = get32(b + 8); s->move_index = get32(b + 12);
-    s->chunks_done = get64(b + 16); s->last_hash = get64(b + 24);
+    s->chunks_done = get64(b + 16); s->last_hash = get64(b + 24); s->boot_restored = get32(b + 32);
     return 1;
 }
 
@@ -64,7 +76,7 @@ static dm_status hdr_prefix(const dm_io *j, uint8_t *prefix, uint32_t *header_si
 {
     dm_status s = j->read(j->ctx, 0, prefix, HDR_ALIGN);
     if (s != DM_OK) return s;
-    if (memcmp(prefix, k_magic, 8) != 0 || get32(prefix + 8) != 1) return DM_E_JOURNAL_CORRUPT;
+    if (memcmp(prefix, k_magic, 8) != 0 || get32(prefix + 8) != JRN_VERSION) return DM_E_JOURNAL_CORRUPT;
     uint32_t hs = get32(prefix + 12);
     if (hs < HDR_ALIGN || hs % HDR_ALIGN || hs > HDR_MAX) return DM_E_JOURNAL_CORRUPT;
     *header_size = hs;
@@ -92,8 +104,11 @@ static dm_status hdr_load(const dm_io *j, hdr *h)
     for (uint32_t i = 0; i < h->move_count; i++) {
         if (pos + MOVE_FIXED > h->size) goto corrupt;
         h->move_off[i] = pos;
+        uint32_t ss = get32(h->buf + pos + 32);
         uint64_t cc = get64(h->buf + pos + 60);
-        pos += MOVE_FIXED;
+        if (!sector_ok(ss) || pos + move_rec_size(ss) > h->size) goto corrupt;
+        h->move_sector[i] = ss;
+        pos += move_rec_size(ss);
         if (cc > (h->size - pos) / 16) goto corrupt;
         h->move_chunks[i] = cc;
         pos += cc * 16;
@@ -143,13 +158,15 @@ static dm_status hdr_stored_crc(const dm_io *j, const uint8_t *prefix, uint32_t 
     uint32_t mc = get32(prefix + 16), al = get32(prefix + 20);
     if (mc < 1 || mc > DM_MAX_MOVES || al > hs - HDR_FIXED) return DM_E_JOURNAL_CORRUPT;
     uint64_t pos = HDR_FIXED + (uint64_t)al;
-    uint8_t b[8];
+    uint8_t b[MOVE_FIXED];
     for (uint32_t i = 0; i < mc; i++) {
         if (pos + MOVE_FIXED > hs) return DM_E_JOURNAL_CORRUPT;
-        dm_status s = j->read(j->ctx, pos + 60, b, 8);
+        dm_status s = j->read(j->ctx, pos, b, MOVE_FIXED);
         if (s != DM_OK) return s;
-        uint64_t cc = get64(b);
-        pos += MOVE_FIXED;
+        uint32_t ss = get32(b + 32);
+        uint64_t cc = get64(b + 60);
+        if (!sector_ok(ss) || pos + move_rec_size(ss) > hs) return DM_E_JOURNAL_CORRUPT;
+        pos += move_rec_size(ss);
         if (cc > (hs - pos) / 16) return DM_E_JOURNAL_CORRUPT;
         pos += cc * 16;
     }
@@ -160,7 +177,8 @@ static dm_status hdr_stored_crc(const dm_io *j, const uint8_t *prefix, uint32_t 
     return DM_OK;
 }
 
-/* Read-modify-write of the newest slot into the other slot. mode 0: step; mode 1: progress. */
+/* Read-modify-write of the newest slot into the other slot. mode 0: step; mode 1: progress (clears
+   boot_restored); mode 2: boot_restored = 1 for the current move of the slot. */
 static dm_status slot_update(const dm_io *j, int mode, uint32_t step, uint32_t move_index,
                              uint64_t chunks_done, uint64_t last_hash)
 {
@@ -176,8 +194,14 @@ static dm_status slot_update(const dm_io *j, int mode, uint32_t step, uint32_t m
     if (s != DM_OK) return s;
     slot n = cur;
     n.seq = cur.seq + 1;
-    if (mode == 0) n.step = step;
-    else { n.move_index = move_index; n.chunks_done = chunks_done; n.last_hash = last_hash; }
+    if (mode == 0) {
+        n.step = step;
+    } else if (mode == 1) {
+        n.move_index = move_index; n.chunks_done = chunks_done; n.last_hash = last_hash; n.boot_restored = 0;
+    } else {
+        if (cur.move_index != move_index) return DM_E_INVALID_ARG;
+        n.boot_restored = 1;
+    }
     return slot_write(j, hs, bind, target, &n);
 }
 
@@ -193,6 +217,8 @@ dm_status dm_journal_create(const dm_io *j, const dm_move_plan *moves, uint32_t 
     uint8_t *buf = NULL;
     dm_status s = DM_OK;
 
+    for (uint32_t i = 0; i < move_count; i++)
+        if (!moves[i].boot_first || !moves[i].boot_backup) return DM_E_INVALID_ARG;   /* v2: required */
     for (uint32_t i = 0; i < move_count && s == DM_OK; i++) {
         s = dm_plan_validate(&moves[i]);
         if (s == DM_OK) s = dm_chunks_build(&moves[i], &chunks[i], &counts[i]);
@@ -200,7 +226,7 @@ dm_status dm_journal_create(const dm_io *j, const dm_move_plan *moves, uint32_t 
     if (s != DM_OK) goto done;
 
     uint64_t used = HDR_FIXED + (uint64_t)app_len;
-    for (uint32_t i = 0; i < move_count; i++) used += MOVE_FIXED + (uint64_t)counts[i] * 16;
+    for (uint32_t i = 0; i < move_count; i++) used += move_rec_size(moves[i].sector_size) + (uint64_t)counts[i] * 16;
     used += 4;
     uint64_t hs = (used + HDR_ALIGN - 1) / HDR_ALIGN * HDR_ALIGN;
     if (hs > HDR_MAX) { s = DM_E_INVALID_PLAN; goto done; }
@@ -208,7 +234,7 @@ dm_status dm_journal_create(const dm_io *j, const dm_move_plan *moves, uint32_t 
     if (!buf) { s = DM_E_NOMEM; goto done; }
 
     memcpy(buf, k_magic, 8);
-    put32(buf + 8, 1); put32(buf + 12, (uint32_t)hs);
+    put32(buf + 8, JRN_VERSION); put32(buf + 12, (uint32_t)hs);
     put32(buf + 16, move_count); put32(buf + 20, app_len);
     if (app_len) memcpy(buf + HDR_FIXED, app_blob, app_len);
     uint8_t *p = buf + HDR_FIXED + app_len;
@@ -219,6 +245,8 @@ dm_status dm_journal_create(const dm_io *j, const dm_move_plan *moves, uint32_t 
         put64(p + 36, m->old_start); put64(p + 44, m->length); put64(p + 52, m->shift);
         put64(p + 60, counts[i]);
         p += MOVE_FIXED;
+        memcpy(p, m->boot_first, m->sector_size); p += m->sector_size;
+        memcpy(p, m->boot_backup, m->sector_size); p += m->sector_size;
         for (uint32_t c = 0; c < counts[i]; c++, p += 16) {
             put64(p, chunks[i][c].offset); put64(p + 8, chunks[i][c].length);
         }
@@ -236,7 +264,7 @@ dm_status dm_journal_create(const dm_io *j, const dm_move_plan *moves, uint32_t 
     if (s == DM_OK) s = j->write(j->ctx, 0, buf, (uint32_t)hs);
     if (s == DM_OK) s = flush_io(j);
     if (s == DM_OK) {
-        slot first = { 1, 0, 0, 0, 0 };
+        slot first = { 1, 0, 0, 0, 0, 0 };
         s = slot_write(j, (uint32_t)hs, hcrc, 0, &first);
     }
 done:
@@ -262,6 +290,7 @@ dm_status dm_journal_read(const dm_io *j, dm_journal_info *info,
     info->move_index = cur.move_index;
     info->chunks_done = cur.chunks_done;
     info->seq = cur.seq;
+    info->boot_restored = cur.boot_restored;
     for (uint32_t i = 0; i < h.move_count; i++) info->chunk_count[i] = h.move_chunks[i];
     if (app_len) *app_len = h.app_len;
     if (h.app_len) {
@@ -303,10 +332,32 @@ dm_status dm_journal_load_move(const dm_io *j, uint32_t move_index, dm_move_plan
     memcpy(plan_out->disk_guid, p, 16); memcpy(plan_out->partition_guid, p + 16, 16);
     plan_out->sector_size = get32(p + 32);
     plan_out->old_start = get64(p + 36); plan_out->length = get64(p + 44); plan_out->shift = get64(p + 52);
-    p += MOVE_FIXED;
+    p += move_rec_size(plan_out->sector_size);
     for (uint64_t c = 0; c < cc; c++, p += 16) { out[c].offset = get64(p); out[c].length = get64(p + 8); }
     free(h.buf);
     *chunks = out;
     *chunk_count = (uint32_t)cc;
+    return DM_OK;
+}
+
+
+dm_status dm_journal_boot_restored(const dm_io *j, uint32_t move_index)
+{
+    if (!j || !j->read || !j->write) return DM_E_INVALID_ARG;
+    return slot_update(j, 2, 0, move_index, 0, 0);
+}
+
+dm_status dm_journal_load_boot(const dm_io *j, uint32_t move_index, uint8_t *first, uint8_t *backup)
+{
+    if (!j || !j->read || !first || !backup) return DM_E_INVALID_ARG;
+    hdr h;
+    dm_status s = hdr_load(j, &h);
+    if (s != DM_OK) return s;
+    if (move_index >= h.move_count) { free(h.buf); return DM_E_INVALID_ARG; }
+    uint32_t ss = h.move_sector[move_index];
+    const uint8_t *p = h.buf + h.move_off[move_index] + MOVE_FIXED;
+    memcpy(first, p, ss);
+    memcpy(backup, p + ss, ss);
+    free(h.buf);
     return DM_OK;
 }

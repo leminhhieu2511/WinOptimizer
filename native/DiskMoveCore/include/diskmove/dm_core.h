@@ -28,6 +28,11 @@ typedef struct dm_move_plan {
     uint64_t old_start, length, shift; /* bytes; partition moves right by shift */
     uint32_t extent_count;
     const dm_extent *extents;          /* used regions; may overlap, unsorted */
+    /* Journal v2: the partition's ORIGINAL first logical sector and backup boot sector (its last logical sector),
+       sector_size bytes each, read by the caller after the lock + dismount and before any write. Required by
+       dm_journal_create (stored in the header, covered by its CRC); not used by dm_plan_validate / dm_chunks_build;
+       NULL in a plan loaded from the journal (see dm_journal_load_boot). */
+    const uint8_t *boot_first, *boot_backup;
 } dm_move_plan;
 
 /* Alignment unit is A = max(4096, sector_size); old_start, length, shift must be multiples of A,
@@ -52,6 +57,7 @@ typedef struct dm_journal_info {
     uint64_t chunks_done;       /* of move_index */
     uint64_t chunk_count[2];    /* total chunks of each move (0 for unused) */
     uint64_t seq;
+    uint32_t boot_restored;     /* 1: the saved boot sectors of move_index are written at its destination */
 } dm_journal_info;
 #define DM_MAX_MOVES 2
 dm_status dm_journal_create(const dm_io *j, const dm_move_plan *moves, uint32_t move_count,
@@ -63,14 +69,27 @@ dm_status dm_journal_set_step(const dm_io *j, uint32_t step);
 /* Internal (dm_move.c): stored plan (extents = NULL) + stored chunks (free with dm_free); progress write. */
 dm_status dm_journal_load_move(const dm_io *j, uint32_t move_index, dm_move_plan *plan_out,
                                dm_extent **chunks, uint32_t *chunk_count);
+/* Progress record: also clears boot_restored. */
 dm_status dm_journal_progress(const dm_io *j, uint32_t move_index, uint64_t chunks_done, uint64_t last_hash);
+/* Copies the saved first / backup boot sector of a move (sector_size bytes each, at most DM_MAX_SECTOR). */
+#define DM_MAX_SECTOR 4096u
+dm_status dm_journal_load_boot(const dm_io *j, uint32_t move_index, uint8_t *first, uint8_t *backup);
+/* Sets boot_restored in a new slot; move_index must be the slot's current move (else DM_E_INVALID_ARG). */
+dm_status dm_journal_boot_restored(const dm_io *j, uint32_t move_index);
 
 /* ---- Backward chunk mover ---- */
 /* Return non-zero to request a stop; the core only stops between two chunks. */
 typedef int (*dm_progress_cb)(void *user, uint64_t bytes_done, uint64_t bytes_total);
 /* Runs (or resumes) move move_index from the journal. On completion returns DM_OK and the journal slot
-   has chunks_done == chunk_count. Moves run in order: a finished move returns DM_OK without I/O; starting
-   move i+1 before move i is complete returns DM_E_JOURNAL_MISMATCH. progress may be NULL. */
+   has chunks_done == chunk_count and boot_restored == 1. Moves run in order: a finished move returns DM_OK
+   without I/O; starting move i+1 before move i is complete returns DM_E_JOURNAL_MISMATCH. progress may be NULL.
+   Journal v2 boot sectors (so no file system can mount the half-moved old view of the partition):
+   - only when chunks_done == 0, right before chunk 0: zero the old first sector and the old backup boot sector
+     (old_start + length - sector), then flush. Never with chunks_done > 0 (the old backup sector may already
+     lie inside the copied destination);
+   - after the last chunk is recorded: write the saved first sector at old_start + shift and the saved backup
+     sector at old_start + shift + length - sector (flush, read back, compare), then record boot_restored.
+     A complete move whose restore is not recorded re-applies it on entry (also before starting move i+1). */
 dm_status dm_run_move(const dm_io *disk, const dm_io *journal, uint32_t move_index,
                       dm_progress_cb progress, void *user);
 

@@ -8,9 +8,18 @@
 #define MIB (1024ull * KIB)
 #define GIB (1024ull * MIB)
 
+/* Journal v2 stores each move's original first and last (backup boot) sector. */
+static uint8_t k_boot_first[4096], k_boot_backup[4096];
+
+static void boot_fill(void)
+{
+    for (int i = 0; i < 4096; i++) { k_boot_first[i] = (uint8_t)(i * 13 + 5); k_boot_backup[i] = (uint8_t)(i * 29 + 11); }
+}
+
 static dm_move_plan mk_plan(const dm_extent *ex, uint32_t n, uint8_t tag)
 {
     dm_move_plan p;
+    boot_fill();
     memset(&p, 0, sizeof p);
     memset(p.disk_guid, tag, 16);
     memset(p.partition_guid, tag + 1, 16);
@@ -20,6 +29,8 @@ static dm_move_plan mk_plan(const dm_extent *ex, uint32_t n, uint8_t tag)
     p.shift = 32 * MIB;
     p.extent_count = n;
     p.extents = ex;
+    p.boot_first = k_boot_first;
+    p.boot_backup = k_boot_backup;
     return p;
 }
 
@@ -162,6 +173,104 @@ static void test_journal_rejects_bad_args(void)
     ASSERT_EQ_INT(dm_journal_create(&io, p, 3, NULL, 0), DM_E_INVALID_ARG);
     p[0].shift = 0;
     ASSERT_EQ_INT(dm_journal_create(&io, p, 1, NULL, 0), DM_E_INVALID_PLAN);
+    p[0] = mk_plan(&e, 1, 1);
+    p[0].boot_first = NULL;                                     /* v2: the saved boot sectors are required */
+    ASSERT_EQ_INT(dm_journal_create(&io, p, 1, NULL, 0), DM_E_INVALID_ARG);
+    p[0] = mk_plan(&e, 1, 1);
+    p[0].boot_backup = NULL;
+    ASSERT_EQ_INT(dm_journal_create(&io, p, 1, NULL, 0), DM_E_INVALID_ARG);
+    ASSERT_EQ_U64(m.size, 0);                                   /* nothing written */
+    mem_io_free(&m);
+}
+
+/* v2: each move record stores the saved first/backup sectors (sector_size bytes each); the header CRC covers them. */
+static void test_journal_boot_sectors_roundtrip(void)
+{
+    dm_extent e0 = { 0, 1 * MIB }, e1 = { 0, 2 * MIB };
+    dm_move_plan plans[2] = { mk_plan(&e0, 1, 0x10), mk_plan(&e1, 1, 0x20) };
+    static uint8_t f1[4096], b1[4096];
+    for (int i = 0; i < 4096; i++) { f1[i] = (uint8_t)(0xA0 ^ i); b1[i] = (uint8_t)(0x5C + i * 3); }
+    plans[1].sector_size = 4096;
+    plans[1].boot_first = f1;
+    plans[1].boot_backup = b1;
+    mem_io m; mem_io_init(&m, NULL);
+    dm_io io = mem_io_as_dm_io(&m);
+    ASSERT_EQ_INT(dm_journal_create(&io, plans, 2, "ab", 2), DM_OK);
+
+    uint8_t first[4096], backup[4096];
+    memset(first, 0xEE, sizeof first); memset(backup, 0xEE, sizeof backup);
+    ASSERT_EQ_INT(dm_journal_load_boot(&io, 0, first, backup), DM_OK);
+    ASSERT_TRUE(memcmp(first, k_boot_first, 512) == 0);
+    ASSERT_TRUE(memcmp(backup, k_boot_backup, 512) == 0);
+    ASSERT_EQ_U32(first[512], 0xEE);                            /* only sector_size bytes are written */
+    ASSERT_EQ_INT(dm_journal_load_boot(&io, 1, first, backup), DM_OK);
+    ASSERT_TRUE(memcmp(first, f1, 4096) == 0);
+    ASSERT_TRUE(memcmp(backup, b1, 4096) == 0);
+    ASSERT_EQ_INT(dm_journal_load_boot(&io, 2, first, backup), DM_E_INVALID_ARG);
+    ASSERT_EQ_INT(dm_journal_load_boot(&io, 0, NULL, backup), DM_E_INVALID_ARG);
+
+    /* the chunks still load behind the boot sectors */
+    dm_move_plan out; dm_extent *ch = NULL; uint32_t n = 0;
+    ASSERT_EQ_INT(dm_journal_load_move(&io, 1, &out, &ch, &n), DM_OK);
+    ASSERT_EQ_U32(out.sector_size, 4096);
+    ASSERT_TRUE(n > 0 && ch[n - 1].offset == 0);
+    dm_free(ch);
+
+    /* a flipped byte inside move 0's saved backup sector: header CRC mismatch */
+    uint64_t off = 24 + 2 + 68 + 512 + 100;
+    m.data[off] ^= 0x01;
+    dm_journal_info info; uint32_t alen;
+    char app[4];
+    ASSERT_EQ_INT(dm_journal_read(&io, &info, app, sizeof app, &alen), DM_E_JOURNAL_CORRUPT);
+    ASSERT_EQ_INT(dm_journal_load_boot(&io, 0, first, backup), DM_E_JOURNAL_CORRUPT);
+    m.data[off] ^= 0x01;
+    ASSERT_EQ_INT(dm_journal_read(&io, &info, app, sizeof app, &alen), DM_OK);
+    mem_io_free(&m);
+}
+
+/* A v1 journal (version field 1) is rejected, never interpreted with the v2 layout. */
+static void test_journal_rejects_v1(void)
+{
+    dm_extent e = { 0, 1 * MIB };
+    dm_move_plan p = mk_plan(&e, 1, 1);
+    mem_io m; mem_io_init(&m, NULL);
+    dm_io io = mem_io_as_dm_io(&m);
+    ASSERT_EQ_INT(dm_journal_create(&io, &p, 1, NULL, 0), DM_OK);
+    ASSERT_EQ_U32(m.data[8] | m.data[9] << 8 | m.data[10] << 16 | (uint32_t)m.data[11] << 24, 2);
+    m.data[8] = 1;
+    dm_journal_info info; uint32_t alen;
+    ASSERT_EQ_INT(dm_journal_read(&io, &info, NULL, 0, &alen), DM_E_JOURNAL_CORRUPT);
+    ASSERT_EQ_INT(dm_journal_set_step(&io, 3), DM_E_JOURNAL_CORRUPT);
+    ASSERT_EQ_INT(dm_journal_progress(&io, 0, 1, 0), DM_E_JOURNAL_CORRUPT);
+    dm_move_plan out; dm_extent *ch = NULL; uint32_t n = 0;
+    ASSERT_EQ_INT(dm_journal_load_move(&io, 0, &out, &ch, &n), DM_E_JOURNAL_CORRUPT);
+    mem_io_free(&m);
+}
+
+/* The slot's boot_restored flag: set by dm_journal_boot_restored, cleared by progress, kept by set_step. */
+static void test_journal_boot_restored_flag(void)
+{
+    dm_extent e = { 0, 1 * MIB };
+    dm_move_plan p = mk_plan(&e, 1, 1);
+    mem_io m; mem_io_init(&m, NULL);
+    dm_io io = mem_io_as_dm_io(&m);
+    ASSERT_EQ_INT(dm_journal_create(&io, &p, 1, NULL, 0), DM_OK);
+    dm_journal_info info; uint32_t alen;
+    ASSERT_EQ_INT(dm_journal_read(&io, &info, NULL, 0, &alen), DM_OK);
+    ASSERT_EQ_U32(info.boot_restored, 0);
+    ASSERT_EQ_INT(dm_journal_progress(&io, 0, 5, 9), DM_OK);
+    ASSERT_EQ_INT(dm_journal_boot_restored(&io, 0), DM_OK);
+    ASSERT_EQ_INT(dm_journal_read(&io, &info, NULL, 0, &alen), DM_OK);
+    ASSERT_EQ_U32(info.boot_restored, 1);
+    ASSERT_EQ_U64(info.chunks_done, 5);
+    ASSERT_EQ_INT(dm_journal_set_step(&io, 4), DM_OK);
+    ASSERT_EQ_INT(dm_journal_read(&io, &info, NULL, 0, &alen), DM_OK);
+    ASSERT_EQ_U32(info.boot_restored, 1);
+    ASSERT_EQ_U32(info.step, 4);
+    ASSERT_EQ_INT(dm_journal_progress(&io, 0, 5, 9), DM_OK);
+    ASSERT_EQ_INT(dm_journal_read(&io, &info, NULL, 0, &alen), DM_OK);
+    ASSERT_EQ_U32(info.boot_restored, 0);
+    ASSERT_EQ_INT(dm_journal_boot_restored(&io, 1), DM_E_INVALID_ARG);   /* only the slot's current move */
     mem_io_free(&m);
 }
 
@@ -272,6 +381,9 @@ void dm_run_journal(void)
     DM_RUN(test_journal_torn_slot_write);
     DM_RUN(test_journal_corrupt_header);
     DM_RUN(test_journal_rejects_bad_args);
+    DM_RUN(test_journal_boot_sectors_roundtrip);
+    DM_RUN(test_journal_rejects_v1);
+    DM_RUN(test_journal_boot_restored_flag);
     DM_RUN(test_journal_200k_extents);
     DM_RUN(test_journal_stale_slot_from_previous_journal);
     DM_RUN(test_journal_stale_slot_not_bound_to_other_header);

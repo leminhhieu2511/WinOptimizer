@@ -17,6 +17,29 @@ static uint64_t rng_next(uint64_t *s)    /* splitmix64 */
     return z ^ (z >> 31);
 }
 
+/* Journal v2: the saved boot sectors are the partition's first and last logical sector of the image. */
+static void set_boot_from(dm_move_plan *p, const uint8_t *image)
+{
+    p->boot_first = image + p->old_start;
+    p->boot_backup = image + p->old_start + p->length - p->sector_size;
+}
+
+static int is_zero(const uint8_t *p, uint64_t len)
+{
+    for (uint64_t i = 0; i < len; i++) if (p[i]) return 0;
+    return 1;
+}
+
+/* After a finished move: the old first sector is zero (invalidated), and so is the old backup sector unless the
+   destination has overwritten it with moved data. */
+static void assert_old_boot_invalidated(const uint8_t *image, const dm_move_plan *p)
+{
+    if (!is_zero(image + p->old_start, p->sector_size)) DM_FAIL("old first sector not invalidated");
+    uint64_t old_backup = p->old_start + p->length - p->sector_size;
+    if (old_backup < p->old_start + p->shift && !is_zero(image + old_backup, p->sector_size))
+        DM_FAIL("old backup boot sector not invalidated");
+}
+
 /* One disk image + journal sharing one mem_fault (a single write counter spans both). */
 typedef struct fx {
     dm_move_plan plan;
@@ -70,6 +93,7 @@ static void make_image(fx *f, uint32_t sector, uint64_t len, uint64_t shift, uin
         uint64_t v = rng_next(&rs);
         memcpy(f->orig + i, &v, 8);
     }
+    set_boot_from(&f->plan, f->orig);   /* what the caller reads after lock + dismount: the real sectors */
     mem_io_init(&f->disk, &f->fault);
     f->disk.data = d; f->disk.size = f->disk.cap = f->size;
     f->dio = mem_io_as_dm_io(&f->disk);
@@ -130,6 +154,7 @@ static void run_and_check(uint32_t sector, uint64_t len, uint64_t shift, uint32_
     ASSERT_EQ_INT(dm_run_move(&f.dio, &f.jio, 0, NULL, NULL), DM_OK);
     assert_moved(f.disk.data, &f.plan, f.orig);
     assert_outside_untouched(&f);
+    assert_old_boot_invalidated(f.disk.data, &f.plan);
     ASSERT_EQ_U64(journal_chunks_done(&f.jio), journal_chunk_count(&f.jio));
     fx_free(&f);
 }
@@ -153,6 +178,10 @@ static void crash_and_resume(fx *f, uint64_t n)
     if (s != DM_OK) DM_FAIL("N=%llu: resume returned %d", (unsigned long long)n, (int)s);
     assert_moved(f->disk.data, &f->plan, f->orig);
     assert_outside_untouched(f);
+    assert_old_boot_invalidated(f->disk.data, &f->plan);
+    dm_journal_info info; uint32_t alen;
+    ASSERT_EQ_INT(dm_journal_read(&f->jio, &info, NULL, 0, &alen), DM_OK);
+    if (info.boot_restored != 1) DM_FAIL("N=%llu: restore not recorded", (unsigned long long)n);
 }
 
 static void move_crash_every_write(void)
@@ -167,6 +196,30 @@ static void move_crash_every_write(void)
     printf("  move_crash_every_write: %llu writes per clean run, %llu crash points, %.2f s\n",
            (unsigned long long)total, (unsigned long long)total, (double)(clock() - t0) / CLOCKS_PER_SEC);
     fx_free(&f);
+}
+
+/* As the callers use it (one extent = the whole partition, shift < length, so the old backup sector lies inside
+   the destination): crash at every write, including the two invalidation writes, every chunk, every journal
+   record, the two restore writes and the boot_restored record; then resume. */
+static void move_crash_every_write_whole_partition(void)
+{
+    for (uint32_t sector = 512; sector <= 4096; sector *= 8) {
+        fx f;
+        make_image(&f, sector, 6 * MIB, 1 * MIB, 0, 30 + sector);
+        f.ext[0].offset = 0; f.ext[0].length = f.plan.length;
+        f.plan.extent_count = 1;
+        fx_reset(&f);
+        ASSERT_EQ_INT(dm_run_move(&f.dio, &f.jio, 0, NULL, NULL), DM_OK);
+        uint64_t total = f.fault.writes;
+        for (uint64_t n = 1; n <= total; n++) {
+            crash_and_resume(&f, n);
+            uint64_t dst = f.plan.old_start + f.plan.shift;
+            if (memcmp(f.disk.data + dst, f.orig + f.plan.old_start, (size_t)f.plan.length) != 0)
+                DM_FAIL("sector %u, N=%llu: destination differs from the original partition", sector, (unsigned long long)n);
+        }
+        printf("  move_crash_every_write_whole_partition (%u): %llu crash points\n", sector, (unsigned long long)total);
+        fx_free(&f);
+    }
 }
 
 static void move_crash_random_large(void)
@@ -304,6 +357,8 @@ static void move_two_moves_in_order(void)
     plans[0].extents = e0; plans[0].extent_count = 2;
     plans[1].old_start = 1 * MIB;  plans[1].length = 16 * MIB; plans[1].shift = 4 * MIB;
     plans[1].extents = e1; plans[1].extent_count = 1;
+    set_boot_from(&plans[0], f.orig);
+    set_boot_from(&plans[1], f.orig);
     mem_io_free(&f.jr);
     mem_io_init(&f.jr, &f.fault);
     f.jio = mem_io_as_dm_io(&f.jr);
@@ -361,6 +416,8 @@ static void fx2_make(fx2 *t)
     t->plans[1].old_start = 1 * MIB; t->plans[1].length = 2 * MIB; t->plans[1].shift = 1 * MIB;
     t->plans[1].extents = t->e1;     t->plans[1].extent_count = 2;
     memset(t->plans[1].partition_guid, 0x33, 16);
+    set_boot_from(&t->plans[0], t->f.orig);
+    set_boot_from(&t->plans[1], t->f.orig);
     fx2_reset(t);
 }
 
@@ -471,6 +528,198 @@ static void move_rejects_bad_args(void)
     fx_free(&f);
 }
 
+
+/* ---- Journal v2: old boot sectors invalidated before chunk 0, saved ones restored after the last chunk ---- */
+
+/* dm_io wrapper that records every write (offset, length, all-zero?) into a fixed log. */
+#define WLOG_MAX 4096
+typedef struct wlog { dm_io inner; uint32_t n; uint64_t off[WLOG_MAX]; uint32_t len[WLOG_MAX]; int zero[WLOG_MAX]; } wlog;
+static dm_status wlog_read(void *ctx, uint64_t off, void *buf, uint32_t len)
+{
+    wlog *w = (wlog *)ctx;
+    return w->inner.read(w->inner.ctx, off, buf, len);
+}
+static dm_status wlog_write(void *ctx, uint64_t off, const void *buf, uint32_t len)
+{
+    wlog *w = (wlog *)ctx;
+    if (w->n < WLOG_MAX) { w->off[w->n] = off; w->len[w->n] = len; w->zero[w->n] = is_zero((const uint8_t *)buf, len); w->n++; }
+    return w->inner.write(w->inner.ctx, off, buf, len);
+}
+static dm_status wlog_flush(void *ctx)
+{
+    wlog *w = (wlog *)ctx;
+    return w->inner.flush(w->inner.ctx);
+}
+static dm_io wlog_io(wlog *w, dm_io inner)
+{
+    memset(w, 0, sizeof *w);
+    w->inner = inner;
+    dm_io io = { w, wlog_read, wlog_write, wlog_flush };
+    return io;
+}
+
+/* Saved sectors differ from what is on the disk: the destination gets exactly the saved ones, the old ones are
+   zeroed, every other byte is moved. shift > length, so the old backup sector stays outside the destination. */
+static void move_restores_saved_boot_sectors(void)
+{
+    for (uint32_t sector = 512; sector <= 4096; sector *= 8) {
+        fx f;
+        make_image(&f, sector, 16 * MIB, 32 * MIB, 0, 20 + sector);
+        f.ext[0].offset = 0; f.ext[0].length = f.plan.length;      /* whole partition used, like the callers */
+        f.plan.extent_count = 1;
+        static uint8_t first[4096], backup[4096];
+        for (uint32_t i = 0; i < sector; i++) { first[i] = (uint8_t)(0xEB ^ i); backup[i] = (uint8_t)(0x52 + 7 * i); }
+        f.plan.boot_first = first;
+        f.plan.boot_backup = backup;
+        fx_reset(&f);
+        ASSERT_EQ_INT(dm_run_move(&f.dio, &f.jio, 0, NULL, NULL), DM_OK);
+
+        const dm_move_plan *p = &f.plan;
+        uint64_t dst = p->old_start + p->shift, len = p->length;
+        ASSERT_TRUE(memcmp(f.disk.data + dst, first, sector) == 0);
+        ASSERT_TRUE(memcmp(f.disk.data + dst + len - sector, backup, sector) == 0);
+        ASSERT_TRUE(is_zero(f.disk.data + p->old_start, sector));
+        ASSERT_TRUE(is_zero(f.disk.data + p->old_start + len - sector, sector));
+        /* everything between the two boot sectors moved (whole range: head/tail regions included) */
+        ASSERT_TRUE(memcmp(f.disk.data + dst + sector, f.orig + p->old_start + sector, (size_t)(len - 2 * sector)) == 0);
+        assert_outside_untouched(&f);
+        dm_journal_info info; uint32_t alen;
+        ASSERT_EQ_INT(dm_journal_read(&f.jio, &info, NULL, 0, &alen), DM_OK);
+        ASSERT_EQ_U32(info.boot_restored, 1);
+        fx_free(&f);
+    }
+}
+
+/* A fresh run: the first two disk writes zero the old first and backup sectors (then a flush), before chunk 0;
+   the last two write the saved sectors at the new start and the new end. */
+static void move_invalidates_before_first_chunk(void)
+{
+    fx f;
+    make_image(&f, 512, 16 * MIB, 1 * MIB, 4, 21);
+    wlog *w = (wlog *)malloc(sizeof *w);
+    ASSERT_TRUE(w != NULL);
+    if (!w) return;
+    dm_io io = wlog_io(w, f.dio);
+    ASSERT_EQ_INT(dm_run_move(&io, &f.jio, 0, NULL, NULL), DM_OK);
+    ASSERT_TRUE(w->n >= 4);
+    ASSERT_EQ_U64(w->off[0], f.plan.old_start);
+    ASSERT_EQ_U32(w->len[0], 512);
+    ASSERT_TRUE(w->zero[0]);
+    ASSERT_EQ_U64(w->off[1], f.plan.old_start + f.plan.length - 512);
+    ASSERT_EQ_U32(w->len[1], 512);
+    ASSERT_TRUE(w->zero[1]);
+    ASSERT_TRUE(w->len[2] > 512);                                    /* then the first chunk */
+    uint64_t dst = f.plan.old_start + f.plan.shift;
+    ASSERT_EQ_U64(w->off[w->n - 2], dst);
+    ASSERT_EQ_U32(w->len[w->n - 2], 512);
+    ASSERT_EQ_U64(w->off[w->n - 1], dst + f.plan.length - 512);
+    ASSERT_EQ_U32(w->len[w->n - 1], 512);
+    assert_moved(f.disk.data, &f.plan, f.orig);
+    free(w);
+    fx_free(&f);
+}
+
+/* A run stopped before the first chunk writes nothing (not even the invalidation). */
+static void move_stop_before_first_chunk_no_invalidation(void)
+{
+    fx f;
+    make_image(&f, 512, 16 * MIB, 1 * MIB, 4, 22);
+    prog p = { 0, 1, 0, 0, 0 };
+    ASSERT_EQ_INT(dm_run_move(&f.dio, &f.jio, 0, prog_cb, &p), DM_E_STOPPED);
+    ASSERT_TRUE(memcmp(f.disk.data, f.orig, (size_t)f.size) == 0);
+    fx_free(&f);
+}
+
+/* Resuming with chunks_done > 0 never invalidates again: the old backup sector position now lies inside the
+   destination (shift < length) and holds moved data, which must survive. */
+static void move_resume_never_invalidates(void)
+{
+    fx f;
+    make_image(&f, 512, 16 * MIB, 1 * MIB, 0, 23);
+    f.ext[0].offset = 0; f.ext[0].length = f.plan.length;          /* whole partition used, like the callers */
+    f.plan.extent_count = 1;
+    fx_reset(&f);
+    uint64_t old_backup = f.plan.old_start + f.plan.length - 512;
+    ASSERT_TRUE(old_backup >= f.plan.old_start + f.plan.shift);      /* inside the destination */
+    /* stop right after the chunk whose destination covers the old backup sector position */
+    dm_move_plan sp; dm_extent *ch = NULL; uint32_t n = 0, c = 0;
+    ASSERT_EQ_INT(dm_journal_load_move(&f.jio, 0, &sp, &ch, &n), DM_OK);
+    while (c < n && !(ch[c].offset + f.plan.shift <= f.plan.length - 512 &&
+                      f.plan.length - 512 < ch[c].offset + ch[c].length + f.plan.shift)) c++;
+    ASSERT_TRUE(c + 1 < n);
+    dm_free(ch);
+    prog p = { 0, (int)c + 2, 0, 0, 0 };
+    ASSERT_EQ_INT(dm_run_move(&f.dio, &f.jio, 0, prog_cb, &p), DM_E_STOPPED);
+    ASSERT_EQ_U64(journal_chunks_done(&f.jio), c + 1);
+    uint8_t moved[512];
+    memcpy(moved, f.disk.data + old_backup, 512);                     /* the copied data now at that position */
+    ASSERT_TRUE(memcmp(moved, f.orig + old_backup - f.plan.shift, 512) == 0);
+
+    wlog *w = (wlog *)malloc(sizeof *w);
+    ASSERT_TRUE(w != NULL);
+    if (!w) return;
+    dm_io io = wlog_io(w, f.dio);
+    ASSERT_EQ_INT(dm_run_move(&io, &f.jio, 0, NULL, NULL), DM_OK);
+    for (uint32_t i = 0; i < w->n; i++) {
+        if (w->len[i] == 512 && (w->off[i] == f.plan.old_start || w->off[i] == old_backup))
+            DM_FAIL("write %u: old boot sector rewritten on resume (off %llu)", i, (unsigned long long)w->off[i]);
+    }
+    ASSERT_TRUE(memcmp(f.disk.data + old_backup, moved, 512) == 0);  /* not zeroed */
+    assert_moved(f.disk.data, &f.plan, f.orig);
+    free(w);
+    fx_free(&f);
+}
+
+/* Re-entry on a complete move: the restore is re-applied while the journal does not record it, and never again
+   once it does (so it cannot undo the caller's later NTFS HiddenSectors patch). */
+static void move_complete_reentry_restore(void)
+{
+    fx f;
+    make_image(&f, 512, 16 * MIB, 1 * MIB, 4, 24);
+    ASSERT_EQ_INT(dm_run_move(&f.dio, &f.jio, 0, NULL, NULL), DM_OK);
+    uint64_t dst = f.plan.old_start + f.plan.shift;
+    uint64_t n = journal_chunk_count(&f.jio);
+
+    /* complete and recorded: no I/O even though the sector changed meanwhile (the caller's patch) */
+    f.disk.data[dst + 0x1C] ^= 0xFF;
+    f.fault.writes = 0;
+    ASSERT_EQ_INT(dm_run_move(&f.dio, &f.jio, 0, NULL, NULL), DM_OK);
+    ASSERT_EQ_U64(f.fault.writes, 0);
+    f.disk.data[dst + 0x1C] ^= 0xFF;
+
+    /* crash between the last progress record and the restore: the journal says complete, not restored */
+    memset(f.disk.data + dst, 0, 512);
+    memset(f.disk.data + dst + f.plan.length - 512, 0, 512);
+    ASSERT_EQ_INT(dm_journal_progress(&f.jio, 0, n, 0), DM_OK);
+    ASSERT_EQ_INT(dm_run_move(&f.dio, &f.jio, 0, NULL, NULL), DM_OK);
+    assert_moved(f.disk.data, &f.plan, f.orig);
+    dm_journal_info info; uint32_t alen;
+    ASSERT_EQ_INT(dm_journal_read(&f.jio, &info, NULL, 0, &alen), DM_OK);
+    ASSERT_EQ_U32(info.boot_restored, 1);
+    fx_free(&f);
+}
+
+/* Starting move 1 while move 0 is complete but its restore was not recorded: move 0's restore runs first. */
+static void move_next_move_restores_previous(void)
+{
+    fx2 *t = (fx2 *)malloc(sizeof *t);
+    ASSERT_TRUE(t != NULL);
+    if (!t) return;
+    fx2_make(t);
+    ASSERT_EQ_INT(dm_run_move(&t->f.dio, &t->f.jio, 0, NULL, NULL), DM_OK);
+    const dm_move_plan *p0 = &t->plans[0];
+    uint64_t dst0 = p0->old_start + p0->shift;
+    memset(t->f.disk.data + dst0, 0, 512);
+    memset(t->f.disk.data + dst0 + p0->length - 512, 0, 512);
+    dm_journal_info info; uint32_t alen; char app[8];
+    ASSERT_EQ_INT(dm_journal_read(&t->f.jio, &info, app, sizeof app, &alen), DM_OK);
+    ASSERT_EQ_INT(dm_journal_progress(&t->f.jio, 0, info.chunk_count[0], 0), DM_OK);   /* "not restored" */
+    ASSERT_EQ_INT(dm_run_move(&t->f.dio, &t->f.jio, 1, NULL, NULL), DM_OK);
+    assert_both_moved(t);
+    fx_free(&t->f);
+    free(t);
+}
+
 /* Suite name "mover" (not "move"): the harness entry point dm_run_<suite> would otherwise collide with dm_run_move. */
 void dm_run_mover(void)
 {
@@ -479,6 +728,7 @@ void dm_run_mover(void)
     DM_RUN(move_shift_larger_than_partition);
     DM_RUN(move_4kn_sectors);
     DM_RUN(move_crash_every_write);
+    DM_RUN(move_crash_every_write_whole_partition);
     DM_RUN(move_crash_random_large);
     DM_RUN(move_crash_every_write_two_moves);
     DM_RUN(move_crash_twice);
@@ -487,4 +737,10 @@ void dm_run_mover(void)
     DM_RUN(move_stop_before_first_chunk);
     DM_RUN(move_two_moves_in_order);
     DM_RUN(move_rejects_bad_args);
+    DM_RUN(move_restores_saved_boot_sectors);
+    DM_RUN(move_invalidates_before_first_chunk);
+    DM_RUN(move_stop_before_first_chunk_no_invalidation);
+    DM_RUN(move_resume_never_invalidates);
+    DM_RUN(move_complete_reentry_restore);
+    DM_RUN(move_next_move_restores_previous);
 }
