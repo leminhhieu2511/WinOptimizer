@@ -55,9 +55,9 @@ Mỗi bước được ghi vào nhật ký **trước khi làm** và **sau khi x
 |---|---|---|---|
 | 0 | Kiểm tra điều kiện (mục 6); `chkdsk` chỉ đọc trên nguồn; lưu bản sao bảng phân vùng (JSON + byte GPT thô) vào `C:\ProgramData\WinOptimizer\DiskMove\` | C# | Chưa thay đổi gì |
 | 1 | Thu nhỏ nguồn đi X (`MSFT_Partition.Resize`) | C# | Có thể hủy: trả lại X cho nguồn |
-| 2 | Khoá và tháo nguồn (`FSCTL_LOCK_VOLUME`, `FSCTL_DISMOUNT_VOLUME`), gỡ ký tự ổ, đặt thuộc tính GPT ẩn/không gán ký tự | C# | Có thể hủy: bỏ thuộc tính, gắn lại |
-| 3 | Dịch dữ liệu nguồn sang phải X (mục 5) | Lõi C/C++ qua DLL | **Không hủy được, chỉ chạy tiếp** |
-| 4 | Cập nhật vị trí nguồn trong bảng GPT (`IOCTL_DISK_SET_DRIVE_LAYOUT_EX`); cập nhật trường *hidden sectors* trong boot sector NTFS chính và dự phòng (nếu giá trị vừa 32 bit); bỏ thuộc tính ẩn; gán lại đúng ký tự cũ | Lõi + C# | Chạy tiếp |
+| 2 | Khoá và tháo nguồn (`FSCTL_LOCK_VOLUME`, `FSCTL_DISMOUNT_VOLUME`); đọc **sector đầu và sector cuối** (boot sector NTFS chính và dự phòng) của nguồn và của Recovery (Recovery cũng được khoá + tháo để đọc, rồi thả ra) rồi lưu vào nhật ký (mục 5.3), **trước mọi thao tác ghi**; gỡ ký tự ổ, đặt thuộc tính GPT ẩn/không gán ký tự | C# | Có thể hủy: bỏ thuộc tính, gắn lại |
+| 3 | Dịch dữ liệu nguồn sang phải X (mục 5). Lõi xoá trắng hai boot sector cũ trước khối đầu tiên và ghi lại bản đã lưu ở vị trí mới sau khối cuối (mục 5.2). DLL giữ khoá volume còn nằm ở vị trí cũ suốt bước này (mục 5.4) | Lõi C/C++ qua DLL | **Không hủy được, chỉ chạy tiếp** |
+| 4 | Cập nhật vị trí nguồn trong bảng GPT (`IOCTL_DISK_SET_DRIVE_LAYOUT_EX`); cập nhật trường *hidden sectors* trong boot sector NTFS chính và dự phòng (nếu giá trị vừa 32 bit; luôn **sau** khi lõi đã ghi lại boot sector đã lưu); bỏ thuộc tính ẩn; gán lại đúng ký tự cũ | Lõi + C# | Chạy tiếp |
 | 5 | Ghi lại trạng thái WinRE; `reagentc /disable`; dịch phân vùng Recovery sang phải X bằng cùng lõi và cập nhật GPT; `reagentc /enable` nếu trước đó đang bật. Nếu bật lại thất bại: tạo lại phân vùng Recovery theo quy trình Microsoft (KB5028997) từ `winre.wim` trên C: | C# + lõi | Chạy tiếp |
 | 6 | Mở rộng C: thêm X (`MSFT_Partition.Resize`) | C# | Chạy tiếp |
 | 7 | Xác minh: `chkdsk` chỉ đọc nguồn; WinRE đúng trạng thái ban đầu; kích thước đúng kế hoạch. Xoá nhật ký, giữ bản sao bảng phân vùng 30 ngày | C# | — |
@@ -78,8 +78,10 @@ Mỗi bước được ghi vào nhật ký **trước khi làm** và **sau khi x
 ### 5.2 Thuật toán
 1. Gộp các vùng liền kề, cắt thành khối kích thước **≤ min(16 MiB, S)**, căn theo bội số 4096 byte và sector logic.
 2. Xử lý các khối theo **địa chỉ giảm dần**.
-3. Mỗi khối: đọc nguồn vào bộ đệm → ghi tới (vị trí + S) → `flush` → đọc lại vùng đích và so sánh với bộ đệm → cập nhật nhật ký → `flush` nhật ký.
-4. So sánh không khớp: thử ghi lại tối đa 3 lần. Vẫn sai thì dừng ở trạng thái "lỗi phần cứng". Nguồn của khối đó vẫn nguyên (bất biến 1), nên không mất dữ liệu.
+3. **Chỉ khi chưa có khối nào xong** (số khối đã xong = 0), ngay trước khối đầu tiên: ghi số 0 lên sector đầu cũ (`old_start`) và sector dự phòng cũ (`old_start + độ dài − sector`), rồi `flush`. Từ đó không hệ thống file nào nhận ra được "bản cũ" của phân vùng (Windows chỉ gắn được dạng RAW). **Không bao giờ** làm lại bước này khi đã có khối xong: sector dự phòng cũ có thể đã nằm trong vùng đích vừa chép.
+4. Mỗi khối: đọc nguồn vào bộ đệm → ghi tới (vị trí + S) → `flush` → đọc lại vùng đích và so sánh với bộ đệm → cập nhật nhật ký → `flush` nhật ký.
+5. So sánh không khớp: thử ghi lại tối đa 3 lần. Vẫn sai thì dừng ở trạng thái "lỗi phần cứng". Nguồn của khối đó vẫn nguyên (bất biến 1), nên không mất dữ liệu.
+6. Sau khi khối cuối đã được nhật ký xác nhận: ghi sector đầu đã lưu tới `old_start + S` và sector dự phòng đã lưu tới `old_start + S + độ dài − sector` (`flush`, đọc lại so sánh), rồi ghi cờ **"đã khôi phục boot sector"** vào nhật ký. Hai sector này đã được chép đi dưới dạng số 0 (bước 3), nên bước này đưa chúng về đúng nội dung gốc. Chạy tiếp một lần dịch đã xong mà chưa có cờ thì làm lại bước 6 (ghi lại cùng nội dung, an toàn); đã có cờ thì không ghi gì nữa (để không đè lên trường *hidden sectors* đã cập nhật ở bước 4). Bắt đầu lần dịch thứ hai (Recovery) khi lần thứ nhất chưa có cờ thì làm bước 6 cho lần thứ nhất trước.
 
 **Bất biến:**
 1. Khối ≤ S, nên đích của một khối không bao giờ chồng lên nguồn của chính nó.
@@ -89,8 +91,10 @@ Mỗi bước được ghi vào nhật ký **trước khi làm** và **sau khi x
 
 ### 5.3 Nhật ký
 - File: `C:\ProgramData\WinOptimizer\DiskMove\journal.bin`. Mở với `FILE_FLAG_WRITE_THROUGH`; mỗi lần ghi đều `flush`. ACL chỉ cho Administrators và SYSTEM.
-- **Phần đầu:** chữ ký `WODMJRN1`, phiên bản định dạng, kế hoạch tổng (bước 0–7, X, nguồn, Recovery), kế hoạch dịch chuyển của từng phân vùng, **trạng thái ban đầu cần khôi phục** (ký tự ổ của nguồn, thuộc tính GPT gốc của nguồn, trạng thái WinRE), CRC32C của phần đầu.
-- **Hai ô tiến độ A/B**, mỗi ô gồm: số thứ tự tăng dần, bước hiện tại, phân vùng đang dời, số khối đã xong, xxHash64 của khối vừa chép, CRC32C của ô. Mỗi lần ghi chỉ ghi vào ô cũ hơn. Khi đọc, lấy ô hợp lệ có số thứ tự lớn nhất.
+- **Phần đầu:** chữ ký `WODMJRN1`, phiên bản định dạng (**hiện là 2**), kế hoạch tổng (bước 0–7, X, nguồn, Recovery), kế hoạch dịch chuyển của từng phân vùng, **trạng thái ban đầu cần khôi phục** (ký tự ổ của nguồn, thuộc tính GPT gốc của nguồn, trạng thái WinRE), CRC32C của phần đầu.
+  - **Phiên bản 2:** mỗi kế hoạch dịch chuyển còn lưu **sector đầu gốc** và **sector dự phòng gốc** (sector cuối) của phân vùng, mỗi cái đúng một sector logic, đặt ngay sau phần cố định của kế hoạch và trước danh sách khối. Bên gọi đọc chúng **sau khi khoá + tháo, trước mọi thao tác ghi**, và đưa vào lúc tạo nhật ký (tạo nhật ký mà thiếu chúng thì bị từ chối trước khi file bị ghi đè). CRC32C của phần đầu bao cả hai sector này.
+  - Nhật ký phiên bản khác 2 (kể cả phiên bản 1) bị từ chối như nhật ký hỏng (`DM_E_JOURNAL_CORRUPT`); không bao giờ đọc theo bố cục khác.
+- **Hai ô tiến độ A/B**, mỗi ô gồm: số thứ tự tăng dần, bước hiện tại, phân vùng đang dời, số khối đã xong, xxHash64 của khối vừa chép, **cờ "đã khôi phục boot sector"** của phân vùng đang dời (phiên bản 2; ghi tiến độ khối thì cờ về 0), CRC32C của ô. Mỗi lần ghi chỉ ghi vào ô cũ hơn. Khi đọc, lấy ô hợp lệ có số thứ tự lớn nhất.
 - **Kiểm tra khi chạy tiếp:**
   - GUID ổ và GUID phân vùng phải khớp.
   - Bảng phân vùng phải khớp **đúng một** trạng thái dự kiến của bước ghi trong nhật ký (ví dụ: "trước cập nhật GPT" hoặc "sau cập nhật GPT").
@@ -98,6 +102,9 @@ Mỗi bước được ghi vào nhật ký **trước khi làm** và **sau khi x
 
 ### 5.4 Đọc/ghi
 - Ổ vật lý `\\.\PhysicalDriveN` mở với `FILE_FLAG_NO_BUFFERING | FILE_FLAG_WRITE_THROUGH`; bộ đệm cấp bằng `VirtualAlloc` (căn trang). Giữ handle khoá volume nguồn suốt bước 3–4.
+- **Khoá lại volume ở vị trí cũ (mọi lần chạy, kể cả chạy tiếp):** phân vùng đang dời dở thì bị ẩn, không còn ký tự ổ hay đường dẫn `\\?\Volume{GUID}`, nên C# không khoá được nó theo tên. Nhưng Windows vẫn giữ thiết bị volume (`\Device\HarddiskVolumeN`) ở **vị trí cũ**. Vì vậy `dmw_run_move`, sau khi kiểm tra danh tính ổ và **trước mọi thao tác ghi**:
+  - Nếu bên gọi đưa handle khoá của chính nó (chạy mới, hoặc chạy tiếp khi phân vùng còn hiện) thì dùng handle đó.
+  - Nếu không, DLL dò `\\?\GLOBALROOT\Device\HarddiskVolumeN` với N = 1..4096 (mở không quyền truy cập nên không gắn hệ thống file; số N thực tế đã thấy tới 412), tìm volume có đúng một vùng = (ổ này, `old_start`, độ dài). Có thì mở, `FSCTL_LOCK_VOLUME` + `FSCTL_DISMOUNT_VOLUME` và giữ khoá tới khi lệnh trả về. Có mà không khoá được (thử 5 lần, cách 1 giây) thì trả `DM_E_LOCKED`, **không ghi gì**. Không có thì chạy tiếp.
 - Lõi không gọi API hệ điều hành. Nó nhận một bảng hàm `read`, `write`, `flush`, `size` cho ổ đĩa và cho nhật ký:
   - `DiskMove.dll`: bản dùng Win32.
   - `DiskMoveBoot.exe` (giai đoạn 2): bản dùng NT native API.
@@ -228,3 +235,4 @@ Lớp 4 cần **Hyper-V được bật** và **ISO Windows 11**; chủ dự án 
 - **Windows không cho đổi vị trí phân vùng trên ổ hệ thống khi đang chạy.** Lớp 0 kiểm tra trên VHDX, nhưng VHDX không phải ổ hệ thống. Lớp 4 mới xác nhận dứt điểm. Nếu không được, bước 3–5 phải chuyển sang chế độ boot (giai đoạn 2).
 - **Driver bên thứ ba** (phần mềm diệt virus, mã hoá, sao lưu cấp khối) có thể giữ hoặc chặn volume. Khi đó công cụ phát hiện qua việc khoá thất bại và dừng an toàn.
 - **Ổ HDD rất chậm** có thể khiến bước 3 kéo dài hàng giờ. Phải báo ước tính trước khi người dùng xác nhận.
+- **Windows vẫn gắn được "bản cũ" của phân vùng đã ẩn** (phát hiện khi điều tra lỗi lệch mã băm): sau khi tiến trình chết giữa bước 3, phân vùng bị ẩn và mất ký tự ổ lẫn đường dẫn `Volume{GUID}`, nhưng thiết bị volume ở vị trí cũ vẫn tồn tại. Bất kỳ thay đổi bố cục phân vùng nào trên **bất kỳ ổ nào** (thêm/bớt/ẩn phân vùng, gắn VHD/USB, Disk Management, diskpart) làm Windows liệt kê lại và NTFS gắn bản cũ đã dịch dở rồi ghi vào đó; lần chạy tiếp sau đó chép nguyên phần bị sửa sang đích (tái hiện 4/4 lần). Cách chặn: boot sector cũ bị xoá trắng trước khối đầu tiên (mục 5.2) nên chỉ gắn được dạng RAW, và DLL khoá thiết bị ở vị trí cũ suốt lúc chép (mục 5.4). Rủi ro còn lại: một bên thứ ba mở sẵn thiết bị RAW đó thì chạy tiếp dừng với `DM_E_LOCKED` cho tới khi nó nhả ra (an toàn, chỉ phải thử lại).
