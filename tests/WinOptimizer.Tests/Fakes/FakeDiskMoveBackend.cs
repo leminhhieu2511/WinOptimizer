@@ -41,6 +41,11 @@ public sealed class FakeDiskMoveBackend : IDiskMoveBackend
         /// to the destination.</summary>
         public byte[]? BootRead;
         public bool BootRestored;
+        /// <summary>Review I1: the volume exists but the mount manager never registered it (no letter can be assigned
+        /// until an arrival nudge or a hide/unhide re-triggers it).</summary>
+        public bool Unregistered;
+        /// <summary>Registered, but no letter can be assigned (e.g. none free).</summary>
+        public bool NoLetterPossible;
         public bool IsHidden => (Attrs & Hidden) != 0;
         /// <summary>Windows can write to it: it has a volume (not hidden) and we do not hold it locked + dismounted.</summary>
         public bool Mounted => !IsHidden && !(Locked && Dismounted);
@@ -57,6 +62,8 @@ public sealed class FakeDiskMoveBackend : IDiskMoveBackend
     public int DisableFailures;
     public int ChkdskResult;
     public bool WindowsRestoresLetter = true;
+    /// <summary>Whether IOCTL_MOUNTMGR_VOLUME_ARRIVAL_NOTIFICATION / a hide + unhide registers an unregistered volume.</summary>
+    public bool NudgeHelps = true, ToggleHelps = true;
     /// <summary>Letters held by volumes outside this disk (e.g. a USB drive plugged in during the move).</summary>
     public readonly HashSet<char> ForeignLetters = [];
     public int ChunksPerMove = 4;
@@ -192,6 +199,7 @@ public sealed class FakeDiskMoveBackend : IDiskMoveBackend
         bool wasHidden = p.IsHidden;
         p.Attrs = attributes;
         if (!wasHidden && p.IsHidden) p.Letter = '\0';                         // Windows drops the letter itself
+        if (wasHidden && !p.IsHidden && p.Unregistered && ToggleHelps) p.Unregistered = false;   // a new arrival
         if (wasHidden && !p.IsHidden && WindowsRestoresLetter && p.RememberedLetter != '\0')
             p.Letter = Taken(p.RememberedLetter, p) ? FirstFree() : p.RememberedLetter;   // ...and often gives one back
         Did($"SetAttributes({p.Name},{(p.IsHidden ? "hidden" : "visible")},0x{attributes:X16})");
@@ -222,6 +230,8 @@ public sealed class FakeDiskMoveBackend : IDiskMoveBackend
         Alive();
         var p = ByVolume(volumePath);
         if (p.IsHidden) throw new DiskMoveException($"fake: {p.Name} has no volume while hidden");
+        if (p.Unregistered || p.NoLetterPossible)
+            throw new DiskMoveException($"fake: cannot give {p.Name} a drive letter: The parameter is incorrect (87)");
         if (!Taken(letter, p)) p.Letter = letter;
         else if (p.Letter == '\0') p.Letter = FirstFree();
         p.RememberedLetter = p.Letter;
@@ -233,7 +243,36 @@ public sealed class FakeDiskMoveBackend : IDiskMoveBackend
     {
         Alive();
         var p = ByVolume(volumePath);
-        return p.Letter == '\0' || p.IsHidden ? null : p.Letter;
+        return p.Letter == '\0' || p.IsHidden || p.Unregistered || p.NoLetterPossible ? null : p.Letter;
+    }
+
+    public IDisposable? LockOldOffset(int disk, long start, long length)
+    {
+        Disk(disk);
+        var p = Parts.SingleOrDefault(x => x.Start == start && x.Size == length && x.IsHidden);
+        if (p is null) return null;
+        if (p.InUse) throw new DiskMoveNativeException(11, "fake: old-offset volume lock (DM_E_LOCKED)");
+        if (p.Locked) throw new InvalidOperationException($"fake: {p.Name} is already locked");
+        p.Locked = p.Dismounted = true;
+        Did($"LockOldOffset({p.Name})");
+        return new Vol(this, p);
+    }
+
+    public bool NudgeVolumeArrival(int disk, long start, long length)
+    {
+        Disk(disk);
+        var p = Parts.SingleOrDefault(x => x.Start == start && x.Size == length && !x.IsHidden);
+        Calls.Add($"Nudge({p?.Name ?? "none"})");
+        if (p is null) return false;
+        if (NudgeHelps) p.Unregistered = false;
+        return true;
+    }
+
+    public bool VolumeRegistered(string volumePath)
+    {
+        Alive();
+        var p = ByVolume(volumePath);
+        return !p.Unregistered && !p.IsHidden;
     }
 
     sealed class Vol(FakeDiskMoveBackend owner, Part p) : IDisposable

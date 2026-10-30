@@ -47,6 +47,17 @@ public interface IDiskMoveBackend
     /// <summary>First 34 and last 33 sectors of the disk (primary and backup GPT).</summary>
     byte[] ReadRawGpt(int disk, int sectorSize);
 
+    /// <summary>Locks + dismounts EVERY volume device still at exactly [start, start + length) (a hidden, half-moved
+    /// partition keeps one at its old offset; DiskMove.dll dmw_lock_old_offset). Null if there is none. Held across a
+    /// resumed step (copy, pauses, NTFS patch, GPT commit) and passed to <see cref="RunMove"/>. Throws if one is in use.</summary>
+    IDisposable? LockOldOffset(int disk, long start, long length);
+    /// <summary>Writes nothing to the disk: asks the mount manager to process the arrival of the volume device at
+    /// exactly [start, start + length). False if there is no such device or the request failed.</summary>
+    bool NudgeVolumeArrival(int disk, long start, long length);
+    /// <summary>False only when it is provable that the mount manager does not know the volume (its GUID path has no
+    /// mount points and FindFirstVolume does not list it).</summary>
+    bool VolumeRegistered(string volumePath);
+
     /// <summary>Read-only: the partition's first and last logical sector (NTFS boot and backup boot sector),
     /// <paramref name="sectorSize"/> bytes each, for the journal (v2). Call it after the volume is locked + dismounted
     /// (or hidden) and before any write.</summary>

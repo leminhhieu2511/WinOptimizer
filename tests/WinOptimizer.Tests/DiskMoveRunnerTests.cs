@@ -684,9 +684,112 @@ public sealed class DiskMoveRunnerTests : IDisposable
         await Runner(f).ResumeAsync(new SyncProgress(), () => false);
         AssertMoved(f, b);
         Assert.DoesNotContain(f.Calls.Skip(before), c => c == "Lock(D)");
-        // ... but DiskMove.dll locks the volume device still at the old offset for the copy (no lock of ours to hand over)
-        AssertInOrder(f.Calls.Skip(before).ToList(), "RunMove(0)", "LockOld(D)", "Chunk(0,");
-        Assert.Equal(["D"], f.OldOffsetLocks);
+        // ... but the runner locks the volume device still at the old offset (review M2) and holds it through the copy,
+        // the NTFS patch and the GPT commit; the DLL then needs no lock of its own
+        AssertInOrder(f.Calls.Skip(before).ToList(), "LockOldOffset(D)", "RunMove(0)", "Chunk(0,", "Patch(D)", "SetStart(D,",
+            "SetAttributes(D,visible", "Unlock(D)");
+        Assert.Empty(f.OldOffsetLocks);
+    }
+
+    /// <summary>Review M2: a resumed Recovery move (hidden at its old start) holds the old-offset lock through its patch
+    /// and GPT commit too.</summary>
+    [Fact]
+    public async Task Resume_HiddenRecovery_HoldsOldOffsetLockThroughCommit()
+    {
+        var f = new FakeDiskMoveBackend();
+        var b = Capture(f);
+        f.OnCall = c => { if (c == "Chunk(1,1)") f.CrashAtCall = f.CallCount; };
+        await Assert.ThrowsAnyAsync<Exception>(() => Run(f));
+        f.Revive();
+        int before = f.Calls.Count;
+        await Runner(f).ResumeAsync(new SyncProgress(), () => false);
+        AssertMoved(f, b);
+        AssertInOrder(f.Calls.Skip(before).ToList(), "LockOldOffset(R)", "RunMove(1)", "Patch(R)", "SetStart(R,",
+            "SetAttributes(R,visible", "Unlock(R)");
+        Assert.Empty(f.OldOffsetLocks);
+    }
+
+    /// <summary>Review I1: after a kill right after the unhide in step 4, the volume exists but the mount manager never
+    /// registers it. The resume must not fail: no letter is a warning and steps 5-7 still run.</summary>
+    [Fact]
+    public async Task Step4_VolumeNeverRegisters_WarnsAndFinishesSteps5To7()
+    {
+        var f = new FakeDiskMoveBackend { NudgeHelps = false, ToggleHelps = false };
+        var b = Capture(f);
+        f.OnCall = c => { if (c.StartsWith("SetAttributes(D,visible")) { f.D.Unregistered = true; f.CrashAtCall = f.CallCount; } };
+        await Assert.ThrowsAnyAsync<Exception>(() => Run(f));
+        f.Revive();
+        var r = await Runner(f).ResumeAsync(new SyncProgress(), () => false);
+        Assert.Equal(DiskMoveOutcome.Completed, r.Outcome);
+        Assert.Null(r.FinalSourceLetter);
+        Assert.Contains(r.Warnings, w => w.Contains("has no drive letter"));
+        Assert.Equal(b.RStart + X, f.R.Start);                    // step 5 ran
+        Assert.Equal(b.CSize + X, f.C.Size);                      // step 6 ran
+        Assert.False(DiskMoveRunner.HasUnfinishedMove(_dir));     // step 7 finished
+        Assert.Single(f.Calls, c => c.StartsWith("Nudge(D"));
+        Assert.Equal(1, f.Calls.Count(c => c.StartsWith("SetAttributes(D,hidden")) - 1);   // one toggle (+ the step-2 hide)
+    }
+
+    /// <summary>Review I1: the arrival nudge (no disk write) is tried first; when it helps, no attribute toggle.</summary>
+    [Fact]
+    public async Task Step4_NudgeBringsTheVolumeBack_NoToggle()
+    {
+        var f = new FakeDiskMoveBackend { NudgeHelps = true };
+        var b = Capture(f);
+        f.OnCall = c => { if (c.StartsWith("SetAttributes(D,visible")) { f.D.Unregistered = true; f.CrashAtCall = f.CallCount; } };
+        await Assert.ThrowsAnyAsync<Exception>(() => Run(f));
+        f.Revive();
+        int before = f.Calls.Count;
+        var r = await Runner(f).ResumeAsync(new SyncProgress(), () => false);
+        Assert.Equal(DiskMoveOutcome.Completed, r.Outcome);
+        Assert.Equal('D', r.FinalSourceLetter);
+        Assert.Empty(r.Warnings);
+        AssertMoved(f, b);
+        Assert.DoesNotContain(f.Calls.Skip(before), c => c.StartsWith("SetAttributes(D,hidden"));
+    }
+
+    /// <summary>Review I1: the toggle is the last resort, at most once, and only while the volume is provably
+    /// unregistered (a volume that is registered but has no letter is never hidden again).</summary>
+    [Fact]
+    public async Task Step4_ToggleOnlyWhenUnregistered_AtMostOnce()
+    {
+        var f = new FakeDiskMoveBackend { NudgeHelps = false, ToggleHelps = true };
+        var b = Capture(f);
+        f.OnCall = c => { if (c.StartsWith("SetAttributes(D,visible")) { f.D.Unregistered = true; f.CrashAtCall = f.CallCount; } };
+        await Assert.ThrowsAnyAsync<Exception>(() => Run(f));
+        f.Revive();
+        int before = f.Calls.Count;
+        var r = await Runner(f).ResumeAsync(new SyncProgress(), () => false);
+        Assert.Equal('D', r.FinalSourceLetter);
+        AssertMoved(f, b);
+        Assert.Single(f.Calls.Skip(before), c => c.StartsWith("SetAttributes(D,hidden"));
+
+        // registered but the letter cannot be assigned (e.g. every letter taken): never toggled
+        var g = new FakeDiskMoveBackend { NudgeHelps = false, ToggleHelps = true };
+        g.OnCall = c => { if (c.StartsWith("SetAttributes(D,visible")) { g.D.NoLetterPossible = true; g.CrashAtCall = g.CallCount; } };
+        await Assert.ThrowsAnyAsync<Exception>(() => Run(g));
+        g.Revive();
+        before = g.Calls.Count;
+        var r2 = await Runner(g).ResumeAsync(new SyncProgress(), () => false);
+        Assert.Equal(DiskMoveOutcome.Completed, r2.Outcome);
+        Assert.DoesNotContain(g.Calls.Skip(before), c => c.StartsWith("SetAttributes(D,hidden"));
+        Assert.Contains(r2.Warnings, w => w.Contains("has no drive letter"));
+    }
+
+    /// <summary>Review M7: the saved boot sectors are also kept next to the layout backups (manual recovery path).</summary>
+    [Fact]
+    public async Task Step2_SavesBootSectorBackup()
+    {
+        var f = new FakeDiskMoveBackend();
+        await Run(f);
+        var file = Assert.Single(Directory.GetFiles(_dir, "boot-*.json"));
+        using var doc = System.Text.Json.JsonDocument.Parse(File.ReadAllBytes(file));
+        var parts = doc.RootElement.GetProperty("Partitions").EnumerateArray().ToList();
+        Assert.Equal(2, parts.Count);
+        Assert.Equal(f.D.Guid, parts[0].GetProperty("PartitionGuid").GetGuid());
+        Assert.Equal(f.R.Guid, parts[1].GetProperty("PartitionGuid").GetGuid());
+        Assert.Equal(f.D.BootRead![..FakeDiskMoveBackend.Sector], Convert.FromBase64String(parts[0].GetProperty("FirstSector").GetString()!));
+        Assert.Equal(f.R.BootRead![FakeDiskMoveBackend.Sector..], Convert.FromBase64String(parts[1].GetProperty("BackupBootSector").GetString()!));
     }
 
     /// <summary>Bootfix: the old-offset volume of the half-moved source is in use (Windows mounted it and something holds

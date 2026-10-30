@@ -77,6 +77,12 @@ internal static partial class DiskMoveNative
     internal static extern int RunMove(string diskPath, string journalPath, uint moveIndex, ProgressCallback? progress, IntPtr user,
         IntPtr heldLock);
 
+    [DllImport(Dll, CallingConvention = CallingConvention.Cdecl, CharSet = CharSet.Unicode, EntryPoint = "dmw_lock_old_offset")]
+    internal static extern int LockOldOffset(string diskPath, ulong start, ulong length, out IntPtr volume);
+
+    [DllImport(Dll, CallingConvention = CallingConvention.Cdecl, CharSet = CharSet.Unicode, EntryPoint = "dmw_volume_arrival_nudge")]
+    internal static extern int VolumeArrivalNudge(string diskPath, ulong start, ulong length);
+
     /// <summary>Read-only: first and last logical sector of [start, start + length) (journal v2 boot sectors).</summary>
     [DllImport(Dll, CallingConvention = CallingConvention.Cdecl, CharSet = CharSet.Unicode, EntryPoint = "dmw_read_boot_sectors")]
     internal static extern int ReadBootSectors(string diskPath, ulong start, ulong length, uint sectorSize,

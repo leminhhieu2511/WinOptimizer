@@ -345,6 +345,7 @@ public sealed class DiskMoveRunner
         ctx.SourceDismounted = true;
         var srcBoot = _b.ReadBootSectors(ctx.Disk, s.SourceStart, s.SourceShrunkSize, s.SectorSize);
         var recBoot = recovery is null ? default : ReadRecoveryBootSectors(ctx, recovery);
+        SaveBootBackup(s, srcBoot, recovery is null ? null : recBoot);
         cancel.ThrowIfCancellationRequested();
 
         // Exact attribute bits, read through the DLL, recorded before anything changes them.
@@ -671,8 +672,18 @@ public sealed class DiskMoveRunner
                "later, for example after a restart; until then the Windows partition is not extended and no new move can start." + winRe;
     }
 
+    /// <summary>Review M2: on a resume the partition is hidden and we hold no lock of ours; lock the volume device still
+    /// at its old offset ourselves and keep it through the copy, the pauses, the NTFS patch and the GPT commit (it is
+    /// released with the lock in step 4 / 5). Null if there is no such device.</summary>
+    private IDisposable? HoldOldOffset(Ctx ctx, Guid part, long oldStart, long length)
+    {
+        if (_b.PartitionStart(ctx.Disk, part) != oldStart || (_b.GetPartitionAttributes(ctx.Disk, part) & GptHidden) == 0) return null;
+        return _b.LockOldOffset(ctx.Disk, oldStart, length);
+    }
+
     private void MoveSource(Ctx ctx)
     {
+        ctx.SourceLock ??= HoldOldOffset(ctx, ctx.State.SourceGuid, ctx.State.SourceStart, ctx.State.SourceShrunkSize);
         ctx.Progress.Report(new RunProgress(MoveStep.MoveSource, 0, ctx.State.SourceShrunkSize, "Moving the source partition"));
         RunMove(ctx, 0, MoveStep.MoveSource);
     }
@@ -710,6 +721,7 @@ public sealed class DiskMoveRunner
             throw new DiskMoveStateMismatchException($"The source starts at {start}, neither old nor new.");
         if (!restored)
         {
+            if (start == s.SourceStart) ctx.SourceLock ??= HoldOldOffset(ctx, s.SourceGuid, s.SourceStart, s.SourceShrunkSize);
             // Raw writes are only allowed while the volume is hidden/dismounted: patch before the attributes come back.
             // Always after step 3, so after the core wrote the saved boot sectors to the destination (journal v2).
             _b.PatchNtfsHiddenSectors(ctx.Disk, s.SourceNewStart, s.SourceShrunkSize, s.SectorSize);
@@ -718,7 +730,44 @@ public sealed class DiskMoveRunner
         }
         ctx.SourceLock?.Dispose();
         ctx.SourceLock = null;
-        if (s.SourceLetter != '\0') NoteLetter(ctx, MoveStep.CommitSource, _b.AssignLetter(s.SourceVolumePath!, s.SourceLetter));
+        if (s.SourceLetter == '\0') return;
+        if (AssignLetterOrContinue(ctx) is char letter) NoteLetter(ctx, MoveStep.CommitSource, letter);
+        else ctx.FinalLetter = null;   // step 7 warns about it; steps 5-7 do not need the letter
+    }
+
+    /// <summary>
+    /// Review I1: a missing drive letter never stops the move. After a kill right after the unhide, the volume can exist
+    /// without the mount manager ever registering it (error 87), and nothing re-triggers the arrival. In order:
+    /// (1) the normal assignment (waits ~20 s); (2) an arrival nudge to the mount manager, which writes nothing to the
+    /// disk; (3) only if the volume is still provably unregistered (so it has no letter or open handle to lose), ONE
+    /// hidden -> original attribute toggle, with no lock held; (4) otherwise continue without the letter.
+    /// </summary>
+    private char? AssignLetterOrContinue(Ctx ctx)
+    {
+        var s = ctx.State;
+        char? Try()
+        {
+            try
+            {
+                return _b.AssignLetter(s.SourceVolumePath!, s.SourceLetter);
+            }
+            catch (DiskMoveException)
+            {
+                return null;
+            }
+        }
+        if (Try() is char first) return first;
+        ctx.Progress.Report(new RunProgress(MoveStep.CommitSource, 0, 0, "The drive letter is not back yet; asking Windows to register the volume"));
+        if (_b.NudgeVolumeArrival(ctx.Disk, s.SourceNewStart, s.SourceShrunkSize) && Try() is char nudged) return nudged;
+        if (!_b.VolumeRegistered(s.SourceVolumePath!))
+        {
+            _b.SetPartitionAttributes(ctx.Disk, s.SourceGuid, s.SourceGptAttributes | HideBits);
+            _b.SetPartitionAttributes(ctx.Disk, s.SourceGuid, s.SourceGptAttributes);
+            if (Try() is char toggled) return toggled;
+        }
+        ctx.Progress.Report(new RunProgress(MoveStep.CommitSource, 0, 0,
+            "The drive letter could not be restored now; continuing (the data is moved and safe)"));
+        return null;
     }
 
     /// <summary>Records the source's final letter; a different one than before is a warning, never a stop.</summary>
@@ -759,6 +808,10 @@ public sealed class DiskMoveRunner
                     if (!_b.VerifyVolume(ctx.RecoveryLock, ctx.Disk, s.RecoveryStart, s.RecoverySize))
                         throw new DiskMoveException("The Recovery volume lock no longer matches the partition after hiding it.");
                     _b.Dismount(ctx.RecoveryLock);
+                }
+                else
+                {
+                    ctx.RecoveryLock ??= HoldOldOffset(ctx, rg, s.RecoveryStart, s.RecoverySize);   // review M2
                 }
                 RunMove(ctx, 1, MoveStep.MoveRecovery);
             }
@@ -893,6 +946,23 @@ public sealed class DiskMoveRunner
         }
     }
 
+    /// <summary>Review M7: the saved boot sectors are also kept next to the layout backups (30 days), so a lost journal
+    /// still leaves a manual way to put them back.</summary>
+    private void SaveBootBackup(RestoreState s, (byte[] First, byte[] Backup) source, (byte[] First, byte[] Backup)? recovery)
+    {
+        EnsureDataDir();
+        object Part(Guid g, long start, long length, (byte[] First, byte[] Backup) b) => new
+        {
+            PartitionGuid = g, Start = start, Length = length, s.SectorSize,
+            FirstSector = Convert.ToBase64String(b.First), BackupBootSector = Convert.ToBase64String(b.Backup),
+        };
+        var parts = new List<object> { Part(s.SourceGuid, s.SourceStart, s.SourceShrunkSize, source) };
+        if (recovery is { } r && s.RecoveryGuid is Guid rg) parts.Add(Part(rg, s.RecoveryStart, s.RecoverySize, r));
+        string stamp = Now().ToString(StampFormat, CultureInfo.InvariantCulture);
+        File.WriteAllBytes(Path.Combine(DataDir, $"boot-{stamp}.json"), JsonSerializer.SerializeToUtf8Bytes(
+            new { s.DiskGuid, Partitions = parts }, new JsonSerializerOptions { WriteIndented = true }));
+    }
+
     private void SaveBackups(DiskSnapshot disk, int diskNo)
     {
         EnsureDataDir();
@@ -909,7 +979,8 @@ public sealed class DiskMoveRunner
         {
             if (!Directory.Exists(DataDir)) return;
             var limit = Now() - BackupRetention;
-            foreach (var f in Directory.EnumerateFiles(DataDir, "layout-*.json").Concat(Directory.EnumerateFiles(DataDir, "gpt-*.bin")))
+            foreach (var f in Directory.EnumerateFiles(DataDir, "layout-*.json").Concat(Directory.EnumerateFiles(DataDir, "gpt-*.bin"))
+                         .Concat(Directory.EnumerateFiles(DataDir, "boot-*.json")))
             {
                 string name = Path.GetFileNameWithoutExtension(f);
                 string stamp = name[(name.IndexOf('-') + 1)..];
