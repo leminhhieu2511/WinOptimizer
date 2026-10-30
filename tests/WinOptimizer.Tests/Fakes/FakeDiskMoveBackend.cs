@@ -10,7 +10,9 @@ public sealed class SimulatedCrashException() : Exception("simulated crash");
 /// Models one GPT disk (EFI, MSR, C:, Recovery, D:) plus the Windows behaviour the runner depends on, records every
 /// state-changing call, and fails loudly on anything that would corrupt a real disk:
 /// writing (copy / NTFS patch) under a mounted volume, moving a GPT entry to where its data is not, overlapping
-/// partitions, moving the Recovery before the source was committed, locking a hidden volume, resizing a hidden one.
+/// partitions, moving the Recovery before the source was committed, locking a hidden volume, resizing a hidden one,
+/// reading the journal's boot sectors from a mounted volume or after data moved, a journal whose boot sectors were not
+/// read from that partition, and an NTFS patch before the move restored the saved boot sectors (journal v2).
 /// The journal is a real JSON file so <see cref="DiskMoveRunner.HasUnfinishedJournal"/> sees it.
 /// </summary>
 public sealed class FakeDiskMoveBackend : IDiskMoveBackend
@@ -35,6 +37,10 @@ public sealed class FakeDiskMoveBackend : IDiskMoveBackend
         public long HiddenSectors;       // NTFS boot sector field
         public bool Locked, Dismounted;
         public bool InUse;
+        /// <summary>The bytes ReadBootSectors returned for it (journal v2), and whether a finished move wrote them
+        /// to the destination.</summary>
+        public byte[]? BootRead;
+        public bool BootRestored;
         public bool IsHidden => (Attrs & Hidden) != 0;
         /// <summary>Windows can write to it: it has a volume (not hidden) and we do not hold it locked + dismounted.</summary>
         public bool Mounted => !IsHidden && !(Locked && Dismounted);
@@ -307,6 +313,7 @@ public sealed class FakeDiskMoveBackend : IDiskMoveBackend
     sealed class JFile
     {
         public List<NativeMovePlanDto> Moves { get; set; } = [];
+        public List<byte[]> Boot { get; set; } = [];
         public int Step { get; set; }
         public int MoveIndex { get; set; }
         public long ChunksDone { get; set; }
@@ -323,13 +330,20 @@ public sealed class FakeDiskMoveBackend : IDiskMoveBackend
     {
         Alive();
         foreach (var m in moves)
+        {
             if (m.Extents.Count != 1 || m.Extents[0] != (0L, m.Length))
                 throw new InvalidOperationException("fake: every move must copy the whole partition (one extent)");
+            var part = P(m.PartitionGuid);
+            if (part.BootRead is null || m.BootFirst is null || m.BootBackup is null ||
+                !m.BootFirst.Concat(m.BootBackup).SequenceEqual(part.BootRead))
+                throw new InvalidOperationException($"fake: the journal's boot sectors of {part.Name} were not read from it");
+        }
         Directory.CreateDirectory(Path.GetDirectoryName(path)!);
         var j = new JFile
         {
             Moves = moves.Select(m => new NativeMovePlanDto(m.DiskGuid, m.PartitionGuid, m.SectorSize, m.OldStart, m.Length, m.Shift)).ToList(),
             ChunkCount = [ChunksPerMove, moves.Count > 1 ? ChunksPerMove : 0],
+            Boot = moves.Select(m => m.BootFirst.Concat(m.BootBackup).ToArray()).ToList(),
             App = state.ToJsonBytes(),
         };
         Save(path, j);
@@ -356,6 +370,25 @@ public sealed class FakeDiskMoveBackend : IDiskMoveBackend
 
     public NativeMovePlanDto JournalMove(string path, int i) => Load(path).Moves[i];
 
+    /// <summary>Read-only. Models dmw_read_boot_sectors: bytes unique to the partition and its current data position.</summary>
+    public (byte[] First, byte[] Backup) ReadBootSectors(int disk, long start, long length, int sectorSize)
+    {
+        Disk(disk);
+        var p = Parts.SingleOrDefault(x => x.Start == start && x.Size == length)
+                ?? throw new InvalidOperationException($"fake: no partition at {start} (+{length}) to read boot sectors from");
+        if (p.Mounted) throw new InvalidOperationException($"fake: boot sectors of the mounted volume {p.Name} read (lock + dismount first)");
+        if (p.DataStart != start) throw new InvalidOperationException($"fake: boot sectors of {p.Name} read after its data moved");
+        if (sectorSize != Sector) throw new InvalidOperationException($"fake: sector size {sectorSize}");
+        var bytes = new byte[2 * sectorSize];
+        new Random(p.Name.GetHashCode() ^ (int)(start / MiB)).NextBytes(bytes);
+        p.BootRead = bytes;
+        Calls.Add($"ReadBoot({p.Name})");
+        return (bytes[..sectorSize], bytes[sectorSize..]);
+    }
+
+    /// <summary>The volumes DiskMove.dll locked by itself at the old offset (RunMove without a held lock).</summary>
+    public readonly List<string> OldOffsetLocks = [];
+
     public void SetJournalStep(string path, MoveStep step)
     {
         Alive();
@@ -372,7 +405,7 @@ public sealed class FakeDiskMoveBackend : IDiskMoveBackend
         Did("DeleteJournal");
     }
 
-    public bool RunMove(int disk, string journal, int moveIndex, Func<long, long, bool> progress)
+    public bool RunMove(int disk, string journal, int moveIndex, Func<long, long, bool> progress, IDisposable? heldLock)
     {
         Disk(disk);
         var j = Load(journal);
@@ -382,6 +415,29 @@ public sealed class FakeDiskMoveBackend : IDiskMoveBackend
         if (m.DiskGuid != DiskGuid || p is null || p.Size != m.Length || (p.Start != m.OldStart && p.Start != m.OldStart + m.Shift))
             throw new DiskMoveStateMismatchException("fake: DM_E_JOURNAL_MISMATCH");
         Calls.Add($"RunMove({moveIndex})");
+        if (heldLock is not null && (heldLock is not Vol { Part: var hp } || hp != p || !p.Locked))
+            throw new InvalidOperationException($"fake: RunMove({moveIndex}) got a lock that is not {p.Name}'s");
+        bool oldOffsetLock = false;
+        if (heldLock is null && p.Start == m.OldStart && p.IsHidden && !p.Locked)
+        {
+            // dmw_run_move finds the volume device still at the old offset and locks + dismounts it for the run.
+            if (p.InUse) throw new DiskMoveNativeException(11, "fake: old-offset volume lock (DM_E_LOCKED)");
+            p.Locked = p.Dismounted = oldOffsetLock = true;
+            OldOffsetLocks.Add(p.Name);
+            Calls.Add($"LockOld({p.Name})");
+        }
+        try
+        {
+            return CopyChunks(j, journal, m, p, moveIndex, progress);
+        }
+        finally
+        {
+            if (oldOffsetLock && !Dead) p.Locked = p.Dismounted = false;
+        }
+    }
+
+    bool CopyChunks(JFile j, string journal, NativeMovePlanDto m, Part p, int moveIndex, Func<long, long, bool> progress)
+    {
         if (moveIndex < j.MoveIndex) return true;
         if (moveIndex > j.MoveIndex)
         {
@@ -399,7 +455,11 @@ public sealed class FakeDiskMoveBackend : IDiskMoveBackend
         for (long i = j.ChunksDone; i < n; i++)
         {
             j.ChunksDone = i + 1;
-            if (j.ChunksDone == n) p.DataStart = m.OldStart + m.Shift;
+            if (j.ChunksDone == n)
+            {
+                p.DataStart = m.OldStart + m.Shift;
+                p.BootRestored = true;   // the core writes the saved boot sectors after the last chunk
+            }
             Save(journal, j);
             ChunkCopies[moveIndex]++;
             Did($"Chunk({moveIndex},{i})");
@@ -425,6 +485,7 @@ public sealed class FakeDiskMoveBackend : IDiskMoveBackend
         var p = Parts.SingleOrDefault(x => x.DataStart == start && x.Size == length)
                 ?? throw new InvalidOperationException($"fake: NTFS patch at {start} where no file system is");
         if (p.Mounted) throw new InvalidOperationException($"fake: raw write into the mounted volume {p.Name}");
+        if (!p.BootRestored) throw new InvalidOperationException($"fake: NTFS patch of {p.Name} before its boot sectors were restored");
         p.HiddenSectors = start / sectorSize;
         Did($"Patch({p.Name})");
     }

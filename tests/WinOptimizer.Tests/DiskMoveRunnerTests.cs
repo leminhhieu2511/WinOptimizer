@@ -127,7 +127,9 @@ public sealed class DiskMoveRunnerTests : IDisposable
         AssertInOrder(f.Calls,
             "ReadRawGpt",                                  // 0
             "Resize(D,",                                   // 1
-            "Lock(D)", "Verify(D)", "CreateJournal",       // 2: journal BEFORE the hide
+            "Lock(D)", "Verify(D)", "Dismount(D)", "ReadBoot(D)",                   // 2: boot sectors after lock + dismount
+            "Lock(R)", "Verify(R)", "Dismount(R)", "ReadBoot(R)", "Unlock(R)",
+            "CreateJournal",                               // journal BEFORE the hide
             "SetAttributes(D,hidden", "Verify(D)", "RemoveLetter(D,D)", "Dismount(D)",
             "Step(MoveSource)", "RunMove(0)", "Chunk(0,3)", // 3
             "Step(CommitSource)", "Patch(D)", "SetStart(D,", "SetAttributes(D,visible", "Unlock(D)", "AssignLetter(D,D)", // 4
@@ -136,6 +138,7 @@ public sealed class DiskMoveRunnerTests : IDisposable
             "Step(ExtendTarget)", "Resize(C,",            // 6
             "Step(Verify)", "Chkdsk(D)", "Step(Done)", "DeleteJournal"); // 7
         Assert.True(f.Calls.IndexOf("CreateJournal") < f.Calls.FindIndex(c => c.StartsWith("SetAttributes(D,hidden")));
+        Assert.Empty(f.OldOffsetLocks);   // a fresh run hands its own locks to DiskMove.dll
         Assert.Equal(new[] { 4, 4 }, new[] { f.ChunkCopies[0], f.ChunkCopies[1] });
         var steps = progress.Items.Select(p => p.Step).Distinct().ToList();
         Assert.Equal(Enum.GetValues<MoveStep>().Where(s => s != MoveStep.Done), steps.Where(s => s != MoveStep.Done));
@@ -250,7 +253,8 @@ public sealed class DiskMoveRunnerTests : IDisposable
                 AssertNotMoved(f, b);
             }
         }
-        Assert.True(resumed > 20 && undone == 2 && untouched == 0 && finished == 1,
+        // undone: Resize(D), Lock(D), Dismount(D), Lock(R), Dismount(R) (step 2 reads the boot sectors before the journal)
+        Assert.True(resumed > 20 && undone == 5 && untouched == 0 && finished == 1,
             $"resumed {resumed}, undone {undone}, untouched {untouched}, finished {finished}");
     }
 
@@ -273,7 +277,8 @@ public sealed class DiskMoveRunnerTests : IDisposable
         var f = new FakeDiskMoveBackend();
         var b = Capture(f);
         using var cts = new CancellationTokenSource();
-        f.OnCall = c => { if (c == "Dismount(D)") cts.Cancel(); };
+        int dismounts = 0;   // the second Dismount(D) ends step 2 (the first one comes before the boot sector read)
+        f.OnCall = c => { if (c == "Dismount(D)" && ++dismounts == 2) cts.Cancel(); };
         await Assert.ThrowsAnyAsync<OperationCanceledException>(() => Run(f, ct: cts.Token));
 
         Assert.Equal(b.DAttrs, f.D.Attrs);
@@ -445,9 +450,10 @@ public sealed class DiskMoveRunnerTests : IDisposable
         var b = Capture(f);
         using var cts = new CancellationTokenSource();
         bool pendingAtFirstUndoCall = false;
+        int dismounts = 0;   // the second Dismount(D) ends step 2 (the first one comes before the boot sector read)
         f.OnCall = c =>
         {
-            if (c == "Dismount(D)") cts.Cancel();
+            if (c == "Dismount(D)" && ++dismounts == 2) cts.Cancel();
             if (c.StartsWith("SetAttributes(D,visible")) pendingAtFirstUndoCall = File.Exists(Pending);
             bool hit = point switch
             {
@@ -679,6 +685,49 @@ public sealed class DiskMoveRunnerTests : IDisposable
         await Runner(f).ResumeAsync(new SyncProgress(), () => false);
         AssertMoved(f, b);
         Assert.DoesNotContain(f.Calls.Skip(before), c => c == "Lock(D)");
+        // ... but DiskMove.dll locks the volume device still at the old offset for the copy (no lock of ours to hand over)
+        AssertInOrder(f.Calls.Skip(before).ToList(), "RunMove(0)", "LockOld(D)", "Chunk(0,");
+        Assert.Equal(["D"], f.OldOffsetLocks);
+    }
+
+    /// <summary>Bootfix: the old-offset volume of the half-moved source is in use (Windows mounted it and something holds
+    /// it): the resume stops with DM_E_LOCKED before copying anything; the journal stays and a later resume completes.</summary>
+    [Fact]
+    public async Task Resume_OldOffsetVolumeBusy_StopsWithoutCopying_ThenCompletes()
+    {
+        var f = new FakeDiskMoveBackend();
+        var b = Capture(f);
+        f.OnCall = c => { if (c == "Chunk(0,1)") f.CrashAtCall = f.CallCount; };
+        await Assert.ThrowsAnyAsync<Exception>(() => Run(f));
+        f.Revive();
+        f.D.InUse = true;
+        int copies = f.ChunkCopies[0];
+        var ex = await Assert.ThrowsAsync<DiskMoveNativeException>(() => Runner(f).ResumeAsync(new SyncProgress(), () => false));
+        Assert.Contains("DM_E_LOCKED", ex.Message);
+        Assert.Equal(copies, f.ChunkCopies[0]);
+        Assert.True(DiskMoveRunner.HasUnfinishedJournal(Journal));
+        Assert.True(f.D.IsHidden);
+
+        f.D.InUse = false;
+        await Runner(f).ResumeAsync(new SyncProgress(), () => false);
+        AssertMoved(f, b);
+    }
+
+    /// <summary>Bootfix: step 2 also reads the Recovery's boot sectors for the journal (locked + dismounted, then
+    /// released). A busy Recovery volume therefore stops the run in step 2, before any data moved: everything undone.</summary>
+    [Fact]
+    public async Task Step2_RecoveryBusy_UndoneBeforeAnyDataMoved()
+    {
+        var f = new FakeDiskMoveBackend();
+        var b = Capture(f);
+        f.R.InUse = true;
+        await Assert.ThrowsAsync<DiskMoveNativeException>(() => Run(f));
+        Assert.DoesNotContain(f.Calls, c => c.StartsWith("RunMove") || c.StartsWith("Step(") || c == "CreateJournal");
+        Assert.Equal(b.DAttrs, f.D.Attrs);
+        Assert.Equal(b.DSize, f.D.Size);
+        Assert.Equal(b.DLetter, f.D.Letter);
+        Assert.False(f.D.Locked);
+        Assert.False(DiskMoveRunner.HasUnfinishedMove(_dir));
     }
 
     [Fact]
@@ -824,8 +873,9 @@ public sealed class DiskMoveRunnerTests : IDisposable
     {
         var f = new FakeDiskMoveBackend();
         var b = Capture(f);
-        f.R.InUse = true;   // something holds the Recovery volume
+        f.OnCall = c => { if (c == "CreateJournal") f.R.InUse = true; };   // something takes the Recovery after step 2
         var ex = await Assert.ThrowsAsync<DiskMoveAfterCommitException>(() => Run(f));
+        f.OnCall = null;
         Assert.StartsWith("D:'s data is already moved and safe. Moving the Recovery partition did not finish", ex.Message);
         Assert.Contains("Try again later", ex.Message);
         Assert.IsType<DiskMoveNativeException>(ex.InnerException);
@@ -866,12 +916,12 @@ public sealed class DiskMoveRunnerTests : IDisposable
         var f = new FakeDiskMoveBackend();
         var b = Capture(f);
         using var cts = new CancellationTokenSource();
-        int countAtCancel = -1;
+        int countAtCancel = -1, dismounts = 0;
         f.OnCall = c =>
         {
-            if (c != "Dismount(D)") return;
+            if (c != "Dismount(D)" || ++dismounts != 2) return;   // the end of step 2
             f.D.Size = b.DSize + FakeDiskMoveBackend.MiB;   // something grew it (the fake's model allows it: D is hidden)
-            countAtCancel = f.Calls.Count;
+            countAtCancel = f.Calls.Count(x => !x.StartsWith("Unlock"));   // step 2 already released the Recovery lock
             cts.Cancel();
         };
         await Assert.ThrowsAsync<DiskMoveStateMismatchException>(() => Run(f, ct: cts.Token));

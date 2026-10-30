@@ -47,6 +47,11 @@ public interface IDiskMoveBackend
     /// <summary>First 34 and last 33 sectors of the disk (primary and backup GPT).</summary>
     byte[] ReadRawGpt(int disk, int sectorSize);
 
+    /// <summary>Read-only: the partition's first and last logical sector (NTFS boot and backup boot sector),
+    /// <paramref name="sectorSize"/> bytes each, for the journal (v2). Call it after the volume is locked + dismounted
+    /// (or hidden) and before any write.</summary>
+    (byte[] First, byte[] Backup) ReadBootSectors(int disk, long start, long length, int sectorSize);
+
     /// <summary>Creates the journal (CREATE_ALWAYS) with the moves and the restore state as its app blob.</summary>
     void CreateJournal(string path, IReadOnlyList<NativeMovePlan> moves, RestoreState state);
     /// <summary>Null if there is no journal file; throws if it exists but cannot be read.</summary>
@@ -56,8 +61,11 @@ public interface IDiskMoveBackend
 
     /// <summary>Runs or resumes move <paramref name="moveIndex"/> of the journal (DiskMove.dll checks the disk's
     /// identity first). <paramref name="progress"/>(done, total) returning true stops between two chunks.
+    /// <paramref name="heldLock"/>: the caller's own lock on this partition's volume at its old start (locked +
+    /// dismounted), or null; with null DiskMove.dll looks for the volume device still at the old offset (a hidden,
+    /// half-moved partition keeps one) and holds it locked + dismounted for the whole run.
     /// Returns true when the move is complete, false when it stopped on request.</summary>
-    bool RunMove(int disk, string journal, int moveIndex, Func<long, long, bool> progress);
+    bool RunMove(int disk, string journal, int moveIndex, Func<long, long, bool> progress, IDisposable? heldLock);
     /// <summary>Moves the GPT entry to newStart (idempotent).</summary>
     void SetPartitionStart(int disk, Guid part, long newStart);
     void PatchNtfsHiddenSectors(int disk, long start, long length, int sectorSize);

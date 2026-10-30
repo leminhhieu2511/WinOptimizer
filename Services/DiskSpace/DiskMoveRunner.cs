@@ -18,8 +18,11 @@ namespace WinOptimizer.Services.DiskSpace;
 /// <para>Resume never guesses: before any write it checks that the actual starts of the source and the Recovery
 /// partition are each exactly one of the values the recorded step allows (old / new), their sizes, the target size,
 /// the move progress and that the source is still hidden while its data is half moved; otherwise it throws
-/// <see cref="DiskMoveStateMismatchException"/>. A hidden partition has no volume device, so a resume never locks
-/// it; dmw_run_move's own disk/partition identity check guards the raw writes.</para>
+/// <see cref="DiskMoveStateMismatchException"/>. A hidden partition has no letter and no volume GUID path, so the runner
+/// cannot lock it by name; but Windows keeps its volume device at the OLD offset and may mount it on any layout change.
+/// Two defences (journal v2): the core zeroes the old boot sectors before the first chunk (any mount then sees RAW),
+/// and dmw_run_move, given no lock of ours, finds that old-offset device itself and holds it locked + dismounted for
+/// the whole copy. dmw_run_move's own disk/partition identity check guards the raw writes.</para>
 /// </summary>
 public sealed class DiskMoveRunner
 {
@@ -326,7 +329,8 @@ public sealed class DiskMoveRunner
             throw new DiskMoveException($"The source is {after} bytes after shrinking, expected {s.SourceShrunkSize}.");
     }
 
-    /// <summary>Step 2 of a fresh run: lock, verify, create the journal, hide + remove the letter, dismount.</summary>
+    /// <summary>Step 2 of a fresh run: lock, verify, dismount, save the boot sectors (source and Recovery), create the
+    /// journal, hide + remove the letter, dismount.</summary>
     private void LockSourceFresh(Ctx ctx, PartitionSnapshot? recovery, CancellationToken cancel)
     {
         var s = ctx.State;
@@ -334,6 +338,10 @@ public sealed class DiskMoveRunner
         ctx.SourceLock = _b.LockVolume(s.SourceVolumePath!);
         if (!_b.VerifyVolume(ctx.SourceLock, ctx.Disk, s.SourceStart, s.SourceShrunkSize))
             throw new DiskMoveException("The locked volume is not the source partition on this disk.");
+        // Journal v2: the original boot sectors, read after the lock + dismount and before any write.
+        _b.Dismount(ctx.SourceLock);
+        var srcBoot = _b.ReadBootSectors(ctx.Disk, s.SourceStart, s.SourceShrunkSize, s.SectorSize);
+        var recBoot = recovery is null ? default : ReadRecoveryBootSectors(ctx, recovery);
         cancel.ThrowIfCancellationRequested();
 
         // Exact attribute bits, read through the DLL, recorded before anything changes them.
@@ -345,16 +353,33 @@ public sealed class DiskMoveRunner
 
         var moves = new List<NativeMovePlan>
         {
-            new(s.DiskGuid, s.SourceGuid, s.SectorSize, s.SourceStart, s.SourceShrunkSize, s.Amount, [(0L, s.SourceShrunkSize)]),
+            new(s.DiskGuid, s.SourceGuid, s.SectorSize, s.SourceStart, s.SourceShrunkSize, s.Amount, [(0L, s.SourceShrunkSize)],
+                srcBoot.First, srcBoot.Backup),
         };
         if (s.RecoveryGuid is Guid rg)
-            moves.Add(new(s.DiskGuid, rg, s.SectorSize, s.RecoveryStart, s.RecoverySize, s.Amount, [(0L, s.RecoverySize)]));
+            moves.Add(new(s.DiskGuid, rg, s.SectorSize, s.RecoveryStart, s.RecoverySize, s.Amount, [(0L, s.RecoverySize)],
+                recBoot.First, recBoot.Backup));
         _b.CreateJournal(_journal, moves, s);
         ctx.JournalCreated = true;
         DeletePending();   // the journal supersedes it
         cancel.ThrowIfCancellationRequested();
 
         HideSource(ctx);
+    }
+
+    /// <summary>The Recovery's boot sectors for the journal (step 2; the journal holds both moves). A visible Recovery is
+    /// locked, verified and dismounted for the read, then released (step 5 locks it again for its move; reagentc needs it
+    /// in between); a hidden one has no volume path and is read as it is. Nothing is written either way.</summary>
+    private (byte[] First, byte[] Backup) ReadRecoveryBootSectors(Ctx ctx, PartitionSnapshot recovery)
+    {
+        var s = ctx.State;
+        if ((_b.GetPartitionAttributes(ctx.Disk, recovery.Guid) & GptHidden) != 0 || string.IsNullOrEmpty(s.RecoveryVolumePath))
+            return _b.ReadBootSectors(ctx.Disk, s.RecoveryStart, s.RecoverySize, s.SectorSize);
+        using var rlock = _b.LockVolume(s.RecoveryVolumePath);
+        if (!_b.VerifyVolume(rlock, ctx.Disk, s.RecoveryStart, s.RecoverySize))
+            throw new DiskMoveException("The locked volume is not the Recovery partition on this disk.");
+        _b.Dismount(rlock);
+        return _b.ReadBootSectors(ctx.Disk, s.RecoveryStart, s.RecoverySize, s.SectorSize);
     }
 
     /// <summary>original | HIDDEN | NO_DRIVE_LETTER in one layout write; re-verify the lock handle; remove the
@@ -579,7 +604,8 @@ public sealed class DiskMoveRunner
         if (!tOk) Fail($"the target is {tSize} bytes; expected {s.TargetOriginalSize} or {tNew}");
     }
 
-    /// <summary>Step 2 on resume: lock + hide only if the source is still visible (a hidden one has no volume).</summary>
+    /// <summary>Step 2 on resume: lock + hide only if the source is still visible (a hidden one has no volume path;
+    /// DiskMove.dll locks its old-offset device itself during the copy).</summary>
     private void LockSourceResume(Ctx ctx)
     {
         var s = ctx.State;
@@ -647,16 +673,19 @@ public sealed class DiskMoveRunner
         RunMove(ctx, 0, MoveStep.MoveSource);
     }
 
-    /// <summary>Copy with pause: the progress callback returns shouldPause(); a stopped move waits (polling) and runs again.</summary>
+    /// <summary>Copy with pause: the progress callback returns shouldPause(); a stopped move waits (polling) and runs again.
+    /// Our own lock on the partition (fresh run, or a resume that found it visible) is handed to DiskMove.dll; without
+    /// one the DLL locks the volume device still at the old offset for the whole run.</summary>
     private void RunMove(Ctx ctx, int index, MoveStep step)
     {
         while (true)
         {
+            var held = index == 0 ? ctx.SourceLock : ctx.RecoveryLock;
             bool complete = _b.RunMove(ctx.Disk, _journal, index, (done, total) =>
             {
                 ctx.Progress.Report(new RunProgress(step, done, total, "Moving data"));
                 return ctx.ShouldPause();
-            });
+            }, held);
             if (complete) return;
             ctx.Progress.Report(new RunProgress(step, 0, 0, "Paused"));
             while (ctx.ShouldPause()) Thread.Sleep(PausePollInterval);
@@ -678,6 +707,7 @@ public sealed class DiskMoveRunner
         if (!restored)
         {
             // Raw writes are only allowed while the volume is hidden/dismounted: patch before the attributes come back.
+            // Always after step 3, so after the core wrote the saved boot sectors to the destination (journal v2).
             _b.PatchNtfsHiddenSectors(ctx.Disk, s.SourceNewStart, s.SourceShrunkSize, s.SectorSize);
             _b.SetPartitionStart(ctx.Disk, s.SourceGuid, s.SourceNewStart);
             _b.SetPartitionAttributes(ctx.Disk, s.SourceGuid, s.SourceGptAttributes);   // still locked in a fresh run

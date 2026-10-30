@@ -18,7 +18,7 @@ internal static partial class DiskMoveNative
         public ulong Offset, Length;
     }
 
-    /// <summary>dm_move_plan (80 bytes on x64). GUIDs are Windows GUID structs (= .NET Guid layout).</summary>
+    /// <summary>dm_move_plan (96 bytes on x64). GUIDs are Windows GUID structs (= .NET Guid layout).</summary>
     [StructLayout(LayoutKind.Sequential)]
     internal struct DmMovePlan
     {
@@ -26,15 +26,18 @@ internal static partial class DiskMoveNative
         public uint SectorSize;
         public ulong OldStart, Length, Shift;
         public uint ExtentCount;
-        public IntPtr Extents;   // const dm_extent *
+        public IntPtr Extents;      // const dm_extent *
+        public IntPtr BootFirst;    // const uint8_t * (SectorSize bytes): journal v2
+        public IntPtr BootBackup;   // const uint8_t * (SectorSize bytes)
     }
 
-    /// <summary>dm_journal_info (48 bytes).</summary>
+    /// <summary>dm_journal_info (56 bytes).</summary>
     [StructLayout(LayoutKind.Sequential)]
     internal struct DmJournalInfo
     {
         public uint MoveCount, Step, MoveIndex;
         public ulong ChunksDone, ChunkCount0, ChunkCount1, Seq;
+        public uint BootRestored;
     }
 
     /// <summary>dm_progress_cb: return non-zero to stop between two chunks.</summary>
@@ -68,9 +71,16 @@ internal static partial class DiskMoveNative
     [DllImport(Dll, CallingConvention = CallingConvention.Cdecl, CharSet = CharSet.Unicode, EntryPoint = "dmw_journal_set_step")]
     internal static extern int JournalSetStep(string path, uint step);
 
-    /// <summary>Runs/resumes a move; checks the disk GUID and the partition (old or new start) before writing.</summary>
+    /// <summary>Runs/resumes a move; checks the disk GUID and the partition (old or new start) before writing. Without
+    /// <paramref name="heldLock"/> (IntPtr.Zero) the DLL itself locks + dismounts the volume device still at the old offset.</summary>
     [DllImport(Dll, CallingConvention = CallingConvention.Cdecl, CharSet = CharSet.Unicode, EntryPoint = "dmw_run_move")]
-    internal static extern int RunMove(string diskPath, string journalPath, uint moveIndex, ProgressCallback? progress, IntPtr user);
+    internal static extern int RunMove(string diskPath, string journalPath, uint moveIndex, ProgressCallback? progress, IntPtr user,
+        IntPtr heldLock);
+
+    /// <summary>Read-only: first and last logical sector of [start, start + length) (journal v2 boot sectors).</summary>
+    [DllImport(Dll, CallingConvention = CallingConvention.Cdecl, CharSet = CharSet.Unicode, EntryPoint = "dmw_read_boot_sectors")]
+    internal static extern int ReadBootSectors(string diskPath, ulong start, ulong length, uint sectorSize,
+        [Out] byte[] first, [Out] byte[] backup);
 
     [DllImport(Dll, CallingConvention = CallingConvention.Cdecl, CharSet = CharSet.Unicode, EntryPoint = "dmw_set_partition_start")]
     internal static extern int SetPartitionStart(string diskPath, in Guid partitionGuid, ulong newStart);

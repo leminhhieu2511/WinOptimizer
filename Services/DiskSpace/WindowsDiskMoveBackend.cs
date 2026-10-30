@@ -385,16 +385,23 @@ public sealed class WindowsDiskMoveBackend : IDiskMoveBackend
         var pins = new List<GCHandle>();
         try
         {
+            IntPtr Pin(object o)
+            {
+                var pin = GCHandle.Alloc(o, GCHandleType.Pinned);
+                pins.Add(pin);
+                return pin.AddrOfPinnedObject();
+            }
             var plans = moves.Select(m =>
             {
+                if (m.BootFirst?.Length != m.SectorSize || m.BootBackup?.Length != m.SectorSize)
+                    throw new ArgumentException("Each move needs its saved boot sectors (sector size bytes each).", nameof(moves));
                 var ext = m.Extents.Select(x => new DiskMoveNative.DmExtent { Offset = (ulong)x.Offset, Length = (ulong)x.Length }).ToArray();
-                var pin = GCHandle.Alloc(ext, GCHandleType.Pinned);
-                pins.Add(pin);
                 return new DiskMoveNative.DmMovePlan
                 {
                     DiskGuid = m.DiskGuid, PartitionGuid = m.PartitionGuid, SectorSize = (uint)m.SectorSize,
                     OldStart = (ulong)m.OldStart, Length = (ulong)m.Length, Shift = (ulong)m.Shift,
-                    ExtentCount = (uint)ext.Length, Extents = pin.AddrOfPinnedObject(),
+                    ExtentCount = (uint)ext.Length, Extents = Pin(ext),
+                    BootFirst = Pin(m.BootFirst), BootBackup = Pin(m.BootBackup),
                 };
             }).ToArray();
             var blob = state.ToJsonBytes();
@@ -431,7 +438,15 @@ public sealed class WindowsDiskMoveBackend : IDiskMoveBackend
 
     public void DeleteJournal(string path) => File.Delete(path);
 
-    public bool RunMove(int disk, string journal, int moveIndex, Func<long, long, bool> progress)
+    public (byte[] First, byte[] Backup) ReadBootSectors(int disk, long start, long length, int sectorSize)
+    {
+        byte[] first = new byte[sectorSize], backup = new byte[sectorSize];
+        Check(DiskMoveNative.ReadBootSectors(DiskPath(disk), (ulong)start, (ulong)length, (uint)sectorSize, first, backup),
+            "Reading the boot sectors");
+        return (first, backup);
+    }
+
+    public bool RunMove(int disk, string journal, int moveIndex, Func<long, long, bool> progress, IDisposable? heldLock)
     {
         Exception? callbackError = null;
         DiskMoveNative.ProgressCallback cb = (_, done, total) =>
@@ -446,7 +461,8 @@ public sealed class WindowsDiskMoveBackend : IDiskMoveBackend
                 return 1;   // stop between two chunks, then rethrow below
             }
         };
-        int st = DiskMoveNative.RunMove(DiskPath(disk), journal, (uint)moveIndex, cb, IntPtr.Zero);
+        int st = DiskMoveNative.RunMove(DiskPath(disk), journal, (uint)moveIndex, cb, IntPtr.Zero,
+            heldLock is null ? IntPtr.Zero : H(heldLock));
         GC.KeepAlive(cb);
         if (callbackError is not null) ExceptionDispatchInfo.Capture(callbackError).Throw();
         if (st == DiskMoveNative.DM_E_STOPPED) return false;

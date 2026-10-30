@@ -104,7 +104,7 @@ public sealed record RunProgress(MoveStep Step, long BytesDone, long BytesTotal,
 
 /// <summary>One partition move as handed to DiskMove.dll (dm_move_plan). Bytes; the partition moves right by Shift.</summary>
 public sealed record NativeMovePlan(Guid DiskGuid, Guid PartitionGuid, int SectorSize, long OldStart, long Length,
-    long Shift, IReadOnlyList<(long Offset, long Length)> Extents);
+    long Shift, IReadOnlyList<(long Offset, long Length)> Extents, byte[] BootFirst, byte[] BootBackup);
 
 /// <summary>The journal's newest progress slot (dm_journal_info).</summary>
 public sealed record JournalInfo(int MoveCount, MoveStep Step, int MoveIndex, long ChunksDone, long[] ChunkCount)
