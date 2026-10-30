@@ -91,6 +91,7 @@ public sealed class NativeMoveVhdxTests(ITestOutputHelper output)
     [InlineData("phase:patch")]
     [InlineData("phase:commit-gpt")]
     [InlineData("phase:restore")]
+    [InlineData("phase:unhidden")]
     public void Move_KilledAtPoint_ResumesCleanly(string killAt)
     {
         string name = "kill-" + killAt.Replace(':', '-');
@@ -150,6 +151,33 @@ public sealed class NativeMoveVhdxTests(ITestOutputHelper output)
         {
             activity?.Join();
             other?.Dispose();
+            SaveLog(name);
+        }
+    }
+
+    /// <summary>
+    /// Review I1 (error 87): "move" is killed right after it un-hid the committed volume while still holding its lock
+    /// ("phase unhidden"). The volume then often exists without the mount manager registering it. "commit --journal"
+    /// must still finish: the letter comes back by itself, after the arrival nudge, or after the one attribute toggle
+    /// (the CLI output says which), and the move must never fail on the letter.
+    /// </summary>
+    [AdminTheory]
+    [InlineData(1)]
+    [InlineData(2)]
+    [InlineData(3)]
+    public void Move_KilledRightAfterUnhide_CommitBringsTheLetterBack(int run)
+    {
+        string name = $"unhide-kill-{run}";
+        try
+        {
+            using var vhdx = VhdxFixture.Create(name, Log);
+            var m = Prepare(vhdx, name);
+            KillAt(m, "phase:unhidden");
+            Recover(m, "phase:unhidden");
+            AssertMoved(vhdx, m);
+        }
+        finally
+        {
             SaveLog(name);
         }
     }
@@ -402,11 +430,11 @@ public sealed class NativeMoveVhdxTests(ITestOutputHelper output)
             Assert.True(done > 0 && done < count, $"expected partial progress, got {done}/{count}");
             Assert.True(sidecar, "the sidecar must exist mid-copy");
         }
-        else if (killAt is "phase:patch" or "phase:commit-gpt" or "phase:restore")   // copied, not finished
+        else if (killAt is "phase:patch" or "phase:commit-gpt" or "phase:restore" or "phase:unhidden")   // copied, not finished
         {
             Assert.Equal(0, statusRc);
             Assert.True(done == count && count > 0, $"expected a finished copy, got {done}/{count}");
-            if (killAt != "phase:restore") Assert.True(sidecar, "the sidecar must exist before the restore");
+            if (killAt is not ("phase:restore" or "phase:unhidden")) Assert.True(sidecar, "the sidecar must exist before the restore");
         }
 
         if (statusRc == 0)

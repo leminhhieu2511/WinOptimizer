@@ -171,6 +171,55 @@ public sealed class RunnerVhdxTests(ITestOutputHelper output)
         }
     }
 
+    /// <summary>
+    /// Review I1, product side: the run "crashes" in step 4 right after the source was un-hid (the lock is released by
+    /// the crash, as by a kill). The resume must complete steps 5-7 whatever happens to the drive letter: back (by
+    /// itself, after the arrival nudge, or after the single toggle; the log says which) or a warning.
+    /// </summary>
+    [AdminTheory]
+    [InlineData(1)]
+    [InlineData(2)]
+    [InlineData(3)]
+    public async Task CrashRightAfterUnhide_ResumeFinishesSteps5To7_OnVhdx(int run)
+    {
+        string name = $"runner-unhide-{run}";
+        try
+        {
+            using var vhdx = VhdxFixture.Create(name, Log);
+            var c = Prepare(vhdx, name);
+            var crashing = new GuardedBackend(new WindowsDiskMoveBackend(), c, Log) { CrashAfterSourceUnhide = true };
+            await Assert.ThrowsAsync<SimulatedCrashException>(() =>
+                new DiskMoveRunner(crashing, c.Journal, manageWinRe: false)
+                    .RunAsync(c.Disk, c.Target, c.Source, c.Plan, () => [], new LogProgress(Log), () => false, CancellationToken.None));
+            Assert.True(crashing.Crashed, "the crash point was not reached");
+
+            var resumed = new GuardedBackend(new WindowsDiskMoveBackend(), c, Log);
+            var result = await new DiskMoveRunner(resumed, c.Journal, manageWinRe: false).ResumeAsync(new LogProgress(Log), () => false);
+            Log($"RESULT resume after unhide crash: {result.Outcome}, letter {result.FinalSourceLetter?.ToString() ?? "none"}, " +
+                $"nudges {resumed.Calls.Count(x => x == "NudgeVolumeArrival")}, registered checks " +
+                $"{resumed.Calls.Count(x => x.StartsWith("VolumeRegistered"))} (a toggle shows as SetPartitionAttributes hidden " +
+                $"then original right after them in the log), warnings [{string.Join(" | ", result.Warnings)}]");
+            Assert.Equal(DiskMoveOutcome.Completed, result.Outcome);
+            if (result.FinalSourceLetter == c.Letter)
+            {
+                Assert.Empty(result.Warnings);
+                AssertMoved(c);
+            }
+            else
+            {
+                // No letter: still steps 5-7 done, and step 7 warned about it.
+                Assert.Contains(result.Warnings, w => w.Contains("has no drive letter"));
+                Assert.Equal(c.Recovery.Offset + Amount, vhdx.RLike.Offset);
+                Assert.Equal(c.Target.Size + Amount, vhdx.CLike.Size);
+                Assert.False(DiskMoveRunner.HasUnfinishedMove(Path.GetDirectoryName(c.Journal)!));
+            }
+        }
+        finally
+        {
+            SaveLog(name);
+        }
+    }
+
     // ------------------------------------------------------------------ helpers
 
     Case Prepare(VhdxFixture vhdx, string name)
@@ -266,6 +315,8 @@ public sealed class RunnerVhdxTests(ITestOutputHelper output)
     sealed class GuardedBackend(IDiskMoveBackend inner, Case c, Action<string> log) : IDiskMoveBackend
     {
         public (int Move, int Percent)? CrashInMove { get; init; }
+        /// <summary>Throw right after the attribute write that un-hides the source at its NEW start (step 4).</summary>
+        public bool CrashAfterSourceUnhide { get; init; }
         public bool Crashed { get; private set; }
         public List<string> Calls { get; } = [];
 
@@ -321,6 +372,13 @@ public sealed class RunnerVhdxTests(ITestOutputHelper output)
         {
             log($"SetPartitionAttributes({part}, 0x{attributes:X16})");
             inner.SetPartitionAttributes(Disk(disk, "SetAttributes"), part, attributes);
+            if (CrashAfterSourceUnhide && !Crashed && part == c.Source.Guid && (attributes & DiskMoveRunner.GptHidden) == 0 &&
+                inner.PartitionStart(disk, part) == c.Source.Offset + Amount)
+            {
+                Crashed = true;
+                log("CRASH right after the source was un-hid at its new start");
+                throw new SimulatedCrashException();
+            }
         }
 
         public void RemoveLetter(string volumePath, char letter) { log($"RemoveLetter({volumePath}, {letter})"); inner.RemoveLetter(Volume(volumePath, "RemoveLetter"), letter); }
@@ -369,6 +427,27 @@ public sealed class RunnerVhdxTests(ITestOutputHelper output)
 
         public void SetJournalStep(string path, MoveStep step) { log($"SetJournalStep({step})"); Calls.Add($"Step({step})"); inner.SetJournalStep(Journal(path), step); }
         public void DeleteJournal(string path) { log("DeleteJournal"); Calls.Add("DeleteJournal"); inner.DeleteJournal(Journal(path)); }
+
+        public IDisposable? LockOldOffset(int disk, long start, long length)
+        {
+            var v = inner.LockOldOffset(Disk(disk, "LockOldOffset"), start, length);
+            log($"LockOldOffset({start}, {length}) = {(v is null ? "no device" : "locked")}");
+            return v;
+        }
+
+        public bool NudgeVolumeArrival(int disk, long start, long length)
+        {
+            bool ok = inner.NudgeVolumeArrival(Disk(disk, "NudgeVolumeArrival"), start, length);
+            log($"NudgeVolumeArrival({start}, {length}) = {ok}");
+            return ok;
+        }
+
+        public bool VolumeRegistered(string volumePath)
+        {
+            bool ok = inner.VolumeRegistered(Volume(volumePath, "VolumeRegistered"));
+            log($"VolumeRegistered({volumePath}) = {ok}");
+            return ok;
+        }
 
         public (byte[] First, byte[] Backup) ReadBootSectors(int disk, long start, long length, int sectorSize)
         {
