@@ -87,7 +87,8 @@ dm_status dmw_find_volume_device(dmw_extents_query query, void *ctx, uint32_t ma
 /* Finds the volume device at exactly [start, start + length) on disk_number; if there is one: open it (Windows
    mounts RAW on an invalidated boot sector), FSCTL_LOCK_VOLUME, re-verify the extent, FSCTL_DISMOUNT_VOLUME, and
    return it in *out (the caller closes it). None: DM_OK with *out = NULL. Exists but cannot be locked / verified /
-   dismounted: DM_E_LOCKED (nothing held). */
+   dismounted: DM_E_LOCKED (nothing held) after DMW_OLD_LOCK_ATTEMPTS tries 1 s apart. */
+#define DMW_OLD_LOCK_ATTEMPTS 5
 dm_status dmw_lock_old_volume(uint32_t disk_number, uint64_t start, uint64_t length, dmw_volume **out);
 
 #endif /* DISKMOVE_DMW_INTERNAL_H */

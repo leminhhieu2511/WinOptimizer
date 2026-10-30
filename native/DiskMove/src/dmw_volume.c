@@ -143,10 +143,9 @@ dm_status dmw_find_volume_device(dmw_extents_query query, void *ctx, uint32_t ma
     return DM_E_NOT_FOUND;
 }
 
-dm_status dmw_lock_old_volume(uint32_t disk_number, uint64_t start, uint64_t length, dmw_volume **out)
+/* One attempt of dmw_lock_old_volume. */
+static dm_status lock_old_volume_once(uint32_t disk_number, uint64_t start, uint64_t length, dmw_volume **out)
 {
-    if (!out) return DM_E_INVALID_ARG;
-    *out = NULL;
     uint32_t n = 0;
     dm_status s = dmw_find_volume_device(dmw_query_volume_device, NULL, DMW_VOLUME_SCAN_MAX, disk_number, start,
                                          length, &n);
@@ -165,4 +164,18 @@ dm_status dmw_lock_old_volume(uint32_t disk_number, uint64_t start, uint64_t len
     }
     *out = v;
     return DM_OK;
+}
+
+dm_status dmw_lock_old_volume(uint32_t disk_number, uint64_t start, uint64_t length, dmw_volume **out)
+{
+    if (!out) return DM_E_INVALID_ARG;
+    *out = NULL;
+    /* Right after Windows mounted it (RAW), a scanner may hold it for a moment: retry like the app's own lock. */
+    dm_status s = DM_E_LOCKED;
+    for (int attempt = 0; attempt < DMW_OLD_LOCK_ATTEMPTS; attempt++) {
+        if (attempt) Sleep(1000);
+        s = lock_old_volume_once(disk_number, start, length, out);
+        if (s != DM_E_LOCKED) break;
+    }
+    return s;
 }
