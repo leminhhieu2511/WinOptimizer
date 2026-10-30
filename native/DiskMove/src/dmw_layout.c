@@ -283,6 +283,43 @@ DMW_API dm_status DMW_CALL dmw_patch_ntfs_hidden_sectors(const wchar_t *disk_pat
     return s;
 }
 
+/* Reads the sector at absolute offset off into out, through a 4096-byte aligned window when it stays inside the
+   partition (as patch_one), else one sector. */
+static dm_status read_one(dm_io *io, uint8_t *buf, uint64_t start, uint64_t length, uint64_t off,
+                          uint32_t sector_size, uint8_t *out)
+{
+    uint64_t base = off & ~(uint64_t)(BOOT_WINDOW - 1);
+    uint32_t wlen = BOOT_WINDOW;
+    if (base < start || base + BOOT_WINDOW > start + length) { base = off; wlen = sector_size; }
+    dm_status s = io->read(io->ctx, base, buf, wlen);
+    if (s == DM_OK) memcpy(out, buf + (off - base), sector_size);
+    return s;
+}
+
+DMW_API dm_status DMW_CALL dmw_read_boot_sectors(const wchar_t *disk_path, uint64_t start, uint64_t length,
+                                                 uint32_t sector_size, uint8_t *first, uint8_t *backup)
+{
+    if (!disk_path || !disk_path[0] || !first || !backup) return DM_E_INVALID_ARG;
+    if (sector_size != 512u && sector_size != 4096u) return DM_E_INVALID_ARG;
+    if (start % sector_size || length % sector_size || length < sector_size || start > UINT64_MAX - length)
+        return DM_E_INVALID_ARG;
+
+    dmw_file f;
+    dm_status s = dmw_disk_open_read(disk_path, &f);
+    if (s != DM_OK) return s;
+    uint8_t *buf = (uint8_t *)VirtualAlloc(NULL, BOOT_WINDOW, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    if (!buf) {
+        dmw_file_close(&f);
+        return DM_E_NOMEM;
+    }
+    dm_io io = dmw_file_as_dm_io(&f);
+    s = read_one(&io, buf, start, length, start, sector_size, first);
+    if (s == DM_OK) s = read_one(&io, buf, start, length, start + length - sector_size, sector_size, backup);
+    VirtualFree(buf, 0, MEM_RELEASE);
+    dmw_file_close(&f);
+    return s;
+}
+
 DMW_API dm_status DMW_CALL dmw_get_partition_attributes(const wchar_t *disk_path, const uint8_t partition_guid[16],
                                                         uint64_t *attributes)
 {

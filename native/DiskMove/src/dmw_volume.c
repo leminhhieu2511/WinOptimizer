@@ -99,3 +99,70 @@ DMW_API dm_status DMW_CALL dmw_disk_number(const wchar_t *disk_path, uint32_t *o
     CloseHandle(h);
     return s;
 }
+
+/* ---- old-offset volume of a half-moved partition ---- */
+
+typedef union extents_buf {
+    VOLUME_DISK_EXTENTS e;
+    uint8_t raw[sizeof(VOLUME_DISK_EXTENTS) + 7 * sizeof(DISK_EXTENT)];
+} extents_buf;
+
+static void volume_device_path(uint32_t n, wchar_t *out, size_t cap)
+{
+    swprintf(out, cap, L"\\\\?\\GLOBALROOT\\Device\\HarddiskVolume%u", n);
+}
+
+dm_status __cdecl dmw_query_volume_device(void *ctx, uint32_t n, VOLUME_DISK_EXTENTS *buf, uint32_t size)
+{
+    (void)ctx;
+    wchar_t path[64];
+    volume_device_path(n, path, 64);
+    /* Zero access: a direct device open, which never mounts a file system. */
+    HANDLE h = CreateFileW(path, 0, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_EXISTING, 0, NULL);
+    if (h == INVALID_HANDLE_VALUE) return dmw_status_from_win32(GetLastError());
+    DWORD ret = 0;
+    BOOL ok = DeviceIoControl(h, IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS, NULL, 0, buf, size, &ret, NULL);
+    DWORD err = ok ? 0 : GetLastError();
+    CloseHandle(h);
+    if (!ok) return err == ERROR_MORE_DATA ? DM_E_INVALID_ARG : dmw_status_from_win32(err);
+    return DM_OK;
+}
+
+dm_status dmw_find_volume_device(dmw_extents_query query, void *ctx, uint32_t max, uint32_t disk_number,
+                                 uint64_t start, uint64_t length, uint32_t *found)
+{
+    if (!query || !found) return DM_E_INVALID_ARG;
+    for (uint32_t n = 1; n <= max; n++) {
+        extents_buf b;
+        if (query(ctx, n, &b.e, (uint32_t)sizeof b) != DM_OK) continue;   /* no such device, or not queryable */
+        if (dmw_extents_match(&b.e, disk_number, start, length) == DM_OK) {
+            *found = n;
+            return DM_OK;
+        }
+    }
+    return DM_E_NOT_FOUND;
+}
+
+dm_status dmw_lock_old_volume(uint32_t disk_number, uint64_t start, uint64_t length, dmw_volume **out)
+{
+    if (!out) return DM_E_INVALID_ARG;
+    *out = NULL;
+    uint32_t n = 0;
+    dm_status s = dmw_find_volume_device(dmw_query_volume_device, NULL, DMW_VOLUME_SCAN_MAX, disk_number, start,
+                                         length, &n);
+    if (s == DM_E_NOT_FOUND) return DM_OK;   /* no volume device at the old offset: nothing can mount it */
+    if (s != DM_OK) return s;
+
+    wchar_t path[64];
+    volume_device_path(n, path, 64);
+    dmw_volume *v = NULL;
+    s = dmw_volume_lock(path, &v);           /* a read/write open: Windows mounts it first (RAW once invalidated) */
+    if (s == DM_E_NOT_FOUND) return DM_OK;   /* it went away meanwhile */
+    if (s != DM_OK) return DM_E_LOCKED;
+    if (dmw_volume_verify(v, disk_number, start, length) != DM_OK || dmw_volume_dismount(v) != DM_OK) {
+        dmw_volume_close(v);
+        return DM_E_LOCKED;
+    }
+    *out = v;
+    return DM_OK;
+}

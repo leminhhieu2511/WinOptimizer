@@ -72,9 +72,13 @@ static uint64_t file_size(const wchar_t *path)
     return ((uint64_t)a.nFileSizeHigh << 32) | a.nFileSizeLow;
 }
 
+static uint8_t k_boot[2][4096];
+
 static void small_plan(dm_move_plan *p, dm_extent *ext)
 {
     memset(p, 0, sizeof *p);
+    p->boot_first = k_boot[0];
+    p->boot_backup = k_boot[1];
     memset(p->disk_guid, 0x11, 16);
     memset(p->partition_guid, 0x22, 16);
     p->sector_size = 512;
@@ -240,14 +244,21 @@ static void run_move_on_image_file(uint32_t sector, uint64_t seed)
     temp_path(disk, L"img");
     temp_path(jr, L"imgjr");
     ASSERT_TRUE(write_file(disk, orig, size));
+    /* v2: the caller reads the original boot sectors (here through the DLL, as the CLI / runner do). */
+    static uint8_t first[4096], backup[4096];
+    ASSERT_EQ_INT(dmw_read_boot_sectors(disk, plan.old_start, plan.length, sector, first, backup), DM_OK);
+    ASSERT_TRUE(memcmp(first, orig + plan.old_start, sector) == 0);
+    ASSERT_TRUE(memcmp(backup, orig + plan.old_start + len - sector, sector) == 0);
+    plan.boot_first = first;
+    plan.boot_backup = backup;
     ASSERT_EQ_INT(dmw_journal_create_ex(jr, &plan, 1, NULL, 0, 0), DM_OK);
 
     prog pg = { 0, 0, 0 };
-    ASSERT_EQ_INT(dmw_run_move_ex(disk, jr, 0, on_progress, &pg, 0), DM_OK);
+    ASSERT_EQ_INT(dmw_run_move_ex(disk, jr, 0, on_progress, &pg, NULL, 0), DM_OK);
     ASSERT_TRUE(pg.calls > 0);
     ASSERT_EQ_U64(pg.last_done, pg.last_total);
     /* A finished move returns DM_OK again without I/O. */
-    ASSERT_EQ_INT(dmw_run_move_ex(disk, jr, 0, NULL, NULL, 0), DM_OK);
+    ASSERT_EQ_INT(dmw_run_move_ex(disk, jr, 0, NULL, NULL, NULL, 0), DM_OK);
 
     uint64_t got_size = 0;
     uint8_t *img = read_file(disk, &got_size);
@@ -261,6 +272,8 @@ static void run_move_on_image_file(uint32_t sector, uint64_t seed)
             if (memcmp(img + dst + ext[i].offset, orig + plan.old_start + ext[i].offset, (size_t)ext[i].length) != 0)
                 DM_FAIL("extent %u not moved", i);
         ASSERT_TRUE(memcmp(img, orig, (size_t)plan.old_start) == 0);
+        for (uint32_t i = 0; i < sector; i++)
+            if (img[plan.old_start + i]) { DM_FAIL("old first sector not invalidated"); break; }
         uint64_t end = dst + len;
         ASSERT_TRUE(memcmp(img + end, orig + end, (size_t)(size - end)) == 0);
     }
@@ -298,11 +311,11 @@ static void move_stop_and_missing_paths(void)
     free(zero);
     ASSERT_EQ_INT(dmw_journal_create_ex(jr, &p, 1, NULL, 0, 0), DM_OK);
 
-    ASSERT_EQ_INT(dmw_run_move_ex(disk, jr, 0, stop_now, NULL, 0), DM_E_STOPPED);
-    ASSERT_EQ_INT(dmw_run_move(none, jr, 0, NULL, NULL), DM_E_NOT_FOUND);
-    ASSERT_EQ_INT(dmw_run_move(disk, none, 0, NULL, NULL), DM_E_NOT_FOUND);
-    ASSERT_EQ_INT(dmw_run_move(NULL, jr, 0, NULL, NULL), DM_E_INVALID_ARG);
-    ASSERT_EQ_INT(dmw_run_move_ex(disk, jr, 0, NULL, NULL, 0), DM_OK);   /* resumes after the stop */
+    ASSERT_EQ_INT(dmw_run_move_ex(disk, jr, 0, stop_now, NULL, NULL, 0), DM_E_STOPPED);
+    ASSERT_EQ_INT(dmw_run_move(none, jr, 0, NULL, NULL, NULL), DM_E_NOT_FOUND);
+    ASSERT_EQ_INT(dmw_run_move(disk, none, 0, NULL, NULL, NULL), DM_E_NOT_FOUND);
+    ASSERT_EQ_INT(dmw_run_move(NULL, jr, 0, NULL, NULL, NULL), DM_E_INVALID_ARG);
+    ASSERT_EQ_INT(dmw_run_move_ex(disk, jr, 0, NULL, NULL, NULL, 0), DM_OK);   /* resumes after the stop */
     DeleteFileW(disk);
     DeleteFileW(jr);
 }
@@ -710,7 +723,7 @@ static void run_move_refuses_unverified_disk(void)
     temp_path(jr, L"identjr");
     ASSERT_TRUE(write_file(disk, data, size));
     ASSERT_EQ_INT(dmw_journal_create_ex(jr, &p, 1, NULL, 0, 0), DM_OK);
-    ASSERT_TRUE(dmw_run_move(disk, jr, 0, NULL, NULL) != DM_OK);
+    ASSERT_TRUE(dmw_run_move(disk, jr, 0, NULL, NULL, NULL) != DM_OK);
     uint64_t got = 0;
     uint8_t *after = read_file(disk, &got);
     ASSERT_TRUE(after && got == size && memcmp(after, data, (size_t)size) == 0);
@@ -721,6 +734,159 @@ static void run_move_refuses_unverified_disk(void)
     free(data);
     DeleteFileW(disk);
     DeleteFileW(jr);
+}
+
+
+/* ---- journal v2 / old-offset volume (boot-sector fix) ---- */
+
+/* The DLL refuses a plan without saved boot sectors BEFORE CREATE_ALWAYS: an existing journal is not truncated. */
+static void journal_create_requires_boot_sectors(void)
+{
+    wchar_t path[MAX_PATH];
+    temp_path(path, L"jrboot");
+    uint8_t keep[8192];
+    memset(keep, 0x3C, sizeof keep);
+    ASSERT_TRUE(write_file(path, keep, sizeof keep));
+    dm_move_plan p; dm_extent e;
+    small_plan(&p, &e);
+    p.boot_backup = NULL;
+    ASSERT_EQ_INT(dmw_journal_create_ex(path, &p, 1, NULL, 0, 0), DM_E_INVALID_ARG);
+    p.boot_backup = k_boot[1];
+    p.boot_first = NULL;
+    ASSERT_EQ_INT(dmw_journal_create(path, &p, 1, NULL, 0), DM_E_INVALID_ARG);
+    uint64_t size = 0;
+    uint8_t *got = read_file(path, &size);
+    ASSERT_TRUE(got && size == sizeof keep && memcmp(got, keep, sizeof keep) == 0);
+    free(got);
+    DeleteFileW(path);
+}
+
+/* dmw_read_boot_sectors: exactly the first and the last logical sector of [start, start + length); read-only. */
+static void read_boot_sectors_on_file(void)
+{
+    uint64_t size = 8 * MIB;
+    uint8_t *img = (uint8_t *)malloc((size_t)size);
+    ASSERT_TRUE(img != NULL);
+    if (!img) return;
+    for (uint64_t i = 0; i < size; i++) img[i] = (uint8_t)(i * 7 + (i >> 9));
+    wchar_t path[MAX_PATH];
+    temp_path(path, L"bootrd");
+    ASSERT_TRUE(write_file(path, img, size));
+    static uint8_t first[4096], backup[4096];
+    for (uint32_t sector = 512; sector <= 4096; sector *= 8) {
+        memset(first, 0xEE, sizeof first); memset(backup, 0xEE, sizeof backup);
+        ASSERT_EQ_INT(dmw_read_boot_sectors(path, 1 * MIB, 4 * MIB, sector, first, backup), DM_OK);
+        ASSERT_TRUE(memcmp(first, img + 1 * MIB, sector) == 0);
+        ASSERT_TRUE(memcmp(backup, img + 5 * MIB - sector, sector) == 0);
+        if (sector < 4096) ASSERT_EQ_U32(first[sector], 0xEE);
+    }
+    ASSERT_EQ_INT(dmw_read_boot_sectors(path, 1 * MIB + 100, 4 * MIB, 512, first, backup), DM_E_INVALID_ARG);
+    ASSERT_EQ_INT(dmw_read_boot_sectors(path, 1 * MIB, 4 * MIB, 1024, first, backup), DM_E_INVALID_ARG);
+    ASSERT_EQ_INT(dmw_read_boot_sectors(path, 1 * MIB, 0, 512, first, backup), DM_E_INVALID_ARG);
+    ASSERT_EQ_INT(dmw_read_boot_sectors(path, 1 * MIB, 4 * MIB, 512, NULL, backup), DM_E_INVALID_ARG);
+    ASSERT_EQ_INT(dmw_read_boot_sectors(NULL, 1 * MIB, 4 * MIB, 512, first, backup), DM_E_INVALID_ARG);
+    uint64_t got_size = 0;
+    uint8_t *after = read_file(path, &got_size);
+    ASSERT_TRUE(after && got_size == size && memcmp(after, img, (size_t)size) == 0);
+    free(after);
+    free(img);
+    DeleteFileW(path);
+}
+
+/* Fake \Device\HarddiskVolumeN table for the pure scan (dmw_find_volume_device). */
+typedef struct fake_vol { uint32_t n, extents, disk; uint64_t start, length; dm_status err; } fake_vol;
+typedef struct fake_vols { const fake_vol *v; uint32_t count, calls, max_n; } fake_vols;
+
+static dm_status __cdecl fake_query(void *ctx, uint32_t n, VOLUME_DISK_EXTENTS *buf, uint32_t size)
+{
+    fake_vols *f = (fake_vols *)ctx;
+    f->calls++;
+    if (n > f->max_n) f->max_n = n;
+    for (uint32_t i = 0; i < f->count; i++) {
+        const fake_vol *v = &f->v[i];
+        if (v->n != n) continue;
+        if (v->err != DM_OK) return v->err;
+        if (size < sizeof(VOLUME_DISK_EXTENTS) + sizeof(DISK_EXTENT)) return DM_E_INVALID_ARG;
+        memset(buf, 0, size);
+        buf->NumberOfDiskExtents = v->extents;
+        for (uint32_t k = 0; k < v->extents && k < 2; k++) {
+            DISK_EXTENT *e = &buf->Extents[0] + k;
+            e->DiskNumber = v->disk;
+            e->StartingOffset.QuadPart = (LONGLONG)v->start;
+            e->ExtentLength.QuadPart = (LONGLONG)v->length;
+        }
+        return DM_OK;
+    }
+    return DM_E_NOT_FOUND;   /* no such device */
+}
+
+static void old_volume_scan_matches_exact_extent(void)
+{
+    const uint64_t start = 1405091840ull, len = 1610612736ull;
+    const fake_vol vols[] = {
+        { 1, 1, 0, 1 * MIB, 100 * MIB, DM_OK },             /* the system disk */
+        { 7, 1, 3, start, len + 4096, DM_OK },              /* other length */
+        { 9, 1, 2, start, len, DM_OK },                     /* other disk */
+        { 30, 1, 3, start + 4096, len, DM_OK },             /* other start */
+        { 31, 2, 3, start, len, DM_OK },                    /* spanned: never */
+        { 40, 1, 3, start, len, DM_E_ACCESS },              /* query fails: skipped */
+        { 412, 1, 3, start, len, DM_OK },                   /* the stale old-offset device of the investigation */
+        { 500, 1, 3, start, len, DM_OK },                   /* a later duplicate: the first match wins */
+    };
+    fake_vols f = { vols, (uint32_t)(sizeof vols / sizeof vols[0]), 0, 0 };
+    uint32_t found = 0;
+    ASSERT_EQ_INT(dmw_find_volume_device(fake_query, &f, 4096, 3, start, len, &found), DM_OK);
+    ASSERT_EQ_U32(found, 412);
+    ASSERT_EQ_U32(f.max_n, 412);                            /* stops at the first match */
+    ASSERT_EQ_U32(f.calls, 412);                            /* N = 1..412, none skipped */
+
+    /* nothing matches: DM_E_NOT_FOUND after the whole range */
+    f.calls = f.max_n = 0;
+    ASSERT_EQ_INT(dmw_find_volume_device(fake_query, &f, 4096, 3, start, len - 4096, &found), DM_E_NOT_FOUND);
+    ASSERT_EQ_U32(f.calls, 4096);
+    /* the range limit is honoured (412 is beyond it) */
+    f.calls = f.max_n = 0;
+    ASSERT_EQ_INT(dmw_find_volume_device(fake_query, &f, 256, 3, start, len, &found), DM_E_NOT_FOUND);
+    ASSERT_EQ_U32(f.max_n, 256);
+    ASSERT_EQ_INT(dmw_find_volume_device(NULL, &f, 256, 3, start, len, &found), DM_E_INVALID_ARG);
+    ASSERT_EQ_INT(dmw_find_volume_device(fake_query, &f, 256, 3, start, len, NULL), DM_E_INVALID_ARG);
+    ASSERT_TRUE(DMW_VOLUME_SCAN_MAX >= 1024);               /* the investigation saw HarddiskVolume412 */
+}
+
+/* The real scan over \\?\GLOBALROOT\Device\HarddiskVolumeN with zero-access opens (no mount, no lock, no write):
+   no volume is on a disk number that does not exist. Runs without admin. */
+static void old_volume_scan_smoke(void)
+{
+    LARGE_INTEGER t0, t1, fq;
+    QueryPerformanceFrequency(&fq);
+    QueryPerformanceCounter(&t0);
+    uint32_t found = 0;
+    ASSERT_EQ_INT(dmw_find_volume_device(dmw_query_volume_device, NULL, DMW_VOLUME_SCAN_MAX, 0xFFFFu, 1 * MIB, 1 * MIB, &found),
+                  DM_E_NOT_FOUND);
+    QueryPerformanceCounter(&t1);
+    printf("  old_volume_scan_smoke: %u devices scanned in %.1f ms\n", (unsigned)DMW_VOLUME_SCAN_MAX,
+           (double)(t1.QuadPart - t0.QuadPart) * 1000.0 / (double)fq.QuadPart);
+    /* The scan does see real devices: it finds the Windows volume by its own extent (zero-access opens only). */
+    wchar_t win[MAX_PATH], root[4] = L"C:\\", dev[8] = L"\\\\.\\C:";
+    if (GetSystemWindowsDirectoryW(win, MAX_PATH)) { root[0] = win[0]; dev[4] = win[0]; }
+    HANDLE h = CreateFileW(dev, 0, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
+    ASSERT_TRUE(h != INVALID_HANDLE_VALUE);
+    union { VOLUME_DISK_EXTENTS e; uint8_t raw[sizeof(VOLUME_DISK_EXTENTS) + 7 * sizeof(DISK_EXTENT)]; } b;
+    DWORD ret = 0;
+    if (h != INVALID_HANDLE_VALUE &&
+        DeviceIoControl(h, IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS, NULL, 0, &b, sizeof b, &ret, NULL) &&
+        b.e.NumberOfDiskExtents == 1) {
+        const DISK_EXTENT *e = &b.e.Extents[0];
+        ASSERT_EQ_INT(dmw_find_volume_device(dmw_query_volume_device, NULL, DMW_VOLUME_SCAN_MAX, e->DiskNumber,
+                                             (uint64_t)e->StartingOffset.QuadPart, (uint64_t)e->ExtentLength.QuadPart,
+                                             &found), DM_OK);
+        printf("  old_volume_scan_smoke: the Windows volume %ls is HarddiskVolume%u\n", root, found);
+    }
+    if (h != INVALID_HANDLE_VALUE) CloseHandle(h);
+    dmw_volume *v = (dmw_volume *)1;
+    ASSERT_EQ_INT(dmw_lock_old_volume(0xFFFFu, 1 * MIB, 1 * MIB, &v), DM_OK);   /* none found: nothing to lock */
+    ASSERT_TRUE(v == NULL);
+    ASSERT_EQ_INT(dmw_lock_old_volume(0xFFFFu, 1 * MIB, 1 * MIB, NULL), DM_E_INVALID_ARG);
 }
 
 static void misc_args(void)
@@ -773,4 +939,8 @@ void dm_run_win32_io(void)
     DM_RUN(layout_check_move_rejects_unsafe_destination);
     DM_RUN(run_move_refuses_unverified_disk);
     DM_RUN(misc_args);
+    DM_RUN(journal_create_requires_boot_sectors);
+    DM_RUN(read_boot_sectors_on_file);
+    DM_RUN(old_volume_scan_matches_exact_extent);
+    DM_RUN(old_volume_scan_smoke);
 }

@@ -35,6 +35,11 @@ dm_status dmw_disk_open(const wchar_t *path, dmw_file *f)
                        FILE_FLAG_NO_BUFFERING | FILE_FLAG_WRITE_THROUGH, 0, f);
 }
 
+dm_status dmw_disk_open_read(const wchar_t *path, dmw_file *f)
+{
+    return open_handle(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, OPEN_EXISTING, FILE_FLAG_NO_BUFFERING, 0, f);
+}
+
 dm_status dmw_journal_open(const wchar_t *path, int write, dmw_file *f)
 {
     DWORD access = write ? (GENERIC_READ | GENERIC_WRITE) : GENERIC_READ;

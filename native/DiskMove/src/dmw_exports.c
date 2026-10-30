@@ -10,6 +10,7 @@ static dm_status validate_moves(const dm_move_plan *moves, uint32_t count)
 {
     if (!moves || count < 1 || count > DM_MAX_MOVES) return DM_E_INVALID_ARG;
     for (uint32_t i = 0; i < count; i++) {
+        if (!moves[i].boot_first || !moves[i].boot_backup) return DM_E_INVALID_ARG;   /* journal v2 */
         dm_status s = dm_plan_validate(&moves[i]);
         if (s != DM_OK) return s;
     }
@@ -100,37 +101,50 @@ DMW_API dm_status DMW_CALL dmw_journal_set_step(const wchar_t *path, uint32_t st
 /* Before the first write: the disk must be the one the journal was made for (GPT disk GUID) and still hold
    the partition at its old or committed start. The disk number alone (\\.\PhysicalDriveN) can change
    between a crash and the resume. */
-static dm_status check_disk_identity(const wchar_t *disk_path, const dm_io *jio, uint32_t move_index)
+static dm_status check_disk_identity(const wchar_t *disk_path, const dm_io *jio, uint32_t move_index,
+                                     dm_move_plan *plan)
 {
-    dm_move_plan plan;
     dm_extent *chunks = NULL;
     uint32_t n = 0;
-    dm_status s = dm_journal_load_move(jio, move_index, &plan, &chunks, &n);
+    dm_status s = dm_journal_load_move(jio, move_index, plan, &chunks, &n);
     if (s != DM_OK) return s;
     dm_free(chunks);
     DRIVE_LAYOUT_INFORMATION_EX *lay = NULL;
     s = dmw_query_layout(disk_path, &lay);
-    if (s == DM_OK) s = dmw_layout_check_move(lay, &plan);
+    if (s == DM_OK) s = dmw_layout_check_move(lay, plan);
     free(lay);
     return s;
 }
 
-DMW_API dm_status DMW_CALL dmw_run_move(const wchar_t *disk_path, const wchar_t *journal_path, uint32_t move_index,
-                                        dm_progress_cb progress, void *user)
+/* After the identity check, before any write: a hidden, half-moved partition keeps a volume device at its OLD
+   offset, which Windows may mount (and write to) on any re-enumeration. Hold a lock on it for the whole run. */
+static dm_status lock_old_offset(const wchar_t *disk_path, const dm_move_plan *plan, dmw_volume **own)
 {
-    return dmw_run_move_ex(disk_path, journal_path, move_index, progress, user, 1);
+    uint32_t disk_number = 0;
+    dm_status s = dmw_disk_number(disk_path, &disk_number);
+    if (s != DM_OK) return s;
+    return dmw_lock_old_volume(disk_number, plan->old_start, plan->length, own);
+}
+
+DMW_API dm_status DMW_CALL dmw_run_move(const wchar_t *disk_path, const wchar_t *journal_path, uint32_t move_index,
+                                        dm_progress_cb progress, void *user, dmw_volume *held_lock)
+{
+    return dmw_run_move_ex(disk_path, journal_path, move_index, progress, user, held_lock, 1);
 }
 
 dm_status dmw_run_move_ex(const wchar_t *disk_path, const wchar_t *journal_path, uint32_t move_index,
-                          dm_progress_cb progress, void *user, int check_identity)
+                          dm_progress_cb progress, void *user, dmw_volume *held_lock, int check_identity)
 {
     if (!disk_path || !disk_path[0] || !journal_path || !journal_path[0]) return DM_E_INVALID_ARG;
     dmw_file jf, df;
+    dmw_volume *own = NULL;
     dm_status s = dmw_journal_open(journal_path, 1, &jf);
     if (s != DM_OK) return s;
     if (check_identity) {
         dm_io cio = dmw_file_as_dm_io(&jf);
-        s = check_disk_identity(disk_path, &cio, move_index);
+        dm_move_plan plan;
+        s = check_disk_identity(disk_path, &cio, move_index, &plan);
+        if (s == DM_OK && !held_lock) s = lock_old_offset(disk_path, &plan, &own);
         if (s != DM_OK) {
             dmw_file_close(&jf);
             return s;
@@ -138,6 +152,7 @@ dm_status dmw_run_move_ex(const wchar_t *disk_path, const wchar_t *journal_path,
     }
     s = dmw_disk_open(disk_path, &df);
     if (s != DM_OK) {
+        dmw_volume_close(own);
         dmw_file_close(&jf);
         return s;
     }
@@ -145,6 +160,7 @@ dm_status dmw_run_move_ex(const wchar_t *disk_path, const wchar_t *journal_path,
     s = dm_run_move(&dio, &jio, move_index, progress, user);
     dmw_file_close(&df);
     dmw_file_close(&jf);
+    dmw_volume_close(own);   /* releases the old-offset lock only after the last write */
     return s;
 }
 
@@ -153,3 +169,4 @@ DMW_API dm_status DMW_CALL dmw_free(void *p)
     dm_free(p);
     return DM_OK;
 }
+

@@ -43,7 +43,8 @@ DMW_API dm_status DMW_CALL dmw_disk_number(const wchar_t *disk_path, uint32_t *o
 
 /* Creates (CREATE_ALWAYS: truncates any old file) the journal with a protected DACL granting only
    Administrators + SYSTEM full control, then writes it through (FILE_FLAG_WRITE_THROUGH + flush).
-   If the ACL cannot be set: DM_E_ACCESS and the file is deleted. */
+   If the ACL cannot be set: DM_E_ACCESS and the file is deleted. Journal v2: every plan must carry
+   boot_first / boot_backup (see dmw_read_boot_sectors), else DM_E_INVALID_ARG before the file is touched. */
 DMW_API dm_status DMW_CALL dmw_journal_create(const wchar_t *path, const dm_move_plan *moves, uint32_t count,
                                               const void *app_blob, uint32_t app_len);
 /* Same contract as dm_journal_read. */
@@ -54,9 +55,21 @@ DMW_API dm_status DMW_CALL dmw_journal_set_step(const wchar_t *path, uint32_t st
 /* Runs (or resumes) move move_index on the disk (unbuffered, write-through I/O). progress is the core's
    dm_progress_cb (may be NULL); return non-zero from it to stop between two chunks (DM_E_STOPPED).
    Before any write it reads the disk's layout: it must be GPT with the journal's disk GUID and hold the
-   journal's partition (same length) at old_start or old_start + shift; otherwise DM_E_JOURNAL_MISMATCH. */
+   journal's partition (same length) at old_start or old_start + shift; otherwise DM_E_JOURNAL_MISMATCH.
+   Then, still before any write, unless held_lock is given: it looks for a volume device whose extent is exactly
+   [old_start, old_start + length) on this disk (a hidden, half-moved partition keeps one, and Windows can mount
+   it on any re-enumeration). If there is one it is locked + dismounted and held until the call returns; if it
+   cannot be locked: DM_E_LOCKED, nothing written. held_lock (may be NULL): a lock the caller took itself on this
+   move's volume at old_start (verified, dismounted) and still holds; the DLL then does not look for one. */
 DMW_API dm_status DMW_CALL dmw_run_move(const wchar_t *disk_path, const wchar_t *journal_path, uint32_t move_index,
-                                        dm_progress_cb progress, void *user);
+                                        dm_progress_cb progress, void *user, dmw_volume *held_lock);
+
+/* Read-only: the partition's first logical sector (at start) and its last one (start + length - sector_size, the
+   NTFS backup boot sector), sector_size bytes each, into first / backup. For the journal v2 plan: call it after the
+   volume is locked + dismounted and before any write. DM_E_INVALID_ARG for a sector size other than 512 / 4096 or
+   an unaligned range. */
+DMW_API dm_status DMW_CALL dmw_read_boot_sectors(const wchar_t *disk_path, uint64_t start, uint64_t length,
+                                                 uint32_t sector_size, uint8_t *first, uint8_t *backup);
 
 /* Moves the GPT entry with this PartitionId to new_start (length, type, attributes, name, GUID kept),
    then IOCTL_DISK_UPDATE_PROPERTIES. Idempotent: DM_OK without writing if it is already at new_start.

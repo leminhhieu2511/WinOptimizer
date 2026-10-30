@@ -57,8 +57,37 @@ dm_status dmw_query_layout(const wchar_t *disk_path, DRIVE_LAYOUT_INFORMATION_EX
    usable range and overlap no other partition. DM_E_JOURNAL_MISMATCH otherwise; DM_E_INVALID_ARG for NULL. */
 dm_status dmw_layout_check_move(const DRIVE_LAYOUT_INFORMATION_EX *layout, const dm_move_plan *plan);
 
-/* dmw_run_move with the disk identity check optional (check = 0 lets tests move inside a plain image file). */
+/* dmw_run_move with the disk identity check (and the old-offset volume lock that follows it) optional
+   (check = 0 lets tests move inside a plain image file). */
 dm_status dmw_run_move_ex(const wchar_t *disk_path, const wchar_t *journal_path, uint32_t move_index,
-                          dm_progress_cb progress, void *user, int check_identity);
+                          dm_progress_cb progress, void *user, dmw_volume *held_lock, int check_identity);
+
+/* Disk read-only: GENERIC_READ, share R|W, OPEN_EXISTING, NO_BUFFERING. */
+dm_status dmw_disk_open_read(const wchar_t *path, dmw_file *f);
+
+/* ---- old-offset volume of a half-moved partition ---- */
+
+/* \\?\GLOBALROOT\Device\HarddiskVolumeN is scanned for N = 1..DMW_VOLUME_SCAN_MAX (the investigation saw
+   HarddiskVolume412 after a day of VHDX attaches, so 256 is too few; a missing N costs one failed open). */
+#define DMW_VOLUME_SCAN_MAX 4096u
+
+/* IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS of volume device N into buf (size bytes). Any failure (no such device:
+   DM_E_NOT_FOUND) makes the scan skip N. */
+typedef dm_status (__cdecl *dmw_extents_query)(void *ctx, uint32_t n, VOLUME_DISK_EXTENTS *buf, uint32_t size);
+
+/* The real query: zero-access open of \\?\GLOBALROOT\Device\HarddiskVolumeN (a direct device open never mounts
+   a file system), then the IOCTL. ctx is unused. */
+dm_status __cdecl dmw_query_volume_device(void *ctx, uint32_t n, VOLUME_DISK_EXTENTS *buf, uint32_t size);
+
+/* Pure part of the old-offset lookup: the first N in [1, max] whose volume is exactly one extent
+   [start, start + length) on disk_number (dmw_extents_match). DM_OK + *found, or DM_E_NOT_FOUND. */
+dm_status dmw_find_volume_device(dmw_extents_query query, void *ctx, uint32_t max, uint32_t disk_number,
+                                 uint64_t start, uint64_t length, uint32_t *found);
+
+/* Finds the volume device at exactly [start, start + length) on disk_number; if there is one: open it (Windows
+   mounts RAW on an invalidated boot sector), FSCTL_LOCK_VOLUME, re-verify the extent, FSCTL_DISMOUNT_VOLUME, and
+   return it in *out (the caller closes it). None: DM_OK with *out = NULL. Exists but cannot be locked / verified /
+   dismounted: DM_E_LOCKED (nothing held). */
+dm_status dmw_lock_old_volume(uint32_t disk_number, uint64_t start, uint64_t length, dmw_volume **out);
 
 #endif /* DISKMOVE_DMW_INTERNAL_H */

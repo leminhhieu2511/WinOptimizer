@@ -8,14 +8,18 @@
  *       2. Reads the original GPT attributes, saves them + partition GUID + mount points to
  *          "<journal>.cli-restore" (flushed), then ONE layout write sets original | HIDDEN | NO_DRIVE_LETTER;
  *          removes the mount points, then dismounts.
- *       3. Creates the journal (one extent: the whole partition), copies, patches the NTFS HiddenSectors and
- *          moves the GPT entry to start + shift, all under the lock.
+ *       3. Reads the partition's original first and last (backup boot) sector, creates the journal v2 with them
+ *          (one extent: the whole partition), copies (the core zeroes the old boot sectors before the first
+ *          chunk and writes the saved ones at the destination after the last), patches the NTFS HiddenSectors
+ *          and moves the GPT entry to start + shift, all under the lock.
  *       4. Only after a fully committed move: original attributes back, mount points re-created, sidecar
  *          deleted. --no-commit, a failure after the copy started, or Ctrl+C leave the volume hidden (so
  *          Windows cannot remount it at the old offset) and keep the sidecar; a failure before the first
  *          write undoes the hiding.
  *   diskmove-cli resume --disk <path> --journal <p> --move <i> [--volume <path> --start <old b> --length <b>]
- *       Copy only; the volume stays hidden until commit.
+ *       Copy only; the volume stays hidden until commit. Without --volume, DiskMove.dll itself finds the volume
+ *       device still sitting at the OLD offset (a hidden partition keeps one) and locks + dismounts it for the
+ *       whole copy, so Windows cannot mount the half-moved view and write to it.
  *   diskmove-cli commit --disk <path> --part-guid <g> --start <new b> [--length <b> [--sector <n>]]
  *                       [--volume <path> --old-start <b>] [--journal <p>]
  *       With --sector the NTFS HiddenSectors are patched first. With --journal the sidecar is restored after
@@ -452,6 +456,15 @@ static int cmd_move(void)
     }
 
     rc = dismount(v);
+    /* Journal v2: the original boot sectors, read after the lock + dismount and before any write. */
+    static uint8_t boot_first[DM_MAX_SECTOR], boot_backup[DM_MAX_SECTOR];
+    if (!rc) {
+        s = dmw_read_boot_sectors(disk, plan.old_start, plan.length, plan.sector_size, boot_first, boot_backup);
+        if (s != DM_OK) rc = report(s, "read boot sectors");
+        else printf("boot sectors saved\n");
+    }
+    plan.boot_first = boot_first;
+    plan.boot_backup = boot_backup;
     if (!rc) {
         s = dmw_journal_create(journal, &plan, 1, NULL, 0);
         if (s != DM_OK) rc = report(s, "journal create");
@@ -464,7 +477,7 @@ static int cmd_move(void)
 
     /* 3. Copy, then commit; the volume stays hidden until the move is fully committed. */
     phase("copy");
-    s = dmw_run_move(disk, journal, 0, on_progress, NULL);
+    s = dmw_run_move(disk, journal, 0, on_progress, NULL, v);   /* our lock covers the old offset */
     if (s != DM_OK) {
         rc = report(s, "move");
     } else {
@@ -522,7 +535,7 @@ static int cmd_resume(void)
     rc = optional_lock(disk_number, old_start, old_start, length, &v);
     if (rc) return rc;
     phase("copy");
-    dm_status s = dmw_run_move(disk, journal, (uint32_t)index, on_progress, NULL);
+    dm_status s = dmw_run_move(disk, journal, (uint32_t)index, on_progress, NULL, v);   /* NULL: the DLL locks the old offset */
     rc = report(s, "move");
     dmw_volume_close(v);
     if (rc) return rc;
@@ -594,10 +607,11 @@ static int cmd_status(void)
         free(app);
     }
     if (s != DM_OK) return report(s, "journal read");
-    printf("move_count %u\nstep %u\nmove_index %u\nchunks_done %llu\nchunk_count %llu %llu\nseq %llu\napp_len %u\n",
+    printf("move_count %u\nstep %u\nmove_index %u\nchunks_done %llu\nchunk_count %llu %llu\nseq %llu\napp_len %u\n"
+           "boot_restored %u\n",
            info.move_count, info.step, info.move_index, (unsigned long long)info.chunks_done,
            (unsigned long long)info.chunk_count[0], (unsigned long long)info.chunk_count[1],
-           (unsigned long long)info.seq, app_len);
+           (unsigned long long)info.seq, app_len, info.boot_restored);
     wchar_t sidecar[MAX_PATH * 2];
     restore_info ri;
     cli_sidecar_path(journal, sidecar, MAX_PATH * 2);
