@@ -12,6 +12,8 @@
  * inside the copied destination. Because those two sectors are copied as zeros, the original ones (saved in the
  * journal header by the caller before any write) are written to the destination after the last chunk, read back,
  * and the journal records boot_restored. A complete move without that record re-applies the restore on entry.
+ * Before chunk 0 the sectors on the disk are compared with the saved ones (equal, or zero from an earlier
+ * invalidation): a stale copy is refused with DM_E_JOURNAL_MISMATCH before any write.
  */
 #include <diskmove/dm_core.h>
 #include <stdlib.h>
@@ -90,6 +92,37 @@ static dm_status boot_invalidate(const dm_io *d, const dm_move_plan *p, uint8_t 
     return s;
 }
 
+/* Each 512-byte block of the sector on the disk equals the saved copy or is all zero (an earlier, possibly torn,
+   invalidation). */
+static int sector_matches_saved(const uint8_t *disk, const uint8_t *saved, uint32_t ss)
+{
+    for (uint32_t o = 0; o < ss; o += 512) {
+        if (memcmp(disk + o, saved + o, 512) == 0) continue;
+        for (uint32_t i = 0; i < 512; i++) if (disk[o + i]) return 0;
+    }
+    return 1;
+}
+
+/* Before chunk 0: the saved boot sectors must still be what is on the disk, else they are stale (the volume
+   changed since the caller read them) and restoring them would break it: DM_E_JOURNAL_MISMATCH, nothing written. */
+static dm_status boot_check_saved(const dm_io *d, const dm_io *j, uint32_t move_index, const dm_move_plan *p,
+                                  uint8_t *buf, uint8_t *chk)
+{
+    const uint32_t ss = p->sector_size;
+    if (ss > DM_MAX_SECTOR) return DM_E_JOURNAL_CORRUPT;
+    uint8_t *first = buf, *backup = buf + DM_MAX_SECTOR;
+    dm_status s = dm_journal_load_boot(j, move_index, first, backup);
+    if (s == DM_OK) s = d->read(d->ctx, p->old_start, chk, ss);
+    if (s != DM_OK) return s;
+    if (!sector_matches_saved(chk, first, ss)) return DM_E_JOURNAL_MISMATCH;
+    if (p->length > ss) {
+        s = d->read(d->ctx, p->old_start + p->length - ss, chk, ss);
+        if (s != DM_OK) return s;
+        if (!sector_matches_saved(chk, backup, ss)) return DM_E_JOURNAL_MISMATCH;
+    }
+    return DM_OK;
+}
+
 /* Writes the saved boot sectors of move i at its destination (verified), then records boot_restored.
    Idempotent: running it again writes the same bytes. */
 static dm_status boot_restore(const dm_io *d, const dm_io *j, uint32_t move_index, uint8_t *buf, uint8_t *chk)
@@ -162,6 +195,10 @@ dm_status dm_run_move(const dm_io *disk, const dm_io *journal, uint32_t move_ind
         if (i < start) done_bytes += ch[i].length;
     }
 
+    if (start == 0) {                                                  /* stale saved copy? nothing written yet */
+        s = boot_check_saved(disk, journal, move_index, &plan, a.p, b.p);
+        if (s != DM_OK) goto done;
+    }
     if (progress && progress(user, done_bytes, total)) { s = DM_E_STOPPED; goto done; }
     if (start == 0) {                                                  /* never once a chunk is recorded */
         s = boot_invalidate(disk, &plan, a.p);

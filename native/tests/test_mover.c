@@ -569,7 +569,9 @@ static void move_restores_saved_boot_sectors(void)
         f.plan.extent_count = 1;
         static uint8_t first[4096], backup[4096];
         for (uint32_t i = 0; i < sector; i++) { first[i] = (uint8_t)(0xEB ^ i); backup[i] = (uint8_t)(0x52 + 7 * i); }
-        f.plan.boot_first = first;
+        memcpy(f.orig + f.plan.old_start, first, sector);                      /* what the caller reads ... */
+        memcpy(f.orig + f.plan.old_start + f.plan.length - sector, backup, sector);
+        f.plan.boot_first = first;                                             /* ... and saves */
         f.plan.boot_backup = backup;
         fx_reset(&f);
         ASSERT_EQ_INT(dm_run_move(&f.dio, &f.jio, 0, NULL, NULL), DM_OK);
@@ -720,6 +722,109 @@ static void move_next_move_restores_previous(void)
     free(t);
 }
 
+/* M3: before chunk 0 the sectors on the disk must still be the saved ones (or zero / half zero from an earlier,
+   possibly torn, invalidation); otherwise the saved copy is stale: DM_E_JOURNAL_MISMATCH, nothing written. */
+static void move_refuses_stale_saved_sectors(void)
+{
+    for (uint32_t sector = 512; sector <= 4096; sector *= 8) {
+        fx f;
+        make_image(&f, sector, 16 * MIB, 1 * MIB, 4, 40 + sector);
+        static uint8_t stale[4096];
+        memcpy(stale, f.orig + f.plan.old_start, sector);
+        stale[17] ^= 0x40;                                                     /* e.g. reformatted since the read */
+        f.plan.boot_first = stale;
+        fx_reset(&f);
+        ASSERT_EQ_INT(dm_run_move(&f.dio, &f.jio, 0, NULL, NULL), DM_E_JOURNAL_MISMATCH);
+        ASSERT_EQ_U64(f.fault.writes, 0);
+        ASSERT_TRUE(memcmp(f.disk.data, f.orig, (size_t)f.size) == 0);
+
+        set_boot_from(&f.plan, f.orig);                                        /* stale backup sector */
+        static uint8_t stale_b[4096];
+        memcpy(stale_b, f.orig + f.plan.old_start + f.plan.length - sector, sector);
+        stale_b[sector - 1] ^= 0x01;
+        f.plan.boot_backup = stale_b;
+        fx_reset(&f);
+        ASSERT_EQ_INT(dm_run_move(&f.dio, &f.jio, 0, NULL, NULL), DM_E_JOURNAL_MISMATCH);
+        ASSERT_EQ_U64(f.fault.writes, 0);
+
+        /* already zeroed (an earlier attempt invalidated, then crashed before chunk 0): accepted */
+        set_boot_from(&f.plan, f.orig);
+        fx_reset(&f);
+        memset(f.disk.data + f.plan.old_start, 0, sector);
+        memset(f.disk.data + f.plan.old_start + f.plan.length - sector, 0, (sector / 2) & ~511u);   /* torn: first half (512-aligned) */
+        ASSERT_EQ_INT(dm_run_move(&f.dio, &f.jio, 0, NULL, NULL), DM_OK);
+        assert_moved(f.disk.data, &f.plan, f.orig);
+        fx_free(&f);
+    }
+}
+
+/* Gap (a): a crash at every write of the restore of move 0 that runs when move 1 is started (restore_prev). */
+static void move_crash_during_previous_restore(void)
+{
+    fx2 *t = (fx2 *)malloc(sizeof *t);
+    ASSERT_TRUE(t != NULL);
+    if (!t) return;
+    fx2_make(t);
+    uint64_t total = 0;
+    for (uint64_t n = 1; total == 0 || n <= total; n++) {
+        fx2_reset(t);
+        ASSERT_EQ_INT(dm_run_move(&t->f.dio, &t->f.jio, 0, NULL, NULL), DM_OK);
+        const dm_move_plan *p0 = &t->plans[0];
+        uint64_t dst0 = p0->old_start + p0->shift;
+        memset(t->f.disk.data + dst0, 0, 512);                                 /* as copied: restore lost */
+        memset(t->f.disk.data + dst0 + p0->length - 512, 0, 512);
+        dm_journal_info info; uint32_t alen; char app[8];
+        ASSERT_EQ_INT(dm_journal_read(&t->f.jio, &info, app, sizeof app, &alen), DM_OK);
+        ASSERT_EQ_INT(dm_journal_progress(&t->f.jio, 0, info.chunk_count[0], 0), DM_OK);   /* complete, not restored */
+        if (total == 0) {                                                      /* first pass: count the writes */
+            t->f.fault.writes = 0;
+            ASSERT_EQ_INT(dm_run_move(&t->f.dio, &t->f.jio, 1, NULL, NULL), DM_OK);
+            total = t->f.fault.writes;
+            assert_both_moved(t);
+            ASSERT_TRUE(total > 3);
+            n = 0;
+            continue;
+        }
+        t->f.fault.writes = 0;
+        t->f.fault.fail_after_writes = n;
+        dm_status s = dm_run_move(&t->f.dio, &t->f.jio, 1, NULL, NULL);
+        if (s != DM_E_IO) DM_FAIL("N=%llu: crashed run returned %d", (unsigned long long)n, (int)s);
+        t->f.fault.tripped = 0;
+        t->f.fault.fail_after_writes = 0;
+        s = dm_run_move(&t->f.dio, &t->f.jio, 1, NULL, NULL);                 /* the caller resumes move 1 */
+        if (s != DM_OK) DM_FAIL("N=%llu: resume returned %d", (unsigned long long)n, (int)s);
+        assert_both_moved(t);
+    }
+    printf("  move_crash_during_previous_restore: %llu crash points\n", (unsigned long long)total);
+    fx_free(&t->f);
+    free(t);
+}
+
+/* Gap (b): shift == length / 2 (the restored first sector lands on the old view's middle sector) and
+   shift == length - 4096 with 4Kn (it lands on the old view's last sector): crash at every write. */
+static void move_shift_half_and_last_sector(void)
+{
+    struct { uint32_t sector; uint64_t len, shift; } c[] = {
+        { 512, 8 * MIB, 4 * MIB }, { 4096, 8 * MIB, 4 * MIB }, { 4096, 4 * MIB + 4096, 4 * MIB },
+    };
+    for (size_t k = 0; k < sizeof c / sizeof c[0]; k++) {
+        fx f;
+        make_image(&f, c[k].sector, c[k].len, c[k].shift, 0, 50 + k);
+        f.ext[0].offset = 0; f.ext[0].length = f.plan.length;
+        f.plan.extent_count = 1;
+        fx_reset(&f);
+        ASSERT_EQ_INT(dm_run_move(&f.dio, &f.jio, 0, NULL, NULL), DM_OK);
+        uint64_t total = f.fault.writes;
+        for (uint64_t n = 1; n <= total; n++) {
+            crash_and_resume(&f, n);
+            uint64_t dst = f.plan.old_start + f.plan.shift;
+            if (memcmp(f.disk.data + dst, f.orig + f.plan.old_start, (size_t)f.plan.length) != 0)
+                DM_FAIL("case %u, N=%llu: destination differs", (unsigned)k, (unsigned long long)n);
+        }
+        fx_free(&f);
+    }
+}
+
 /* Suite name "mover" (not "move"): the harness entry point dm_run_<suite> would otherwise collide with dm_run_move. */
 void dm_run_mover(void)
 {
@@ -743,4 +848,7 @@ void dm_run_mover(void)
     DM_RUN(move_resume_never_invalidates);
     DM_RUN(move_complete_reentry_restore);
     DM_RUN(move_next_move_restores_previous);
+    DM_RUN(move_refuses_stale_saved_sectors);
+    DM_RUN(move_crash_during_previous_restore);
+    DM_RUN(move_shift_half_and_last_sector);
 }
