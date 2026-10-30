@@ -122,6 +122,55 @@ public sealed class RunnerVhdxTests(ITestOutputHelper output)
         }
     }
 
+    /// <summary>
+    /// Regression of the hash-mismatch investigation for the product runner: the run crashes at 50 % of the source
+    /// copy; while the resume runs (no lock of ours: the source is hidden) a SECOND VHDX's layout changes 3 times.
+    /// DiskMove.dll must lock the old-offset volume device of the half-moved source for the copy, and its old boot
+    /// sectors are already zero, so nothing can be written into the source: every hash must match.
+    /// </summary>
+    [AdminTheory]
+    [InlineData(1)]
+    [InlineData(2)]
+    [InlineData(3)]
+    public async Task CrashMidMove_LayoutChangeOnOtherDisk_ResumeCompletes_OnVhdx(int run)
+    {
+        string name = $"bootfix-runner-{run}";
+        VhdxFixture? other = null;
+        Thread? activity = null;
+        try
+        {
+            other = VhdxFixture.Create(name + "-other", Log);
+            using var vhdx = VhdxFixture.Create(name, Log);
+            var c = Prepare(vhdx, name);
+            var crashing = new GuardedBackend(new WindowsDiskMoveBackend(), c, Log) { CrashInMove = (0, 50) };
+            await Assert.ThrowsAsync<SimulatedCrashException>(() =>
+                new DiskMoveRunner(crashing, c.Journal, manageWinRe: false)
+                    .RunAsync(c.Disk, c.Target, c.Source, c.Plan, () => [], new LogProgress(Log), () => false, CancellationToken.None));
+            Assert.True(crashing.Crashed, "the crash point was not reached");
+            long shrunk = c.Source.Size - Amount;
+            Log("old-offset volume device after the crash: " + (vhdx.FindVolumeDevice(c.Source.Offset, shrunk) ?? "none"));
+
+            activity = other.StartHideUnhide(Log);
+            var resumed = new GuardedBackend(new WindowsDiskMoveBackend(), c, Log);
+            var sw = Stopwatch.StartNew();
+            var result = await new DiskMoveRunner(resumed, c.Journal, manageWinRe: false).ResumeAsync(new LogProgress(Log), () => false);
+            Log($"ResumeAsync took {sw.Elapsed.TotalSeconds:F1} s (activity still running: {activity.IsAlive}): {result.Outcome}, " +
+                $"letter {result.FinalSourceLetter}, warnings [{string.Join(" | ", result.Warnings)}]");
+            activity.Join();
+            Assert.Equal(DiskMoveOutcome.Completed, result.Outcome);
+            Assert.Equal(c.Letter, result.FinalSourceLetter);
+            Assert.Empty(result.Warnings);
+            Assert.DoesNotContain(resumed.Calls, x => x.StartsWith($"LockVolume({c.Source.VolumePath}"));
+            AssertMoved(c);
+        }
+        finally
+        {
+            activity?.Join();
+            other?.Dispose();
+            SaveLog(name);
+        }
+    }
+
     // ------------------------------------------------------------------ helpers
 
     Case Prepare(VhdxFixture vhdx, string name)
@@ -321,9 +370,16 @@ public sealed class RunnerVhdxTests(ITestOutputHelper output)
         public void SetJournalStep(string path, MoveStep step) { log($"SetJournalStep({step})"); Calls.Add($"Step({step})"); inner.SetJournalStep(Journal(path), step); }
         public void DeleteJournal(string path) { log("DeleteJournal"); Calls.Add("DeleteJournal"); inner.DeleteJournal(Journal(path)); }
 
-        public bool RunMove(int disk, string journal, int moveIndex, Func<long, long, bool> progress)
+        public (byte[] First, byte[] Backup) ReadBootSectors(int disk, long start, long length, int sectorSize)
+        {
+            log($"ReadBootSectors({start}, {length}, {sectorSize})");
+            return inner.ReadBootSectors(Disk(disk, "ReadBootSectors"), start, length, sectorSize);
+        }
+
+        public bool RunMove(int disk, string journal, int moveIndex, Func<long, long, bool> progress, IDisposable? heldLock)
         {
             var sw = Stopwatch.StartNew();
+            log($"RunMove({moveIndex}) with {(heldLock is null ? "no lock of ours (the DLL locks the old-offset volume)" : "our lock")}");
             bool done = inner.RunMove(Disk(disk, $"RunMove({moveIndex})"), Journal(journal), moveIndex, (d, t) =>
             {
                 if (CrashInMove is { } cm && cm.Move == moveIndex && !Crashed && d > 0 && d * 100 >= t * cm.Percent)
@@ -333,7 +389,7 @@ public sealed class RunnerVhdxTests(ITestOutputHelper output)
                     throw new SimulatedCrashException();
                 }
                 return progress(d, t);
-            });
+            }, heldLock);
             log($"RunMove({moveIndex}) = {done} in {sw.Elapsed.TotalSeconds:F1} s");
             return done;
         }

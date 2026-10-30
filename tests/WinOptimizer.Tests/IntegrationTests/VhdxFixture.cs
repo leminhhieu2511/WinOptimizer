@@ -5,6 +5,8 @@ using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Security.Principal;
 using System.Text;
+using Microsoft.Win32.SafeHandles;
+using WinOptimizer.Services.DiskSpace;
 using Xunit;
 
 namespace WinOptimizer.Tests.IntegrationTests;
@@ -350,6 +352,81 @@ public sealed class VhdxFixture : IDisposable
             throw new Win32Exception(Marshal.GetLastWin32Error(), $"GetVolumeInformation({letter}:)");
         return serial;
     }
+
+    /// <summary>
+    /// The trigger of the hash-mismatch investigation: a partition-layout change on THIS (second) disk while another
+    /// disk's move is half done. Hides and unhides DLIKE <paramref name="cycles"/> times through DiskMove.dll
+    /// (SET_DRIVE_LAYOUT_EX + UPDATE_PROPERTIES), 700 ms apart, on a background thread; join it when done.
+    /// </summary>
+    public Thread StartHideUnhide(Action<string> log, int cycles = 3)
+    {
+        int disk = DiskNumber;   // AssertSafe
+        var native = new WindowsDiskMoveBackend();
+        ulong original = native.GetPartitionAttributes(disk, DLikeGuid);
+        var t = new Thread(() =>
+        {
+            try
+            {
+                for (int k = 0; k < cycles; k++)
+                {
+                    AssertSafe();
+                    native.SetPartitionAttributes(disk, DLikeGuid, original | DiskMoveRunner.HideBits);
+                    log($"ACTIVITY other disk {disk}: DLIKE hidden ({k + 1}/{cycles})");
+                    Thread.Sleep(700);
+                    AssertSafe();
+                    native.SetPartitionAttributes(disk, DLikeGuid, original);
+                    log($"ACTIVITY other disk {disk}: DLIKE visible again ({k + 1}/{cycles})");
+                    Thread.Sleep(700);
+                }
+            }
+            catch (Exception ex)
+            {
+                log($"ACTIVITY failed: {ex.Message}");
+            }
+        }) { IsBackground = true, Name = "other-disk layout changes" };
+        t.Start();
+        return t;
+    }
+
+    /// <summary>Read-only: <paramref name="count"/> bytes at <paramref name="offset"/> of the VHDX disk.</summary>
+    public byte[] ReadRaw(long offset, int count)
+    {
+        using var h = CreateFileW(DiskPath, 0x80000000 /* GENERIC_READ */, 3, IntPtr.Zero, 3, 0, IntPtr.Zero);
+        if (h.IsInvalid) throw new Win32Exception(Marshal.GetLastWin32Error(), $"open {DiskPath}");
+        var buf = new byte[count];
+        if (RandomAccess.Read(h, buf, offset) != count) throw new IOException($"short read at {offset}");
+        return buf;
+    }
+
+    /// <summary>
+    /// "\Device\HarddiskVolumeN" whose only extent is exactly [start, start + length) on the disk, or null. Zero-access
+    /// opens only (a direct device open never mounts a file system), like DiskMove.dll's own lookup.
+    /// </summary>
+    public string? FindVolumeDevice(long start, long length)
+    {
+        int disk = DiskNumber;
+        var buf = new byte[24 + 8 * 24];
+        for (int n = 1; n <= 4096; n++)
+        {
+            using var h = CreateFileW($@"\\?\GLOBALROOT\Device\HarddiskVolume{n}", 0, 7, IntPtr.Zero, 3, 0, IntPtr.Zero);
+            if (h.IsInvalid) continue;
+            if (!DeviceIoControl(h, 0x00560000 /* IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS */, IntPtr.Zero, 0, buf, buf.Length,
+                                 out _, IntPtr.Zero))
+                continue;
+            if (BitConverter.ToUInt32(buf, 0) == 1 && BitConverter.ToUInt32(buf, 8) == disk &&
+                BitConverter.ToInt64(buf, 16) == start && BitConverter.ToInt64(buf, 24) == length)
+                return $@"\Device\HarddiskVolume{n}";
+        }
+        return null;
+    }
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    static extern SafeFileHandle CreateFileW(string path, uint access, uint share, IntPtr sa, uint disposition, uint flags,
+                                             IntPtr template);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    static extern bool DeviceIoControl(SafeFileHandle h, uint code, IntPtr inBuf, int inSize, [Out] byte[] outBuf, int outSize,
+                                       out int returned, IntPtr overlapped);
 
     /// <summary>Takes the VHDX disk offline (diskpart): its volumes go away, so nothing writes to it.</summary>
     public void SetOffline()

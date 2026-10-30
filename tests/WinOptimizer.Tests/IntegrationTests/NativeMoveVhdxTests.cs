@@ -109,6 +109,52 @@ public sealed class NativeMoveVhdxTests(ITestOutputHelper output)
     }
 
     /// <summary>
+    /// Regression of the hash-mismatch investigation (Ruling 19): "move" is killed at 50 % of the copy; while the
+    /// half-moved DLIKE is hidden, a SECOND VHDX's partition layout changes (DLIKE there hidden + unhidden 3 times),
+    /// which makes Windows re-enumerate and mount the old-offset volume device of our DLIKE. Before the fix NTFS wrote
+    /// into the not-yet-copied source and the resume copied the damage (4 of 4 runs). Now the old view's boot
+    /// sectors are zero (RAW) and the resume locks that device, so every hash must match and chkdsk be clean; the old
+    /// first sector must still be zero after the commit, and the new one an NTFS boot sector.
+    /// </summary>
+    [AdminTheory]
+    [InlineData(1)]
+    [InlineData(2)]
+    [InlineData(3)]
+    public void Move_KilledAtProgress50_LayoutChangeOnOtherDisk_ResumesCleanly(int run)
+    {
+        string name = $"bootfix-cli-{run}";
+        VhdxFixture? other = null;
+        Thread? activity = null;
+        try
+        {
+            other = VhdxFixture.Create(name + "-other", Log);
+            using var vhdx = VhdxFixture.Create(name, Log);
+            var m = Prepare(vhdx, name);
+            KillAt(m, "progress:50");
+            activity = other.StartHideUnhide(Log);
+            Recover(m, "progress:50", afterResume: () =>
+            {
+                activity.Join();
+                Log("activity on the other disk done (it overlapped the resume)");
+            });
+            AssertMoved(vhdx, m);
+
+            var oldFirst = vhdx.ReadRaw(m.OldStart, (int)m.Sector);
+            Assert.True(oldFirst.All(x => x == 0), "the old first sector must have been invalidated (zeroed)");
+            var newFirst = vhdx.ReadRaw(m.NewStart, (int)m.Sector);
+            Assert.Equal("NTFS    ", Encoding.ASCII.GetString(newFirst, 3, 8));
+            Assert.Equal((uint)(m.NewStart / m.Sector), BitConverter.ToUInt32(newFirst, 0x1C));   // patched after the restore
+            Log("RESULT bootfix CLI regression: hashes, chkdsk, identity, boot sectors all as expected");
+        }
+        finally
+        {
+            activity?.Join();
+            other?.Dispose();
+            SaveLog(name);
+        }
+    }
+
+    /// <summary>
     /// A crashed move must not be resumed on another disk: "resume --disk" of a second (offline) VHDX is
     /// refused with DM_E_JOURNAL_MISMATCH (exit code 6), its bytes and the journal stay unchanged, and the
     /// right disk then resumes normally.
@@ -229,9 +275,14 @@ public sealed class NativeMoveVhdxTests(ITestOutputHelper output)
             ["commit", "--disk", Disk, "--part-guid", PartGuid.ToString(), "--start", OldStart.ToString(), "--journal", Journal];
     }
 
+    VhdxFixture? _vhdx;
+
+    VhdxFixture Vhdx(MoveCase m) => _vhdx ?? throw new InvalidOperationException($"no fixture for {m.Disk}");
+
     /// <summary>Fills DLIKE with 2000 files, shrinks it by 512 MiB and collects what the move needs.</summary>
     MoveCase Prepare(VhdxFixture vhdx, string name)
     {
+        _vhdx = vhdx;
         var d = vhdx.DLike;
         char letter = d.Letter;
         var hashes = vhdx.PopulateFiles(letter, FileCount, FileSeed);
@@ -333,7 +384,7 @@ public sealed class NativeMoveVhdxTests(ITestOutputHelper output)
 
     /// <summary>Checks the crash state (journal + sidecar only: the hidden volume is not opened), then finishes
     /// the move: resume + commit if the journal exists, otherwise undo the hiding and move again.</summary>
-    void Recover(MoveCase m, string killAt)
+    void Recover(MoveCase m, string killAt, Action? afterResume = null)
     {
         bool sidecar = File.Exists(m.Sidecar);
         var (statusRc, statusOut) = Cli(["status", "--journal", m.Journal]);
@@ -360,15 +411,21 @@ public sealed class NativeMoveVhdxTests(ITestOutputHelper output)
 
         if (statusRc == 0)
         {
-            // The journal exists, so copying may have started: finish it (resume without a volume lock: a
-            // hidden volume has no device), then commit + restore.
+            // The journal exists, so copying may have started: finish it (resume without --volume: a hidden volume
+            // has no name to lock; DiskMove.dll locks its old-offset device itself), then commit + restore.
             Log("RECOVERY resume + commit (journal valid)");
+            if (done > 0 && done < count)
+                Log("old-offset volume device before the resume: " + (Vhdx(m).FindVolumeDevice(m.OldStart, m.Length) ?? "none"));
             var (rc, outp) = Cli(m.ResumeArgs());
             Assert.True(rc == 0, $"resume failed ({rc}): {outp}");
             int copied = outp.Split('\n').Count(l => l.StartsWith("progress "));
             Log($"resume reported {copied} copied chunk(s)");
             if (done < count) Assert.True(copied > 0, "the resume must copy the remaining chunks");
+            afterResume?.Invoke();
             (rc, outp) = Cli(m.CommitArgs());
+            if (rc != 0)
+                Log($"DIAG commit failed: volume device at the old offset {Vhdx(m).FindVolumeDevice(m.OldStart, m.Length) ?? "none"}, " +
+                    $"at the new offset {Vhdx(m).FindVolumeDevice(m.NewStart, m.Length) ?? "none"}; " + VolumeProbe(m.VolumePath));
             Assert.True(rc == 0, $"commit failed ({rc}): {outp}");
             return;
         }
