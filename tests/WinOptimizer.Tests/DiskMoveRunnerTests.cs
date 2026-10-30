@@ -130,7 +130,7 @@ public sealed class DiskMoveRunnerTests : IDisposable
             "Lock(D)", "Verify(D)", "Dismount(D)", "ReadBoot(D)",                   // 2: boot sectors after lock + dismount
             "Lock(R)", "Verify(R)", "Dismount(R)", "ReadBoot(R)", "Unlock(R)",
             "CreateJournal",                               // journal BEFORE the hide
-            "SetAttributes(D,hidden", "Verify(D)", "RemoveLetter(D,D)", "Dismount(D)",
+            "SetAttributes(D,hidden", "Verify(D)", "RemoveLetter(D,D)",
             "Step(MoveSource)", "RunMove(0)", "Chunk(0,3)", // 3
             "Step(CommitSource)", "Patch(D)", "SetStart(D,", "SetAttributes(D,visible", "Unlock(D)", "AssignLetter(D,D)", // 4
             "Step(MoveRecovery)", "SetWinRe(False)", "Lock(R)", "Verify(R)", "SetAttributes(R,hidden", "Verify(R)",
@@ -139,6 +139,7 @@ public sealed class DiskMoveRunnerTests : IDisposable
             "Step(Verify)", "Chkdsk(D)", "Step(Done)", "DeleteJournal"); // 7
         Assert.True(f.Calls.IndexOf("CreateJournal") < f.Calls.FindIndex(c => c.StartsWith("SetAttributes(D,hidden")));
         Assert.Empty(f.OldOffsetLocks);   // a fresh run hands its own locks to DiskMove.dll
+        Assert.Single(f.Calls, c => c == "Dismount(D)");   // once, before the boot sector read (a second one fails)
         Assert.Equal(new[] { 4, 4 }, new[] { f.ChunkCopies[0], f.ChunkCopies[1] });
         var steps = progress.Items.Select(p => p.Step).Distinct().ToList();
         Assert.Equal(Enum.GetValues<MoveStep>().Where(s => s != MoveStep.Done), steps.Where(s => s != MoveStep.Done));
@@ -277,8 +278,7 @@ public sealed class DiskMoveRunnerTests : IDisposable
         var f = new FakeDiskMoveBackend();
         var b = Capture(f);
         using var cts = new CancellationTokenSource();
-        int dismounts = 0;   // the second Dismount(D) ends step 2 (the first one comes before the boot sector read)
-        f.OnCall = c => { if (c == "Dismount(D)" && ++dismounts == 2) cts.Cancel(); };
+        f.OnCall = c => { if (c == "RemoveLetter(D,D)") cts.Cancel(); };   // the end of step 2
         await Assert.ThrowsAnyAsync<OperationCanceledException>(() => Run(f, ct: cts.Token));
 
         Assert.Equal(b.DAttrs, f.D.Attrs);
@@ -450,10 +450,9 @@ public sealed class DiskMoveRunnerTests : IDisposable
         var b = Capture(f);
         using var cts = new CancellationTokenSource();
         bool pendingAtFirstUndoCall = false;
-        int dismounts = 0;   // the second Dismount(D) ends step 2 (the first one comes before the boot sector read)
         f.OnCall = c =>
         {
-            if (c == "Dismount(D)" && ++dismounts == 2) cts.Cancel();
+            if (c == "RemoveLetter(D,D)") cts.Cancel();   // the end of step 2
             if (c.StartsWith("SetAttributes(D,visible")) pendingAtFirstUndoCall = File.Exists(Pending);
             bool hit = point switch
             {
@@ -916,10 +915,10 @@ public sealed class DiskMoveRunnerTests : IDisposable
         var f = new FakeDiskMoveBackend();
         var b = Capture(f);
         using var cts = new CancellationTokenSource();
-        int countAtCancel = -1, dismounts = 0;
+        int countAtCancel = -1;
         f.OnCall = c =>
         {
-            if (c != "Dismount(D)" || ++dismounts != 2) return;   // the end of step 2
+            if (c != "RemoveLetter(D,D)") return;   // the end of step 2
             f.D.Size = b.DSize + FakeDiskMoveBackend.MiB;   // something grew it (the fake's model allows it: D is hidden)
             countAtCancel = f.Calls.Count(x => !x.StartsWith("Unlock"));   // step 2 already released the Recovery lock
             cts.Cancel();

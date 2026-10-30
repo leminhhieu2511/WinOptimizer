@@ -274,6 +274,7 @@ public sealed class FakeDiskMoveBackend : IDiskMoveBackend
     {
         Alive();
         var p = ((Vol)volume).Part;
+        if (p.Dismounted) throw new DiskMoveNativeException(3, "fake: dismount of an already dismounted volume handle (Windows: DM_E_IO)");
         p.Dismounted = true;
         Did($"Dismount({p.Name})");
     }

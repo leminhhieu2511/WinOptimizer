@@ -131,6 +131,8 @@ public sealed class DiskMoveRunner
         public required Func<bool> ShouldPause;
         public bool ManageWinRe;
         public IDisposable? SourceLock;
+        /// <summary>SourceLock is already dismounted (a second FSCTL_DISMOUNT_VOLUME on the handle fails).</summary>
+        public bool SourceDismounted;
         public IDisposable? RecoveryLock;
         // Undo bookkeeping (only before step 3 of a fresh run).
         public bool Shrunk, JournalCreated, SourceHidden, UndoMarkerWritten;
@@ -340,6 +342,7 @@ public sealed class DiskMoveRunner
             throw new DiskMoveException("The locked volume is not the source partition on this disk.");
         // Journal v2: the original boot sectors, read after the lock + dismount and before any write.
         _b.Dismount(ctx.SourceLock);
+        ctx.SourceDismounted = true;
         var srcBoot = _b.ReadBootSectors(ctx.Disk, s.SourceStart, s.SourceShrunkSize, s.SectorSize);
         var recBoot = recovery is null ? default : ReadRecoveryBootSectors(ctx, recovery);
         cancel.ThrowIfCancellationRequested();
@@ -383,7 +386,7 @@ public sealed class DiskMoveRunner
     }
 
     /// <summary>original | HIDDEN | NO_DRIVE_LETTER in one layout write; re-verify the lock handle; remove the
-    /// letter (Windows usually already did); dismount. Needs ctx.SourceLock.</summary>
+    /// letter (Windows usually already did); dismount unless step 2 already did. Needs ctx.SourceLock.</summary>
     private void HideSource(Ctx ctx)
     {
         var s = ctx.State;
@@ -392,7 +395,8 @@ public sealed class DiskMoveRunner
         if (!_b.VerifyVolume(ctx.SourceLock!, ctx.Disk, s.SourceStart, s.SourceShrunkSize))
             throw new DiskMoveException("The source volume lock no longer matches the partition after hiding it.");
         if (s.SourceLetter != '\0') _b.RemoveLetter(s.SourceVolumePath!, s.SourceLetter);
-        _b.Dismount(ctx.SourceLock!);
+        if (!ctx.SourceDismounted) _b.Dismount(ctx.SourceLock!);   // a fresh run dismounted it before the boot read
+        ctx.SourceDismounted = true;
     }
 
     /// <summary>Undo of steps 1-2 (cancel, failed recheck, failure before step 3). Order: (1) pending marker with
