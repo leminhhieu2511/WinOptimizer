@@ -3,7 +3,8 @@
 #include <stdlib.h>
 #include <string.h>
 
-struct dmw_volume { HANDLE h; };
+/* A lock, or a chain of locks (every old-offset device of a partition), closed together. */
+struct dmw_volume { HANDLE h; struct dmw_volume *next; };
 
 DMW_API dm_status DMW_CALL dmw_volume_lock(const wchar_t *volume_path, dmw_volume **out)
 {
@@ -38,6 +39,7 @@ DMW_API dm_status DMW_CALL dmw_volume_lock(const wchar_t *volume_path, dmw_volum
         return DM_E_NOMEM;
     }
     v->h = h;
+    v->next = NULL;
     *out = v;
     return DM_OK;
 }
@@ -53,9 +55,12 @@ DMW_API dm_status DMW_CALL dmw_volume_dismount(dmw_volume *v)
 
 DMW_API void DMW_CALL dmw_volume_close(dmw_volume *v)
 {
-    if (!v) return;
-    CloseHandle(v->h);
-    free(v);
+    while (v) {
+        dmw_volume *next = v->next;
+        CloseHandle(v->h);
+        free(v);
+        v = next;
+    }
 }
 
 dm_status dmw_extents_match(const VOLUME_DISK_EXTENTS *ext, uint32_t disk_number, uint64_t start, uint64_t length)
@@ -128,41 +133,153 @@ dm_status __cdecl dmw_query_volume_device(void *ctx, uint32_t n, VOLUME_DISK_EXT
     return DM_OK;
 }
 
-dm_status dmw_find_volume_device(dmw_extents_query query, void *ctx, uint32_t max, uint32_t disk_number,
-                                 uint64_t start, uint64_t length, uint32_t *found)
+dm_status dmw_find_volume_devices(dmw_extents_query query, void *ctx, const uint32_t *cand, uint32_t ncand,
+                                  uint32_t disk_number, uint64_t start, uint64_t length,
+                                  uint32_t *found, uint32_t cap, uint32_t *nfound)
 {
-    if (!query || !found) return DM_E_INVALID_ARG;
-    for (uint32_t n = 1; n <= max; n++) {
+    if (nfound) *nfound = 0;
+    if (!query || !cand || !found || !nfound) return DM_E_INVALID_ARG;
+    for (uint32_t i = 0; i < ncand; i++) {
         extents_buf b;
-        if (query(ctx, n, &b.e, (uint32_t)sizeof b) != DM_OK) continue;   /* no such device, or not queryable */
-        if (dmw_extents_match(&b.e, disk_number, start, length) == DM_OK) {
-            *found = n;
-            return DM_OK;
-        }
+        if (query(ctx, cand[i], &b.e, (uint32_t)sizeof b) != DM_OK) continue;   /* gone, or not queryable */
+        if (dmw_extents_match(&b.e, disk_number, start, length) != DM_OK) continue;
+        if (*nfound >= cap) return DM_E_NOMEM;
+        found[(*nfound)++] = cand[i];
     }
-    return DM_E_NOT_FOUND;
+    return *nfound ? DM_OK : DM_E_NOT_FOUND;
 }
 
-/* One attempt of dmw_lock_old_volume. */
+int dmw_parse_volume_name(const wchar_t *name, size_t len, uint32_t *n)
+{
+    static const wchar_t prefix[] = L"HarddiskVolume";
+    const size_t pl = sizeof prefix / sizeof prefix[0] - 1;
+    if (!name || !n || len <= pl || wcsncmp(name, prefix, pl) != 0) return 0;
+    uint64_t v = 0;
+    for (size_t i = pl; i < len; i++) {
+        if (name[i] < L'0' || name[i] > L'9') return 0;
+        v = v * 10 + (uint64_t)(name[i] - L'0');
+        if (v > 0xFFFFFFFFull) return 0;
+    }
+    *n = (uint32_t)v;
+    return 1;
+}
+
+/* ntdll object-directory API (documented in winternl / the WDK; loaded dynamically). */
+typedef struct dmw_unicode { USHORT Length, MaximumLength; PWSTR Buffer; } dmw_unicode;
+typedef struct dmw_objattr {
+    ULONG Length; HANDLE RootDirectory; dmw_unicode *ObjectName; ULONG Attributes; PVOID Sd, Qos;
+} dmw_objattr;
+typedef struct dmw_dirinfo { dmw_unicode Name, TypeName; } dmw_dirinfo;
+typedef LONG (NTAPI *nt_open_dir)(HANDLE *, ACCESS_MASK, dmw_objattr *);
+typedef LONG (NTAPI *nt_query_dir)(HANDLE, PVOID, ULONG, BOOLEAN, BOOLEAN, PULONG, PULONG);
+typedef LONG (NTAPI *nt_close)(HANDLE);
+
+static int list_device_directory(uint32_t **out, uint32_t *count)
+{
+    HMODULE nt = GetModuleHandleW(L"ntdll.dll");
+    if (!nt) return 0;
+    nt_open_dir open_dir = (nt_open_dir)(void (*)(void))GetProcAddress(nt, "NtOpenDirectoryObject");
+    nt_query_dir query_dir = (nt_query_dir)(void (*)(void))GetProcAddress(nt, "NtQueryDirectoryObject");
+    nt_close close_h = (nt_close)(void (*)(void))GetProcAddress(nt, "NtClose");
+    if (!open_dir || !query_dir || !close_h) return 0;
+
+    wchar_t dev[] = L"\\Device";
+    dmw_unicode name = { (USHORT)(7 * sizeof(wchar_t)), (USHORT)sizeof dev, dev };
+    dmw_objattr oa = { sizeof oa, NULL, &name, 0x40 /* OBJ_CASE_INSENSITIVE */, NULL, NULL };
+    HANDLE dir = NULL;
+    if (open_dir(&dir, 0x0001 /* DIRECTORY_QUERY */, &oa) < 0) return 0;
+
+    uint32_t cap = 256, n = 0;
+    uint32_t *list = (uint32_t *)malloc(cap * sizeof *list);
+    const ULONG bufsz = 64 * 1024;
+    uint8_t *buf = (uint8_t *)malloc(bufsz);
+    int ok = list && buf;
+    ULONG ctx = 0, ret = 0;
+    BOOLEAN first = TRUE;
+    while (ok) {
+        LONG st = query_dir(dir, buf, bufsz, FALSE, first, &ctx, &ret);
+        first = FALSE;
+        if (st == (LONG)0x8000001A /* STATUS_NO_MORE_ENTRIES */) break;
+        if (st < 0) { ok = 0; break; }
+        for (const dmw_dirinfo *e = (const dmw_dirinfo *)buf; e->Name.Buffer; e++) {
+            uint32_t num;
+            if (!dmw_parse_volume_name(e->Name.Buffer, e->Name.Length / sizeof(wchar_t), &num)) continue;
+            if (n == cap) {
+                uint32_t *bigger = (uint32_t *)realloc(list, (size_t)cap * 2 * sizeof *list);
+                if (!bigger) { ok = 0; break; }
+                list = bigger;
+                cap *= 2;
+            }
+            list[n++] = num;
+        }
+        if (st == 0) continue;                  /* STATUS_SUCCESS: maybe more */
+        if (st == 0x00000105 /* STATUS_MORE_ENTRIES */) continue;
+    }
+    close_h(dir);
+    free(buf);
+    if (!ok || n == 0) { free(list); return 0; }
+    *out = list;
+    *count = n;
+    return 1;
+}
+
+dm_status dmw_volume_numbers(uint32_t **out, uint32_t *count, int *from_directory)
+{
+    if (!out || !count || !from_directory) return DM_E_INVALID_ARG;
+    *out = NULL; *count = 0; *from_directory = 0;
+    if (list_device_directory(out, count)) {
+        *from_directory = 1;
+        return DM_OK;
+    }
+    uint32_t *list = (uint32_t *)malloc(DMW_VOLUME_SCAN_MAX * sizeof *list);
+    if (!list) return DM_E_NOMEM;
+    for (uint32_t i = 0; i < DMW_VOLUME_SCAN_MAX; i++) list[i] = i + 1;
+    *out = list;
+    *count = DMW_VOLUME_SCAN_MAX;
+    return DM_OK;
+}
+
+/* Every device at exactly [start, start + length) on the disk. */
+static dm_status find_devices(uint32_t disk_number, uint64_t start, uint64_t length, uint32_t *found, uint32_t *nfound)
+{
+    uint32_t *cand = NULL, ncand = 0;
+    int from_dir = 0;
+    dm_status s = dmw_volume_numbers(&cand, &ncand, &from_dir);
+    if (s != DM_OK) return s;
+    s = dmw_find_volume_devices(dmw_query_volume_device, NULL, cand, ncand, disk_number, start, length, found,
+                                DMW_MAX_OLD_DEVICES, nfound);
+    free(cand);
+    return s;
+}
+
+/* One attempt: lock + verify + dismount EVERY matching device. DM_OK with *out = NULL if none exists;
+   DM_E_LOCKED (retry) if one cannot be locked or vanished between the scan and the open (re-enumeration in
+   progress: the next attempt rescans instead of assuming it is safe). */
 static dm_status lock_old_volume_once(uint32_t disk_number, uint64_t start, uint64_t length, dmw_volume **out)
 {
-    uint32_t n = 0;
-    dm_status s = dmw_find_volume_device(dmw_query_volume_device, NULL, DMW_VOLUME_SCAN_MAX, disk_number, start,
-                                         length, &n);
+    uint32_t found[DMW_MAX_OLD_DEVICES], nfound = 0;
+    dm_status s = find_devices(disk_number, start, length, found, &nfound);
     if (s == DM_E_NOT_FOUND) return DM_OK;   /* no volume device at the old offset: nothing can mount it */
-    if (s != DM_OK) return s;
+    if (s != DM_OK) return s == DM_E_NOMEM ? DM_E_LOCKED : s;
 
-    wchar_t path[64];
-    volume_device_path(n, path, 64);
-    dmw_volume *v = NULL;
-    s = dmw_volume_lock(path, &v);           /* a read/write open: Windows mounts it first (RAW once invalidated) */
-    if (s == DM_E_NOT_FOUND) return DM_OK;   /* it went away meanwhile */
-    if (s != DM_OK) return DM_E_LOCKED;
-    if (dmw_volume_verify(v, disk_number, start, length) != DM_OK || dmw_volume_dismount(v) != DM_OK) {
-        dmw_volume_close(v);
-        return DM_E_LOCKED;
+    dmw_volume *chain = NULL;
+    for (uint32_t i = 0; i < nfound; i++) {
+        wchar_t path[64];
+        volume_device_path(found[i], path, 64);
+        dmw_volume *v = NULL;
+        s = dmw_volume_lock(path, &v);       /* a read/write open: Windows mounts it first (RAW once invalidated) */
+        if (s == DM_OK && (dmw_volume_verify(v, disk_number, start, length) != DM_OK || dmw_volume_dismount(v) != DM_OK)) {
+            dmw_volume_close(v);
+            s = DM_E_LOCKED;
+        }
+        if (s != DM_OK) {
+            dmw_volume_close(chain);
+            return DM_E_LOCKED;
+        }
+        v->next = chain;
+        chain = v;
     }
-    *out = v;
+    *out = chain;
     return DM_OK;
 }
 
@@ -177,5 +294,44 @@ dm_status dmw_lock_old_volume(uint32_t disk_number, uint64_t start, uint64_t len
         s = lock_old_volume_once(disk_number, start, length, out);
         if (s != DM_E_LOCKED) break;
     }
+    return s;
+}
+
+DMW_API dm_status DMW_CALL dmw_lock_old_offset(const wchar_t *disk_path, uint64_t start, uint64_t length, dmw_volume **out)
+{
+    if (!out) return DM_E_INVALID_ARG;
+    *out = NULL;
+    if (!disk_path || !disk_path[0]) return DM_E_INVALID_ARG;
+    uint32_t disk_number = 0;
+    dm_status s = dmw_disk_number(disk_path, &disk_number);
+    if (s != DM_OK) return s;
+    return dmw_lock_old_volume(disk_number, start, length, out);
+}
+
+/* mountmgr.h is not in every SDK: the two definitions needed. */
+#define DMW_IOCTL_MOUNTMGR_VOLUME_ARRIVAL_NOTIFICATION CTL_CODE(0x0000006D, 11, METHOD_BUFFERED, FILE_READ_ACCESS)
+
+DMW_API dm_status DMW_CALL dmw_volume_arrival_nudge(const wchar_t *disk_path, uint64_t start, uint64_t length)
+{
+    if (!disk_path || !disk_path[0]) return DM_E_INVALID_ARG;
+    uint32_t disk_number = 0, found[DMW_MAX_OLD_DEVICES], nfound = 0;
+    dm_status s = dmw_disk_number(disk_path, &disk_number);
+    if (s == DM_OK) s = find_devices(disk_number, start, length, found, &nfound);
+    if (s != DM_OK) return s;
+    HANDLE mm = CreateFileW(L"\\\\.\\MountPointManager", GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
+                            OPEN_EXISTING, 0, NULL);
+    if (mm == INVALID_HANDLE_VALUE) return dmw_status_from_win32(GetLastError());
+    for (uint32_t i = 0; i < nfound && s == DM_OK; i++) {
+        /* MOUNTMGR_TARGET_NAME: USHORT DeviceNameLength (bytes), WCHAR DeviceName[] (not terminated). */
+        union { USHORT len; uint8_t raw[2 + 64 * sizeof(wchar_t)]; } t;
+        wchar_t name[64];
+        int chars = swprintf(name, 64, L"\\Device\\HarddiskVolume%u", found[i]);
+        t.len = (USHORT)(chars * sizeof(wchar_t));
+        memcpy(t.raw + 2, name, t.len);
+        DWORD ret = 0;
+        if (!DeviceIoControl(mm, DMW_IOCTL_MOUNTMGR_VOLUME_ARRIVAL_NOTIFICATION, &t, 2 + t.len, NULL, 0, &ret, NULL))
+            s = dmw_status_from_win32(GetLastError());
+    }
+    CloseHandle(mm);
     return s;
 }

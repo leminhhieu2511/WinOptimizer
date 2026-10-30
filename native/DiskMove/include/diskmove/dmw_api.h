@@ -64,6 +64,19 @@ DMW_API dm_status DMW_CALL dmw_journal_set_step(const wchar_t *path, uint32_t st
 DMW_API dm_status DMW_CALL dmw_run_move(const wchar_t *disk_path, const wchar_t *journal_path, uint32_t move_index,
                                         dm_progress_cb progress, void *user, dmw_volume *held_lock);
 
+/* Finds EVERY volume device whose only extent is exactly [start, start + length) on the disk (a hidden, half-moved
+   partition keeps one at its old offset), locks + dismounts all of them and returns them as one handle in *out
+   (NULL if there is none); close it with dmw_volume_close. Callers hold it across a whole resumed step (copy,
+   pauses, NTFS patch, GPT commit) and pass it to dmw_run_move as held_lock. DM_E_LOCKED if one cannot be locked
+   (5 tries, 1 s apart; a device that vanishes meanwhile triggers a rescan, never a silent success). */
+DMW_API dm_status DMW_CALL dmw_lock_old_offset(const wchar_t *disk_path, uint64_t start, uint64_t length, dmw_volume **out);
+
+/* Writes nothing to the disk: asks the mount manager (IOCTL_MOUNTMGR_VOLUME_ARRIVAL_NOTIFICATION) to process the
+   arrival of every volume device whose only extent is exactly [start, start + length) on the disk. For a committed
+   volume that exists but never got its \\?\Volume{GUID} link / drive letter. DM_E_NOT_FOUND if there is no such
+   device. */
+DMW_API dm_status DMW_CALL dmw_volume_arrival_nudge(const wchar_t *disk_path, uint64_t start, uint64_t length);
+
 /* Read-only: the partition's first logical sector (at start) and its last one (start + length - sector_size, the
    NTFS backup boot sector), sector_size bytes each, into first / backup. For the journal v2 plan: call it after the
    volume is locked + dismounted and before any write. DM_E_INVALID_ARG for a sector size other than 512 / 4096 or

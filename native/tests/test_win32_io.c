@@ -831,26 +831,56 @@ static void old_volume_scan_matches_exact_extent(void)
         { 31, 2, 3, start, len, DM_OK },                    /* spanned: never */
         { 40, 1, 3, start, len, DM_E_ACCESS },              /* query fails: skipped */
         { 412, 1, 3, start, len, DM_OK },                   /* the stale old-offset device of the investigation */
-        { 500, 1, 3, start, len, DM_OK },                   /* a later duplicate: the first match wins */
+        { 5000, 1, 3, start, len, DM_OK },                  /* a second device with the same extent (review M1) */
     };
     fake_vols f = { vols, (uint32_t)(sizeof vols / sizeof vols[0]), 0, 0 };
-    uint32_t found = 0;
-    ASSERT_EQ_INT(dmw_find_volume_device(fake_query, &f, 4096, 3, start, len, &found), DM_OK);
-    ASSERT_EQ_U32(found, 412);
-    ASSERT_EQ_U32(f.max_n, 412);                            /* stops at the first match */
-    ASSERT_EQ_U32(f.calls, 412);                            /* N = 1..412, none skipped */
+    uint32_t cand[] = { 1, 2, 7, 9, 30, 31, 40, 412, 777, 5000 };   /* from \Device: any N, also above 4096 */
+    uint32_t found[8] = { 0 }, nfound = 0;
+    ASSERT_EQ_INT(dmw_find_volume_devices(fake_query, &f, cand, 10, 3, start, len, found, 8, &nfound), DM_OK);
+    ASSERT_EQ_U32(nfound, 2);                               /* EVERY match, not only the first */
+    ASSERT_EQ_U32(found[0], 412);
+    ASSERT_EQ_U32(found[1], 5000);
+    ASSERT_EQ_U32(f.calls, 10);                             /* each candidate queried once */
 
-    /* nothing matches: DM_E_NOT_FOUND after the whole range */
-    f.calls = f.max_n = 0;
-    ASSERT_EQ_INT(dmw_find_volume_device(fake_query, &f, 4096, 3, start, len - 4096, &found), DM_E_NOT_FOUND);
-    ASSERT_EQ_U32(f.calls, 4096);
-    /* the range limit is honoured (412 is beyond it) */
-    f.calls = f.max_n = 0;
-    ASSERT_EQ_INT(dmw_find_volume_device(fake_query, &f, 256, 3, start, len, &found), DM_E_NOT_FOUND);
-    ASSERT_EQ_U32(f.max_n, 256);
-    ASSERT_EQ_INT(dmw_find_volume_device(NULL, &f, 256, 3, start, len, &found), DM_E_INVALID_ARG);
-    ASSERT_EQ_INT(dmw_find_volume_device(fake_query, &f, 256, 3, start, len, NULL), DM_E_INVALID_ARG);
-    ASSERT_TRUE(DMW_VOLUME_SCAN_MAX >= 1024);               /* the investigation saw HarddiskVolume412 */
+    f.calls = 0;
+    ASSERT_EQ_INT(dmw_find_volume_devices(fake_query, &f, cand, 10, 3, start, len - 4096, found, 8, &nfound),
+                  DM_E_NOT_FOUND);
+    ASSERT_EQ_U32(nfound, 0);
+    ASSERT_EQ_INT(dmw_find_volume_devices(fake_query, &f, cand, 10, 3, start, len, found, 1, &nfound), DM_E_NOMEM);
+    ASSERT_EQ_INT(dmw_find_volume_devices(NULL, &f, cand, 10, 3, start, len, found, 8, &nfound), DM_E_INVALID_ARG);
+    ASSERT_EQ_INT(dmw_find_volume_devices(fake_query, &f, NULL, 10, 3, start, len, found, 8, &nfound), DM_E_INVALID_ARG);
+    ASSERT_EQ_INT(dmw_find_volume_devices(fake_query, &f, cand, 10, 3, start, len, NULL, 8, &nfound), DM_E_INVALID_ARG);
+}
+
+/* The name parser of the \Device enumeration (review M6). */
+static void volume_number_from_name(void)
+{
+    uint32_t n = 0;
+    ASSERT_TRUE(dmw_parse_volume_name(L"HarddiskVolume412", 17, &n) && n == 412);
+    ASSERT_TRUE(dmw_parse_volume_name(L"HarddiskVolume7", 15, &n) && n == 7);
+    ASSERT_TRUE(dmw_parse_volume_name(L"HarddiskVolume123456", 20, &n) && n == 123456);
+    ASSERT_TRUE(!dmw_parse_volume_name(L"HarddiskVolume", 14, &n));
+    ASSERT_TRUE(!dmw_parse_volume_name(L"HarddiskVolume4a", 16, &n));
+    ASSERT_TRUE(!dmw_parse_volume_name(L"Harddisk0", 9, &n));
+    ASSERT_TRUE(!dmw_parse_volume_name(L"HarddiskVolumeShadowCopy3", 25, &n));
+    ASSERT_TRUE(!dmw_parse_volume_name(L"HarddiskVolume99999999999", 25, &n));     /* overflow */
+}
+
+/* Review M4: the partition already at its new start while the move would still write: refuse. */
+static void move_position_checked(void)
+{
+    dm_journal_info i;
+    memset(&i, 0, sizeof i);
+    i.move_count = 1; i.chunk_count[0] = 10; i.chunks_done = 5;
+    ASSERT_TRUE(dmw_move_position_ok(&i, 0, 1));
+    ASSERT_TRUE(!dmw_move_position_ok(&i, 0, 0));           /* would copy under the committed volume */
+    i.chunks_done = 10;
+    ASSERT_TRUE(!dmw_move_position_ok(&i, 0, 0));           /* would restore under it */
+    i.boot_restored = 1;
+    ASSERT_TRUE(dmw_move_position_ok(&i, 0, 0));            /* no I/O */
+    ASSERT_TRUE(dmw_move_position_ok(&i, 0, 1));
+    ASSERT_TRUE(dmw_move_position_ok(NULL, 0, 1));
+    ASSERT_TRUE(!dmw_move_position_ok(NULL, 0, 0));
 }
 
 /* The real scan over \\?\GLOBALROOT\Device\HarddiskVolumeN with zero-access opens (no mount, no lock, no write):
@@ -860,12 +890,16 @@ static void old_volume_scan_smoke(void)
     LARGE_INTEGER t0, t1, fq;
     QueryPerformanceFrequency(&fq);
     QueryPerformanceCounter(&t0);
-    uint32_t found = 0;
-    ASSERT_EQ_INT(dmw_find_volume_device(dmw_query_volume_device, NULL, DMW_VOLUME_SCAN_MAX, 0xFFFFu, 1 * MIB, 1 * MIB, &found),
-                  DM_E_NOT_FOUND);
+    uint32_t *cand = NULL, ncand = 0, found[8], nfound = 0;
+    int from_dir = 0;
+    ASSERT_EQ_INT(dmw_volume_numbers(&cand, &ncand, &from_dir), DM_OK);
+    ASSERT_TRUE(ncand > 0);
+    ASSERT_EQ_INT(dmw_find_volume_devices(dmw_query_volume_device, NULL, cand, ncand, 0xFFFFu, 1 * MIB, 1 * MIB,
+                                          found, 8, &nfound), DM_E_NOT_FOUND);
     QueryPerformanceCounter(&t1);
-    printf("  old_volume_scan_smoke: %u devices scanned in %.1f ms\n", (unsigned)DMW_VOLUME_SCAN_MAX,
-           (double)(t1.QuadPart - t0.QuadPart) * 1000.0 / (double)fq.QuadPart);
+    printf("  old_volume_scan_smoke: %u candidates (%s) scanned in %.1f ms\n", (unsigned)ncand,
+           from_dir ? "from \\Device" : "numeric fallback", (double)(t1.QuadPart - t0.QuadPart) * 1000.0 / (double)fq.QuadPart);
+    ASSERT_TRUE(from_dir);
     /* The scan does see real devices: it finds the Windows volume by its own extent (zero-access opens only). */
     wchar_t win[MAX_PATH], root[4] = L"C:\\", dev[8] = L"\\\\.\\C:";
     if (GetSystemWindowsDirectoryW(win, MAX_PATH)) { root[0] = win[0]; dev[4] = win[0]; }
@@ -877,12 +911,14 @@ static void old_volume_scan_smoke(void)
         DeviceIoControl(h, IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS, NULL, 0, &b, sizeof b, &ret, NULL) &&
         b.e.NumberOfDiskExtents == 1) {
         const DISK_EXTENT *e = &b.e.Extents[0];
-        ASSERT_EQ_INT(dmw_find_volume_device(dmw_query_volume_device, NULL, DMW_VOLUME_SCAN_MAX, e->DiskNumber,
-                                             (uint64_t)e->StartingOffset.QuadPart, (uint64_t)e->ExtentLength.QuadPart,
-                                             &found), DM_OK);
-        printf("  old_volume_scan_smoke: the Windows volume %ls is HarddiskVolume%u\n", root, found);
+        ASSERT_EQ_INT(dmw_find_volume_devices(dmw_query_volume_device, NULL, cand, ncand, e->DiskNumber,
+                                              (uint64_t)e->StartingOffset.QuadPart, (uint64_t)e->ExtentLength.QuadPart,
+                                              found, 8, &nfound), DM_OK);
+        ASSERT_EQ_U32(nfound, 1);
+        printf("  old_volume_scan_smoke: the Windows volume %ls is HarddiskVolume%u\n", root, found[0]);
     }
     if (h != INVALID_HANDLE_VALUE) CloseHandle(h);
+    dmw_free(cand);
     dmw_volume *v = (dmw_volume *)1;
     ASSERT_EQ_INT(dmw_lock_old_volume(0xFFFFu, 1 * MIB, 1 * MIB, &v), DM_OK);   /* none found: nothing to lock */
     ASSERT_TRUE(v == NULL);
@@ -930,6 +966,9 @@ static void misc_args(void)
     ASSERT_EQ_INT(dmw_get_partition_attributes(L"x", id, NULL), DM_E_INVALID_ARG);
     ASSERT_EQ_INT(dmw_disk_number(L"x", NULL), DM_E_INVALID_ARG);
     ASSERT_EQ_INT(dmw_journal_create(NULL, NULL, 0, NULL, 0), DM_E_INVALID_ARG);
+    ASSERT_EQ_INT(dmw_lock_old_offset(NULL, MIB, MIB, &v), DM_E_INVALID_ARG);
+    ASSERT_EQ_INT(dmw_lock_old_offset(L"x", MIB, MIB, NULL), DM_E_INVALID_ARG);
+    ASSERT_EQ_INT(dmw_volume_arrival_nudge(NULL, MIB, MIB), DM_E_INVALID_ARG);
     ASSERT_EQ_INT(dmw_status_from_win32(ERROR_ACCESS_DENIED), DM_E_ACCESS);
     ASSERT_EQ_INT(dmw_status_from_win32(ERROR_FILE_NOT_FOUND), DM_E_NOT_FOUND);
     ASSERT_EQ_INT(dmw_status_from_win32(ERROR_PATH_NOT_FOUND), DM_E_NOT_FOUND);
@@ -965,4 +1004,6 @@ void dm_run_win32_io(void)
     DM_RUN(old_volume_scan_matches_exact_extent);
     DM_RUN(old_volume_scan_smoke);
     DM_RUN(old_lock_needed_only_when_writing);
+    DM_RUN(volume_number_from_name);
+    DM_RUN(move_position_checked);
 }

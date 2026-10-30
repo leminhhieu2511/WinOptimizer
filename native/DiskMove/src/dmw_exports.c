@@ -167,9 +167,12 @@ dm_status dmw_run_move_ex(const wchar_t *disk_path, const wchar_t *journal_path,
         dm_journal_info info;
         int at_old = 1;
         s = check_disk_identity(disk_path, &cio, move_index, &plan, &at_old);
+        const dm_journal_info *ip = NULL;
+        if (s == DM_OK && journal_info(&cio, &info) == DM_OK) ip = &info;
+        /* Review M4: never copy or restore under a partition that is already at its new start. */
+        if (s == DM_OK && !dmw_move_position_ok(ip, move_index, at_old)) s = DM_E_JOURNAL_MISMATCH;
         /* Only when this call can write: opening the old device read/write makes Windows mount it (RAW). */
-        if (s == DM_OK && !held_lock &&
-            dmw_move_needs_old_lock(journal_info(&cio, &info) == DM_OK ? &info : NULL, move_index, at_old))
+        if (s == DM_OK && !held_lock && dmw_move_needs_old_lock(ip, move_index, at_old))
             s = lock_old_offset(disk_path, &plan, &own);
         if (s != DM_OK) {
             dmw_file_close(&jf);
@@ -206,4 +209,13 @@ int dmw_move_needs_old_lock(const dm_journal_info *info, uint32_t move_index, in
         info->chunks_done == info->chunk_count[move_index] && info->boot_restored)
         return 0;                                            /* complete and restored: no I/O */
     return 1;
+}
+
+int dmw_move_position_ok(const dm_journal_info *info, uint32_t move_index, int at_old)
+{
+    if (at_old) return 1;
+    if (!info) return 0;
+    if (move_index < info->move_index) return 1;             /* finished earlier: no I/O */
+    return move_index == info->move_index && move_index < DM_MAX_MOVES &&
+           info->chunks_done == info->chunk_count[move_index] && info->boot_restored;
 }

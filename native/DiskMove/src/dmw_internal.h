@@ -79,16 +79,31 @@ typedef dm_status (__cdecl *dmw_extents_query)(void *ctx, uint32_t n, VOLUME_DIS
    a file system), then the IOCTL. ctx is unused. */
 dm_status __cdecl dmw_query_volume_device(void *ctx, uint32_t n, VOLUME_DISK_EXTENTS *buf, uint32_t size);
 
-/* Pure part of the old-offset lookup: the first N in [1, max] whose volume is exactly one extent
-   [start, start + length) on disk_number (dmw_extents_match). DM_OK + *found, or DM_E_NOT_FOUND. */
-dm_status dmw_find_volume_device(dmw_extents_query query, void *ctx, uint32_t max, uint32_t disk_number,
-                                 uint64_t start, uint64_t length, uint32_t *found);
+/* Pure part of the lookup: EVERY candidate N whose volume is exactly one extent [start, start + length) on
+   disk_number (dmw_extents_match), in candidate order, into found[0..cap). DM_OK with *nfound >= 1;
+   DM_E_NOT_FOUND if none; DM_E_NOMEM if more than cap match. */
+dm_status dmw_find_volume_devices(dmw_extents_query query, void *ctx, const uint32_t *cand, uint32_t ncand,
+                                  uint32_t disk_number, uint64_t start, uint64_t length,
+                                  uint32_t *found, uint32_t cap, uint32_t *nfound);
+
+/* Candidate volume numbers: every \Device\HarddiskVolumeN in the object directory (NtQueryDirectoryObject, any N),
+   *from_directory = 1; if the directory cannot be read, 1..DMW_VOLUME_SCAN_MAX, *from_directory = 0.
+   Free *out with dmw_free. */
+dm_status dmw_volume_numbers(uint32_t **out, uint32_t *count, int *from_directory);
+
+/* "HarddiskVolume<digits>" (len wide chars, not terminated) -> N; 0 for anything else or an overflow. */
+int dmw_parse_volume_name(const wchar_t *name, size_t len, uint32_t *n);
+
+/* Pure (review M4): may dmw_run_move go on with the partition where the layout has it? A move that can still
+   write (not an earlier one, not complete + boot_restored) needs it at old_start; info NULL: only at old_start. */
+int dmw_move_position_ok(const dm_journal_info *info, uint32_t move_index, int at_old);
 
 /* Finds the volume device at exactly [start, start + length) on disk_number; if there is one: open it (Windows
    mounts RAW on an invalidated boot sector), FSCTL_LOCK_VOLUME, re-verify the extent, FSCTL_DISMOUNT_VOLUME, and
    return it in *out (the caller closes it). None: DM_OK with *out = NULL. Exists but cannot be locked / verified /
    dismounted: DM_E_LOCKED (nothing held) after DMW_OLD_LOCK_ATTEMPTS tries 1 s apart. */
 #define DMW_OLD_LOCK_ATTEMPTS 5
+#define DMW_MAX_OLD_DEVICES   8
 
 /* Pure: does dmw_run_move need the old-offset lock? Only when dm_run_move can write: at_old (the partition is
    still at old_start in the layout) and the move is neither an earlier one nor complete with boot_restored.
