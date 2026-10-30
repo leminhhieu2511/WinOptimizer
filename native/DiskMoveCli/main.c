@@ -23,14 +23,14 @@
  *   diskmove-cli commit --disk <path> --part-guid <g> --start <new b> [--length <b> [--sector <n>]]
  *                       [--volume <path> --old-start <b>] [--journal <p>]
  *       With --sector the NTFS HiddenSectors are patched first. With --journal the sidecar is restored after
- *       success. --volume (a hidden volume has no letter: use "\\?\Volume{...}") is verified at --old-start
+ *       success, and a readable journal must show the move complete with its boot sectors restored. --volume (a hidden volume has no letter: use "\\?\Volume{...}") is verified at --old-start
  *       or, after an earlier partial commit, at --start.
  *   diskmove-cli status --journal <p>   (also prints pending restore info)
  *
  * Every command first refuses a --disk that holds the Windows volume or an EFI system / active partition
  * (dmw_disk_is_system; read-only, fails closed).
  *
- * Step lines: "phase <lock|hide|copy|patch|commit-gpt|restore|done>"; progress lines: "progress <done>/<total>"
+ * Step lines: "phase <lock|hide|copy|patch|commit-gpt|restore|unhidden|done>"; progress lines: "progress <done>/<total>"
  * (stdout is unbuffered). Ctrl+C stops between two chunks (exit code 7 = DM_E_STOPPED).
  * Exit code = dm_status of the failing step (0 = success, 1 = bad command line).
  */
@@ -244,10 +244,31 @@ static void drop_auto_letters(const restore_info *ri)
     }
 }
 
-/* Re-creates the recorded mount points; drops a drive letter Windows auto-assigned meanwhile. */
-static int remount(const restore_info *ri)
+/* The mount manager knows the volume: its \\?\Volume{GUID} name resolves to paths, or FindFirstVolume lists it. */
+static int volume_registered(const wchar_t *volume)
 {
-    int ok = 1;
+    wchar_t names[1024];
+    DWORD len = 0;
+    if (GetVolumePathNamesForVolumeNameW(volume, names, 1024, &len)) return 1;
+    wchar_t name[MAX_PATH];
+    HANDLE h = FindFirstVolumeW(name, MAX_PATH);
+    if (h == INVALID_HANDLE_VALUE) return 1;   /* cannot prove it is unregistered */
+    int listed = 0;
+    do listed |= _wcsicmp(name, volume) == 0; while (!listed && FindNextVolumeW(h, name, MAX_PATH));
+    FindVolumeClose(h);
+    return listed;
+}
+
+/* Where the volume is now, for the arrival nudge / toggle (review I1). length 0: no nudge, no toggle. */
+typedef struct remount_ctx { const wchar_t *disk; const uint8_t *part_guid; uint64_t start, length; } remount_ctx;
+
+/* Re-creates the recorded mount points; drops a drive letter Windows auto-assigned meanwhile. A volume that never
+   gets registered by the mount manager (seen after a kill right after the unhide: error 87) gets, after 5 s, an
+   arrival nudge that writes nothing to the disk, and after 12 s, only if it is still provably unregistered, ONE
+   hidden -> original attribute toggle. Returns 1 if every mount point is back; a missing one is a warning. */
+static int remount(const restore_info *ri, const remount_ctx *rc)
+{
+    int ok = 1, nudged = 0, toggled = 0;
     drop_auto_letters(ri);
     for (int i = 0; i < ri->mount_count; i++) {
         /* The volume re-arrives asynchronously after UPDATE_PROPERTIES, and Windows may give it its old letter
@@ -264,14 +285,30 @@ static int remount(const restore_info *ri)
                 set = 1;
             } else {
                 err = GetLastError();
+                if (rc && rc->length && attempt >= 10 && !nudged && !volume_registered(ri->volume)) {
+                    nudged = 1;
+                    dm_status ns = dmw_volume_arrival_nudge(rc->disk, rc->start, rc->length);
+                    printf("volume not registered after 5 s: mount manager arrival nudge %s (%d)\n",
+                           ns == DM_OK ? "sent" : "failed", (int)ns);
+                } else if (rc && rc->length && attempt >= 24 && !toggled && !volume_registered(ri->volume)) {
+                    toggled = 1;   /* last resort, once, only while provably unregistered (no letters to lose) */
+                    dm_status ts = dmw_set_partition_attributes(rc->disk, rc->part_guid,
+                                                                cli_hidden_attributes(ri->attributes), NULL);
+                    Sleep(1000);
+                    dm_status ts2 = dmw_set_partition_attributes(rc->disk, rc->part_guid, ri->attributes, NULL);
+                    printf("volume still not registered after 12 s: attributes toggled hidden -> original (%d, %d)\n",
+                           (int)ts, (int)ts2);
+                }
                 Sleep(500);
             }
         }
         if (!set) {
-            fprintf(stderr, "cannot re-create mount point %ls (error %lu)\n", ri->mounts[i], err);
+            printf("warning: mount point %ls not re-created (error %lu); the data is intact, give the volume a "
+                   "letter in Disk Management\n", ri->mounts[i], err);
             ok = 0;
         } else {
-            printf(already ? "mount point %ls already back\n" : "mount point %ls restored\n", ri->mounts[i]);
+            printf(already ? "mount point %ls already back%s\n" : "mount point %ls restored%s\n", ri->mounts[i],
+                   toggled ? " (after the attribute toggle)" : nudged ? " (after the arrival nudge)" : "");
         }
     }
     drop_auto_letters(ri);   /* a letter auto-assigned while we waited */
@@ -279,12 +316,14 @@ static int remount(const restore_info *ri)
 }
 
 /* Puts the original attributes back (while *v is still locked, so nothing mounts before), releases the
-   lock, re-creates the mount points and deletes the sidecar. Returns 0 or a dm_status. */
+   lock, re-creates the mount points and deletes the sidecar. A mount point that cannot be re-created is only a
+   warning (review I1): the partition itself is restored. Returns 0 or a dm_status. */
 static int restore_volume(const wchar_t *disk, const uint8_t part_guid[16], const restore_info *ri,
-                          const wchar_t *sidecar, dmw_volume **v)
+                          const wchar_t *sidecar, dmw_volume **v, uint64_t start, uint64_t length)
 {
     phase("restore");
     dm_status s = dmw_set_partition_attributes(disk, part_guid, ri->attributes, NULL);
+    if (s == DM_OK) phase("unhidden");   /* still locked here (kill point of the VHDX tests) */
     dmw_volume_close(*v);
     *v = NULL;
     if (s != DM_OK) {
@@ -292,10 +331,8 @@ static int restore_volume(const wchar_t *disk, const uint8_t part_guid[16], cons
         return report(s, "restore partition attributes");
     }
     printf("partition attributes restored to 0x%016llX\n", (unsigned long long)ri->attributes);
-    if (!remount(ri)) {
-        print_restore_hint(ri, sidecar);
-        return report(DM_E_IO, "restore mount points");
-    }
+    remount_ctx rc = { disk, part_guid, start, length };
+    if (!remount(ri, &rc)) printf("warning: not every mount point is back (see above)\n");
     DeleteFileW(sidecar);
     return 0;
 }
@@ -427,7 +464,7 @@ static int cmd_move(void)
     s = dmw_set_partition_attributes(disk, plan.partition_guid, cli_hidden_attributes(ri.attributes), NULL);
     if (s != DM_OK) {
         rc = report(s, "hide partition");
-        restore_volume(disk, plan.partition_guid, &ri, sidecar, &v);   /* nothing written yet */
+        restore_volume(disk, plan.partition_guid, &ri, sidecar, &v, plan.old_start, plan.length);   /* nothing written yet */
         return rc;
     }
     printf("partition hidden (original attributes 0x%016llX)\n", (unsigned long long)ri.attributes);
@@ -435,7 +472,7 @@ static int cmd_move(void)
     s = dmw_volume_verify(v, disk_number, plan.old_start, plan.length);
     if (s != DM_OK) {
         rc = report(s, "volume verify after hide");
-        restore_volume(disk, plan.partition_guid, &ri, sidecar, &v);   /* nothing written yet */
+        restore_volume(disk, plan.partition_guid, &ri, sidecar, &v, plan.old_start, plan.length);   /* nothing written yet */
         return rc;
     }
     printf("lock handle still valid after hide\n");
@@ -449,7 +486,7 @@ static int cmd_move(void)
         if (!cli_mount_point_removed(deleted, resolves ? now : NULL, ri.volume)) {
             fprintf(stderr, "cannot remove mount point %ls (error %lu)\n", ri.mounts[i], err);
             rc = report(DM_E_IO, "remove mount points");
-            restore_volume(disk, plan.partition_guid, &ri, sidecar, &v);   /* nothing written yet */
+            restore_volume(disk, plan.partition_guid, &ri, sidecar, &v, plan.old_start, plan.length);   /* nothing written yet */
             return rc;
         }
         printf(deleted ? "mount point %ls removed\n" : "mount point %ls already removed by Windows\n", ri.mounts[i]);
@@ -471,7 +508,7 @@ static int cmd_move(void)
         else printf("journal created\n");
     }
     if (rc) {   /* still nothing written to the disk data: undo the hiding */
-        restore_volume(disk, plan.partition_guid, &ri, sidecar, &v);
+        restore_volume(disk, plan.partition_guid, &ri, sidecar, &v, plan.old_start, plan.length);
         return rc;
     }
 
@@ -498,7 +535,7 @@ static int cmd_move(void)
     }
 
     /* 4. Committed: original attributes back, mount points re-created at the new location. */
-    rc = restore_volume(disk, plan.partition_guid, &ri, sidecar, &v);
+    rc = restore_volume(disk, plan.partition_guid, &ri, sidecar, &v, new_start, plan.length);
     if (!rc) done_ok();
     return rc;
 }
@@ -574,6 +611,24 @@ static int cmd_commit(void)
         }
     }
 
+    if (journal && GetFileAttributesW(journal) != INVALID_FILE_ATTRIBUTES) {
+        /* Review M5: never patch / commit a move whose copy or boot sector restore is not finished. */
+        dm_journal_info info;
+        uint32_t app_len = 0;
+        dm_status js = dmw_journal_read(journal, &info, NULL, 0, &app_len);
+        if (js == DM_OK || (js == DM_E_INVALID_ARG && app_len)) {
+            uint32_t last = info.move_count - 1;
+            if (info.move_index != last || info.chunks_done != info.chunk_count[last] || !info.boot_restored) {
+                fprintf(stderr, "the journal says the move is not finished (move %u, %llu/%llu chunks, boot_restored %u): "
+                        "run resume first\n", info.move_index, (unsigned long long)info.chunks_done,
+                        (unsigned long long)info.chunk_count[last], info.boot_restored);
+                return report(DM_E_JOURNAL_MISMATCH, "commit");
+            }
+        } else {
+            printf("journal unreadable (%d): no copy was started, committing as asked\n", (int)js);
+        }
+    }
+
     uint32_t disk_number = 0;
     int rc = guard_disk(disk, &disk_number);
     if (rc) return rc;
@@ -587,7 +642,7 @@ static int cmd_commit(void)
         if (have_restore) print_restore_hint(&ri, sidecar);
         return rc;
     }
-    if (have_restore) rc = restore_volume(disk, guid, &ri, sidecar, &v);
+    if (have_restore) rc = restore_volume(disk, guid, &ri, sidecar, &v, start, length);
     dmw_volume_close(v);
     if (!rc) done_ok();
     return rc;
