@@ -889,6 +889,27 @@ static void old_volume_scan_smoke(void)
     ASSERT_EQ_INT(dmw_lock_old_volume(0xFFFFu, 1 * MIB, 1 * MIB, NULL), DM_E_INVALID_ARG);
 }
 
+/* The old-offset lock is taken only when dm_run_move can write: partition still at old_start and the move not
+   finished (complete + boot_restored) nor an earlier move. */
+static void old_lock_needed_only_when_writing(void)
+{
+    dm_journal_info i;
+    memset(&i, 0, sizeof i);
+    i.move_count = 2; i.chunk_count[0] = 10; i.chunk_count[1] = 4;
+    i.move_index = 0; i.chunks_done = 5;
+    ASSERT_TRUE(dmw_move_needs_old_lock(&i, 0, 1));
+    ASSERT_TRUE(!dmw_move_needs_old_lock(&i, 0, 0));          /* committed: the old view is gone */
+    i.chunks_done = 10;
+    ASSERT_TRUE(dmw_move_needs_old_lock(&i, 0, 1));           /* complete, restore not recorded: writes */
+    i.boot_restored = 1;
+    ASSERT_TRUE(!dmw_move_needs_old_lock(&i, 0, 1));          /* complete + restored: no I/O */
+    ASSERT_TRUE(dmw_move_needs_old_lock(&i, 1, 1));           /* next move starts */
+    i.move_index = 1; i.chunks_done = 0; i.boot_restored = 0;
+    ASSERT_TRUE(!dmw_move_needs_old_lock(&i, 0, 1));          /* finished earlier */
+    ASSERT_TRUE(dmw_move_needs_old_lock(&i, 1, 1));
+    ASSERT_TRUE(dmw_move_needs_old_lock(NULL, 0, 1));         /* unknown: lock (fail safe) */
+}
+
 static void misc_args(void)
 {
     dmw_volume *v = (dmw_volume *)1;
@@ -943,4 +964,5 @@ void dm_run_win32_io(void)
     DM_RUN(read_boot_sectors_on_file);
     DM_RUN(old_volume_scan_matches_exact_extent);
     DM_RUN(old_volume_scan_smoke);
+    DM_RUN(old_lock_needed_only_when_writing);
 }

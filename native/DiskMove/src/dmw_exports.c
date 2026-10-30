@@ -102,8 +102,9 @@ DMW_API dm_status DMW_CALL dmw_journal_set_step(const wchar_t *path, uint32_t st
    the partition at its old or committed start. The disk number alone (\\.\PhysicalDriveN) can change
    between a crash and the resume. */
 static dm_status check_disk_identity(const wchar_t *disk_path, const dm_io *jio, uint32_t move_index,
-                                     dm_move_plan *plan)
+                                     dm_move_plan *plan, int *at_old)
 {
+    *at_old = 1;
     dm_extent *chunks = NULL;
     uint32_t n = 0;
     dm_status s = dm_journal_load_move(jio, move_index, plan, &chunks, &n);
@@ -112,7 +113,27 @@ static dm_status check_disk_identity(const wchar_t *disk_path, const dm_io *jio,
     DRIVE_LAYOUT_INFORMATION_EX *lay = NULL;
     s = dmw_query_layout(disk_path, &lay);
     if (s == DM_OK) s = dmw_layout_check_move(lay, plan);
+    if (s == DM_OK) {
+        for (DWORD i = 0; i < lay->PartitionCount; i++) {
+            const PARTITION_INFORMATION_EX *e = &lay->PartitionEntry[i];
+            if (e->PartitionStyle == PARTITION_STYLE_GPT && memcmp(&e->Gpt.PartitionId, plan->partition_guid, 16) == 0)
+                *at_old = (uint64_t)e->StartingOffset.QuadPart == plan->old_start;
+        }
+    }
     free(lay);
+    return s;
+}
+
+/* The newest slot (any app blob size). */
+static dm_status journal_info(const dm_io *jio, dm_journal_info *info)
+{
+    uint32_t app_len = 0;
+    dm_status s = dm_journal_read(jio, info, NULL, 0, &app_len);
+    if (s != DM_E_INVALID_ARG || app_len == 0) return s;
+    void *app = malloc(app_len);
+    if (!app) return DM_E_NOMEM;
+    s = dm_journal_read(jio, info, app, app_len, &app_len);
+    free(app);
     return s;
 }
 
@@ -143,8 +164,13 @@ dm_status dmw_run_move_ex(const wchar_t *disk_path, const wchar_t *journal_path,
     if (check_identity) {
         dm_io cio = dmw_file_as_dm_io(&jf);
         dm_move_plan plan;
-        s = check_disk_identity(disk_path, &cio, move_index, &plan);
-        if (s == DM_OK && !held_lock) s = lock_old_offset(disk_path, &plan, &own);
+        dm_journal_info info;
+        int at_old = 1;
+        s = check_disk_identity(disk_path, &cio, move_index, &plan, &at_old);
+        /* Only when this call can write: opening the old device read/write makes Windows mount it (RAW). */
+        if (s == DM_OK && !held_lock &&
+            dmw_move_needs_old_lock(journal_info(&cio, &info) == DM_OK ? &info : NULL, move_index, at_old))
+            s = lock_old_offset(disk_path, &plan, &own);
         if (s != DM_OK) {
             dmw_file_close(&jf);
             return s;
@@ -170,3 +196,14 @@ DMW_API dm_status DMW_CALL dmw_free(void *p)
     return DM_OK;
 }
 
+
+int dmw_move_needs_old_lock(const dm_journal_info *info, uint32_t move_index, int at_old)
+{
+    if (!at_old) return 0;                                   /* committed: no device at the old offset to fear */
+    if (!info) return 1;
+    if (move_index < info->move_index) return 0;             /* finished earlier: dm_run_move does no I/O */
+    if (move_index == info->move_index && move_index < DM_MAX_MOVES &&
+        info->chunks_done == info->chunk_count[move_index] && info->boot_restored)
+        return 0;                                            /* complete and restored: no I/O */
+    return 1;
+}

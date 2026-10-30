@@ -89,6 +89,12 @@ dm_status dmw_find_volume_device(dmw_extents_query query, void *ctx, uint32_t ma
    return it in *out (the caller closes it). None: DM_OK with *out = NULL. Exists but cannot be locked / verified /
    dismounted: DM_E_LOCKED (nothing held) after DMW_OLD_LOCK_ATTEMPTS tries 1 s apart. */
 #define DMW_OLD_LOCK_ATTEMPTS 5
+
+/* Pure: does dmw_run_move need the old-offset lock? Only when dm_run_move can write: at_old (the partition is
+   still at old_start in the layout) and the move is neither an earlier one nor complete with boot_restored.
+   info NULL (unknown): yes. Opening the old device read/write forces Windows to mount it (RAW), so it is not
+   done when nothing will be written. */
+int dmw_move_needs_old_lock(const dm_journal_info *info, uint32_t move_index, int at_old);
 dm_status dmw_lock_old_volume(uint32_t disk_number, uint64_t start, uint64_t length, dmw_volume **out);
 
 #endif /* DISKMOVE_DMW_INTERNAL_H */
