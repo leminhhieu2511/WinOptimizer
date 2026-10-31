@@ -259,16 +259,16 @@ static int volume_registered(const wchar_t *volume)
     return listed;
 }
 
-/* Where the volume is now, for the arrival nudge / toggle (review I1). length 0: no nudge, no toggle. */
-typedef struct remount_ctx { const wchar_t *disk; const uint8_t *part_guid; uint64_t start, length; } remount_ctx;
+/* Where the volume is now, for the arrival nudge (review I1). length 0: no nudge. */
+typedef struct remount_ctx { const wchar_t *disk; uint64_t start, length; } remount_ctx;
 
 /* Re-creates the recorded mount points; drops a drive letter Windows auto-assigned meanwhile. A volume that never
    gets registered by the mount manager (seen after a kill right after the unhide: error 87) gets, after 5 s, an
-   arrival nudge that writes nothing to the disk, and after 12 s, only if it is still provably unregistered, ONE
-   hidden -> original attribute toggle. Returns 1 if every mount point is back; a missing one is a warning. */
+   arrival nudge that writes nothing to the disk (on the VHDX it brought the letter back every time it was needed).
+   Returns 1 if every mount point is back; a missing one is a warning. */
 static int remount(const restore_info *ri, const remount_ctx *rc)
 {
-    int ok = 1, nudged = 0, toggled = 0;
+    int ok = 1, nudged = 0;
     drop_auto_letters(ri);
     for (int i = 0; i < ri->mount_count; i++) {
         /* The volume re-arrives asynchronously after UPDATE_PROPERTIES, and Windows may give it its old letter
@@ -290,14 +290,6 @@ static int remount(const restore_info *ri, const remount_ctx *rc)
                     dm_status ns = dmw_volume_arrival_nudge(rc->disk, rc->start, rc->length);
                     printf("volume not registered after 5 s: mount manager arrival nudge %s (%d)\n",
                            ns == DM_OK ? "sent" : "failed", (int)ns);
-                } else if (rc && rc->length && attempt >= 24 && !toggled && !volume_registered(ri->volume)) {
-                    toggled = 1;   /* last resort, once, only while provably unregistered (no letters to lose) */
-                    dm_status ts = dmw_set_partition_attributes(rc->disk, rc->part_guid,
-                                                                cli_hidden_attributes(ri->attributes), NULL);
-                    Sleep(1000);
-                    dm_status ts2 = dmw_set_partition_attributes(rc->disk, rc->part_guid, ri->attributes, NULL);
-                    printf("volume still not registered after 12 s: attributes toggled hidden -> original (%d, %d)\n",
-                           (int)ts, (int)ts2);
                 }
                 Sleep(500);
             }
@@ -308,7 +300,7 @@ static int remount(const restore_info *ri, const remount_ctx *rc)
             ok = 0;
         } else {
             printf(already ? "mount point %ls already back%s\n" : "mount point %ls restored%s\n", ri->mounts[i],
-                   toggled ? " (after the attribute toggle)" : nudged ? " (after the arrival nudge)" : "");
+                   nudged ? " (after the arrival nudge)" : "");
         }
     }
     drop_auto_letters(ri);   /* a letter auto-assigned while we waited */
@@ -331,7 +323,7 @@ static int restore_volume(const wchar_t *disk, const uint8_t part_guid[16], cons
         return report(s, "restore partition attributes");
     }
     printf("partition attributes restored to 0x%016llX\n", (unsigned long long)ri->attributes);
-    remount_ctx rc = { disk, part_guid, start, length };
+    remount_ctx rc = { disk, start, length };
     if (!remount(ri, &rc)) printf("warning: not every mount point is back (see above)\n");
     DeleteFileW(sidecar);
     return 0;

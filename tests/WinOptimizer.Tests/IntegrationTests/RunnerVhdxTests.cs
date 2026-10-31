@@ -174,7 +174,7 @@ public sealed class RunnerVhdxTests(ITestOutputHelper output)
     /// <summary>
     /// Review I1, product side: the run "crashes" in step 4 right after the source was un-hid (the lock is released by
     /// the crash, as by a kill). The resume must complete steps 5-7 whatever happens to the drive letter: back (by
-    /// itself, after the arrival nudge, or after the single toggle; the log says which) or a warning.
+    /// itself or after the arrival nudge; the log says which) or a warning.
     /// </summary>
     [AdminTheory]
     [InlineData(1)]
@@ -196,9 +196,7 @@ public sealed class RunnerVhdxTests(ITestOutputHelper output)
             var resumed = new GuardedBackend(new WindowsDiskMoveBackend(), c, Log);
             var result = await new DiskMoveRunner(resumed, c.Journal, manageWinRe: false).ResumeAsync(new LogProgress(Log), () => false);
             Log($"RESULT resume after unhide crash: {result.Outcome}, letter {result.FinalSourceLetter?.ToString() ?? "none"}, " +
-                $"nudges {resumed.Calls.Count(x => x == "NudgeVolumeArrival")}, registered checks " +
-                $"{resumed.Calls.Count(x => x.StartsWith("VolumeRegistered"))} (a toggle shows as SetPartitionAttributes hidden " +
-                $"then original right after them in the log), warnings [{string.Join(" | ", result.Warnings)}]");
+                $"nudges {resumed.Calls.Count(x => x == "NudgeVolumeArrival")}, warnings [{string.Join(" | ", result.Warnings)}]");
             Assert.Equal(DiskMoveOutcome.Completed, result.Outcome);
             if (result.FinalSourceLetter == c.Letter)
             {
@@ -442,12 +440,6 @@ public sealed class RunnerVhdxTests(ITestOutputHelper output)
             return ok;
         }
 
-        public bool VolumeRegistered(string volumePath)
-        {
-            bool ok = inner.VolumeRegistered(Volume(volumePath, "VolumeRegistered"));
-            log($"VolumeRegistered({volumePath}) = {ok}");
-            return ok;
-        }
 
         public (byte[] First, byte[] Backup) ReadBootSectors(int disk, long start, long length, int sectorSize)
         {

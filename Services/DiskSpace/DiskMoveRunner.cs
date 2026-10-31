@@ -739,8 +739,8 @@ public sealed class DiskMoveRunner
     /// Review I1: a missing drive letter never stops the move. After a kill right after the unhide, the volume can exist
     /// without the mount manager ever registering it (error 87), and nothing re-triggers the arrival. In order:
     /// (1) the normal assignment (waits ~20 s); (2) an arrival nudge to the mount manager, which writes nothing to the
-    /// disk; (3) only if the volume is still provably unregistered (so it has no letter or open handle to lose), ONE
-    /// hidden -> original attribute toggle, with no lock held; (4) otherwise continue without the letter.
+    /// disk (on the VHDX it brought the volume back every time it was needed); (3) otherwise continue without the
+    /// letter. A hide/unhide toggle was tried as a further fallback and dropped: it was never needed.
     /// </summary>
     private char? AssignLetterOrContinue(Ctx ctx)
     {
@@ -759,12 +759,6 @@ public sealed class DiskMoveRunner
         if (Try() is char first) return first;
         ctx.Progress.Report(new RunProgress(MoveStep.CommitSource, 0, 0, "The drive letter is not back yet; asking Windows to register the volume"));
         if (_b.NudgeVolumeArrival(ctx.Disk, s.SourceNewStart, s.SourceShrunkSize) && Try() is char nudged) return nudged;
-        if (!_b.VolumeRegistered(s.SourceVolumePath!))
-        {
-            _b.SetPartitionAttributes(ctx.Disk, s.SourceGuid, s.SourceGptAttributes | HideBits);
-            _b.SetPartitionAttributes(ctx.Disk, s.SourceGuid, s.SourceGptAttributes);
-            if (Try() is char toggled) return toggled;
-        }
         ctx.Progress.Report(new RunProgress(MoveStep.CommitSource, 0, 0,
             "The drive letter could not be restored now; continuing (the data is moved and safe)"));
         return null;

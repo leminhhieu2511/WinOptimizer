@@ -248,35 +248,6 @@ public sealed class WindowsDiskMoveBackend : IDiskMoveBackend
     public bool NudgeVolumeArrival(int disk, long start, long length) =>
         DiskMoveNative.VolumeArrivalNudge(DiskPath(disk), (ulong)start, (ulong)length) == DiskMoveNative.DM_OK;
 
-    public bool VolumeRegistered(string volumePath)
-    {
-        string vol = Norm(volumePath);
-        if (GetVolumePathNamesForVolumeNameW(vol, new char[1024], 1024, out _)) return true;
-        var name = new StringBuilder(260);
-        IntPtr h = FindFirstVolumeW(name, name.Capacity);
-        if (h == new IntPtr(-1)) return true;   // cannot prove it is unregistered
-        try
-        {
-            do
-            {
-                if (Same(name.ToString(), vol)) return true;
-            } while (FindNextVolumeW(h, name, name.Capacity));
-            return false;
-        }
-        finally
-        {
-            FindVolumeClose(h);
-        }
-    }
-
-    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
-    private static extern IntPtr FindFirstVolumeW(StringBuilder name, int size);
-
-    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
-    private static extern bool FindNextVolumeW(IntPtr h, StringBuilder name, int size);
-
-    [DllImport("kernel32.dll")]
-    private static extern bool FindVolumeClose(IntPtr h);
 
     private static string Root(char letter) => $"{char.ToUpperInvariant(letter)}:\\";
     private static string Norm(string volume) => volume.EndsWith('\\') ? volume : volume + "\\";

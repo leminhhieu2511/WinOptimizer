@@ -158,8 +158,8 @@ public sealed class NativeMoveVhdxTests(ITestOutputHelper output)
     /// <summary>
     /// Review I1 (error 87): "move" is killed right after it un-hid the committed volume while still holding its lock
     /// ("phase unhidden"). The volume then often exists without the mount manager registering it. "commit --journal"
-    /// must still finish: the letter comes back by itself, after the arrival nudge, or after the one attribute toggle
-    /// (the CLI output says which), and the move must never fail on the letter.
+    /// must still finish: the letter comes back by itself or after the arrival nudge (the CLI output says which), and
+    /// the move must never fail on the letter.
     /// </summary>
     [AdminTheory]
     [InlineData(1)]

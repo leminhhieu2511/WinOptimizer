@@ -714,7 +714,7 @@ public sealed class DiskMoveRunnerTests : IDisposable
     [Fact]
     public async Task Step4_VolumeNeverRegisters_WarnsAndFinishesSteps5To7()
     {
-        var f = new FakeDiskMoveBackend { NudgeHelps = false, ToggleHelps = false };
+        var f = new FakeDiskMoveBackend { NudgeHelps = false };
         var b = Capture(f);
         f.OnCall = c => { if (c.StartsWith("SetAttributes(D,visible")) { f.D.Unregistered = true; f.CrashAtCall = f.CallCount; } };
         await Assert.ThrowsAnyAsync<Exception>(() => Run(f));
@@ -727,7 +727,7 @@ public sealed class DiskMoveRunnerTests : IDisposable
         Assert.Equal(b.CSize + X, f.C.Size);                      // step 6 ran
         Assert.False(DiskMoveRunner.HasUnfinishedMove(_dir));     // step 7 finished
         Assert.Single(f.Calls, c => c.StartsWith("Nudge(D"));
-        Assert.Equal(1, f.Calls.Count(c => c.StartsWith("SetAttributes(D,hidden")) - 1);   // one toggle (+ the step-2 hide)
+        Assert.Single(f.Calls, c => c.StartsWith("SetAttributes(D,hidden"));   // only the step-2 hide: never toggled
     }
 
     /// <summary>Review I1: the arrival nudge (no disk write) is tried first; when it helps, no attribute toggle.</summary>
@@ -746,34 +746,6 @@ public sealed class DiskMoveRunnerTests : IDisposable
         Assert.Empty(r.Warnings);
         AssertMoved(f, b);
         Assert.DoesNotContain(f.Calls.Skip(before), c => c.StartsWith("SetAttributes(D,hidden"));
-    }
-
-    /// <summary>Review I1: the toggle is the last resort, at most once, and only while the volume is provably
-    /// unregistered (a volume that is registered but has no letter is never hidden again).</summary>
-    [Fact]
-    public async Task Step4_ToggleOnlyWhenUnregistered_AtMostOnce()
-    {
-        var f = new FakeDiskMoveBackend { NudgeHelps = false, ToggleHelps = true };
-        var b = Capture(f);
-        f.OnCall = c => { if (c.StartsWith("SetAttributes(D,visible")) { f.D.Unregistered = true; f.CrashAtCall = f.CallCount; } };
-        await Assert.ThrowsAnyAsync<Exception>(() => Run(f));
-        f.Revive();
-        int before = f.Calls.Count;
-        var r = await Runner(f).ResumeAsync(new SyncProgress(), () => false);
-        Assert.Equal('D', r.FinalSourceLetter);
-        AssertMoved(f, b);
-        Assert.Single(f.Calls.Skip(before), c => c.StartsWith("SetAttributes(D,hidden"));
-
-        // registered but the letter cannot be assigned (e.g. every letter taken): never toggled
-        var g = new FakeDiskMoveBackend { NudgeHelps = false, ToggleHelps = true };
-        g.OnCall = c => { if (c.StartsWith("SetAttributes(D,visible")) { g.D.NoLetterPossible = true; g.CrashAtCall = g.CallCount; } };
-        await Assert.ThrowsAnyAsync<Exception>(() => Run(g));
-        g.Revive();
-        before = g.Calls.Count;
-        var r2 = await Runner(g).ResumeAsync(new SyncProgress(), () => false);
-        Assert.Equal(DiskMoveOutcome.Completed, r2.Outcome);
-        Assert.DoesNotContain(g.Calls.Skip(before), c => c.StartsWith("SetAttributes(D,hidden"));
-        Assert.Contains(r2.Warnings, w => w.Contains("has no drive letter"));
     }
 
     /// <summary>Review M7: the saved boot sectors are also kept next to the layout backups (manual recovery path).</summary>

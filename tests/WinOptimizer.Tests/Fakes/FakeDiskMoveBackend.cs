@@ -42,7 +42,7 @@ public sealed class FakeDiskMoveBackend : IDiskMoveBackend
         public byte[]? BootRead;
         public bool BootRestored;
         /// <summary>Review I1: the volume exists but the mount manager never registered it (no letter can be assigned
-        /// until an arrival nudge or a hide/unhide re-triggers it).</summary>
+        /// until an arrival nudge re-triggers it).</summary>
         public bool Unregistered;
         /// <summary>Registered, but no letter can be assigned (e.g. none free).</summary>
         public bool NoLetterPossible;
@@ -62,8 +62,8 @@ public sealed class FakeDiskMoveBackend : IDiskMoveBackend
     public int DisableFailures;
     public int ChkdskResult;
     public bool WindowsRestoresLetter = true;
-    /// <summary>Whether IOCTL_MOUNTMGR_VOLUME_ARRIVAL_NOTIFICATION / a hide + unhide registers an unregistered volume.</summary>
-    public bool NudgeHelps = true, ToggleHelps = true;
+    /// <summary>Whether IOCTL_MOUNTMGR_VOLUME_ARRIVAL_NOTIFICATION registers an unregistered volume.</summary>
+    public bool NudgeHelps = true;
     /// <summary>Letters held by volumes outside this disk (e.g. a USB drive plugged in during the move).</summary>
     public readonly HashSet<char> ForeignLetters = [];
     public int ChunksPerMove = 4;
@@ -199,7 +199,6 @@ public sealed class FakeDiskMoveBackend : IDiskMoveBackend
         bool wasHidden = p.IsHidden;
         p.Attrs = attributes;
         if (!wasHidden && p.IsHidden) p.Letter = '\0';                         // Windows drops the letter itself
-        if (wasHidden && !p.IsHidden && p.Unregistered && ToggleHelps) p.Unregistered = false;   // a new arrival
         if (wasHidden && !p.IsHidden && WindowsRestoresLetter && p.RememberedLetter != '\0')
             p.Letter = Taken(p.RememberedLetter, p) ? FirstFree() : p.RememberedLetter;   // ...and often gives one back
         Did($"SetAttributes({p.Name},{(p.IsHidden ? "hidden" : "visible")},0x{attributes:X16})");
@@ -268,12 +267,6 @@ public sealed class FakeDiskMoveBackend : IDiskMoveBackend
         return true;
     }
 
-    public bool VolumeRegistered(string volumePath)
-    {
-        Alive();
-        var p = ByVolume(volumePath);
-        return !p.Unregistered && !p.IsHidden;
-    }
 
     sealed class Vol(FakeDiskMoveBackend owner, Part p) : IDisposable
     {
